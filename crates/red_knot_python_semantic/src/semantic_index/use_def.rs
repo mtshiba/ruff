@@ -275,6 +275,7 @@ use crate::semantic_index::symbol::{FileScopeId, ScopedSymbolId};
 use crate::semantic_index::visibility_constraints::{
     ScopedVisibilityConstraintId, VisibilityConstraints, VisibilityConstraintsBuilder,
 };
+use crate::Db;
 
 mod symbol_state;
 
@@ -366,6 +367,17 @@ impl<'db> UseDefMap<'db> {
     ) -> DeclarationsIterator<'map, 'db> {
         let declarations = self.public_symbols[symbol].declarations();
         self.declarations_iterator(declarations)
+    }
+
+    pub(crate) fn definitions(
+        &self,
+        db: &'db dyn Db,
+        symbol: ScopedSymbolId,
+    ) -> impl Iterator<Item = &Definition<'db>> {
+        self.all_definitions.iter().filter_map(move |def| {
+            let def = def.as_ref()?;
+            (def.symbol(db) == symbol).then_some(def)
+        })
     }
 
     fn bindings_iterator<'map>(

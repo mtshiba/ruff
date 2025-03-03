@@ -46,15 +46,16 @@ use crate::semantic_index::definition::{
     ExceptHandlerDefinitionKind, ForStmtDefinitionKind, TargetKind,
 };
 use crate::semantic_index::expression::{Expression, ExpressionKind};
-use crate::semantic_index::semantic_index;
 use crate::semantic_index::symbol::{FileScopeId, NodeWithScopeKind, NodeWithScopeRef, ScopeId};
 use crate::semantic_index::SemanticIndex;
+use crate::semantic_index::{semantic_index, symbol_table, use_def_map};
 use crate::symbol::{
     builtins_module_scope, builtins_symbol, explicit_global_symbol,
     module_type_implicit_global_symbol, symbol, symbol_from_bindings, symbol_from_declarations,
     typing_extensions_symbol, Boundness, LookupError,
 };
 use crate::types::call::{Argument, CallArguments, UnionCallError};
+use crate::types::declaration_type;
 use crate::types::diagnostic::{
     report_invalid_arguments_to_annotated, report_invalid_assignment,
     report_invalid_attribute_assignment, report_unresolved_module, TypeCheckDiagnostics,
@@ -1461,6 +1462,53 @@ impl<'db> TypeInferenceBuilder<'db> {
         }
     }
 
+    fn check_implicit_shadowing(
+        &self,
+        node: AnyNodeRef,
+        name: &str,
+        inferred_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let shadowed_ty = self.shadowed_declaration_type(node, name)?.inner_type();
+        if !inferred_ty.is_assignable_to(self.db(), shadowed_ty) {
+            report_invalid_assignment(&self.context, node, shadowed_ty, inferred_ty);
+        }
+        Some(shadowed_ty)
+    }
+
+    /// Returns the type of the declaration that is shadowed by the new definition.
+    fn shadowed_declaration_type(
+        &self,
+        new_definition: AnyNodeRef,
+        name: &str,
+    ) -> Option<TypeAndQualifiers<'db>> {
+        let db = self.db();
+        let scope = self.scope();
+        let symbol_id = symbol_table(db, scope).symbol_id_by_name(name)?;
+        let use_def = use_def_map(db, scope);
+        let mut last_declaration = None;
+        for declaration in use_def.definitions(db, symbol_id) {
+            if !declaration
+                .kind(db)
+                .category(self.in_stub())
+                .is_declaration()
+            {
+                continue;
+            }
+            let declaration_range = declaration.kind(db).target_range();
+            // declaration should be placed before new_definition
+            if new_definition
+                .range()
+                .intersect(declaration_range)
+                .is_some()
+                || new_definition.range().end() < declaration_range.start()
+            {
+                continue;
+            }
+            last_declaration = Some(*declaration);
+        }
+        Some(declaration_type(db, last_declaration?))
+    }
+
     fn infer_type_alias_definition(
         &mut self,
         type_alias: &ast::StmtTypeAlias,
@@ -1479,6 +1527,10 @@ impl<'db> TypeInferenceBuilder<'db> {
                 &type_alias.name.as_name_expr().unwrap().id,
                 rhs_scope,
             )));
+
+        if let Some(name) = type_alias.name.as_name_expr() {
+            self.check_implicit_shadowing(name.into(), &name.id, type_alias_ty);
+        }
 
         self.add_declaration_with_binding(
             type_alias.into(),
@@ -2511,11 +2563,18 @@ impl<'db> TypeInferenceBuilder<'db> {
             full_module_ty
         };
 
-        self.add_declaration_with_binding(
-            alias.into(),
-            definition,
-            &DeclaredAndInferredType::AreTheSame(binding_ty),
-        );
+        let declared_and_inferred_ty = asname
+            .as_ref()
+            .and_then(|asname| self.shadowed_declaration_type(asname.into(), &asname.id))
+            .map_or_else(
+                || DeclaredAndInferredType::AreTheSame(binding_ty),
+                |declared_ty| DeclaredAndInferredType::MightBeDifferent {
+                    declared_ty,
+                    inferred_ty: binding_ty,
+                },
+            );
+
+        self.add_declaration_with_binding(alias.into(), definition, &declared_and_inferred_ty);
     }
 
     fn infer_import_from_statement(&mut self, import: &ast::StmtImportFrom) {
@@ -2691,7 +2750,7 @@ impl<'db> TypeInferenceBuilder<'db> {
         let ast::Alias {
             range: _,
             name,
-            asname: _,
+            asname,
         } = alias;
 
         // First try loading the requested attribute from the module.
@@ -2705,11 +2764,17 @@ impl<'db> TypeInferenceBuilder<'db> {
                     format_args!("Member `{name}` of module `{module_name}` is possibly unbound",),
                 );
             }
-            self.add_declaration_with_binding(
-                alias.into(),
-                definition,
-                &DeclaredAndInferredType::AreTheSame(ty),
-            );
+            let declared_and_inferred_ty = asname
+                .as_ref()
+                .and_then(|asname| self.shadowed_declaration_type(asname.into(), &asname.id))
+                .map_or_else(
+                    || DeclaredAndInferredType::AreTheSame(ty),
+                    |declared_ty| DeclaredAndInferredType::MightBeDifferent {
+                        declared_ty,
+                        inferred_ty: ty,
+                    },
+                );
+            self.add_declaration_with_binding(alias.into(), definition, &declared_and_inferred_ty);
             return;
         };
 
