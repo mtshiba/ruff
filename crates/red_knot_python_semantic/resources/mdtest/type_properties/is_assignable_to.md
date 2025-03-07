@@ -256,6 +256,7 @@ static_assert(is_assignable_to(Intersection[Child1, Not[Grandchild]], Parent))
 static_assert(is_assignable_to(Intersection[Child1, Child2], Intersection[Child1, Child2]))
 static_assert(is_assignable_to(Intersection[Child1, Child2], Intersection[Child2, Child1]))
 static_assert(is_assignable_to(Grandchild, Intersection[Child1, Child2]))
+static_assert(not is_assignable_to(Grandchild, Intersection[Child1, Not[Child2]]))
 
 static_assert(not is_assignable_to(Parent, Intersection[Parent, Unrelated]))
 static_assert(not is_assignable_to(int, Intersection[int, Not[Literal[1]]]))
@@ -266,11 +267,19 @@ static_assert(not is_assignable_to(Intersection[Any, Parent], Unrelated))
 static_assert(is_assignable_to(Intersection[Unrelated, Any], Intersection[Unrelated, Any]))
 static_assert(is_assignable_to(Intersection[Unrelated, Any], Intersection[Unrelated, Not[Any]]))
 
-# TODO: The following assertions should not fail (see https://github.com/astral-sh/ruff/issues/14899)
-# error: [static-assert-error]
+static_assert(is_assignable_to(int, Intersection[Any, int]))
+static_assert(not is_assignable_to(str, Intersection[Any, int]))
+
 static_assert(is_assignable_to(Intersection[Any, int], int))
-# error: [static-assert-error]
+static_assert(not is_assignable_to(Intersection[Any, int], str))
+
+static_assert(is_assignable_to(Intersection[Any, int], Intersection[int, Any]))
+static_assert(not is_assignable_to(Intersection[Any, int], Intersection[str, Any]))
+
 static_assert(is_assignable_to(Intersection[Unrelated, Any], Not[tuple[Unrelated, Any]]))
+static_assert(not is_assignable_to(Unrelated, tuple[Unrelated, Any]))
+static_assert(is_assignable_to(Unrelated, Not[tuple[Unrelated, Any]]))
+static_assert(is_assignable_to(Intersection[Any, tuple[Any, int]], Intersection[tuple[str, int], Any]))
 ```
 
 ## General properties

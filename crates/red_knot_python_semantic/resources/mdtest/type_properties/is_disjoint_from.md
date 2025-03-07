@@ -9,6 +9,8 @@ This means that it is known that no possible runtime object inhabits both types 
 from typing_extensions import Literal, LiteralString, Any
 from knot_extensions import Intersection, Not, TypeOf, is_disjoint_from, static_assert
 
+class Foo: ...
+
 static_assert(is_disjoint_from(bool, str))
 static_assert(not is_disjoint_from(bool, bool))
 static_assert(not is_disjoint_from(bool, int))
@@ -19,8 +21,16 @@ static_assert(not is_disjoint_from(Any, Any))
 
 static_assert(not is_disjoint_from(LiteralString, LiteralString))
 static_assert(not is_disjoint_from(str, LiteralString))
-static_assert(not is_disjoint_from(str, type))
-static_assert(not is_disjoint_from(str, type[Any]))
+
+static_assert(is_disjoint_from(str, type))
+static_assert(is_disjoint_from(str, type[Any]))
+static_assert(is_disjoint_from(int, tuple))
+static_assert(is_disjoint_from(Foo, tuple[tuple[Foo]]))
+
+static_assert(is_disjoint_from(int, Not[int]))
+static_assert(not is_disjoint_from(int, Not[str]))
+static_assert(is_disjoint_from(Not[int], int))
+static_assert(not is_disjoint_from(Not[str], int))
 ```
 
 ## Class hierarchies

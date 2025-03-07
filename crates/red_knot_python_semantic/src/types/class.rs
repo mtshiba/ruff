@@ -69,6 +69,46 @@ impl<'db> Class<'db> {
         self.explicit_bases_query(db)
     }
 
+    /// Return `AlwaysTrue` if the *shape* of this class is known to differ from `other`.
+    /// For example, `int` and `tuple` are inheritable classes, but have different instance layouts,
+    /// so a class that inherits both `int` and `tuple` cannot exist.
+    /// This method is used in `Type::is_disjoint_from`.
+    pub(super) fn shape_differs(self, db: &'db dyn Db, other: Class) -> Truthiness {
+        let mut known_self_base = None;
+        for base in self.iter_mro(db) {
+            if let Some(class) = base.into_class() {
+                if class.is_known(db, KnownClass::Object) {
+                    break;
+                } else if let Some(class) = class.known(db) {
+                    known_self_base = Some(class);
+                }
+            }
+        }
+        let Some(known_self_base) = known_self_base else {
+            return Truthiness::Ambiguous;
+        };
+        let mut known_other_base = None;
+        for base in other.iter_mro(db) {
+            if let Some(class) = base.into_class() {
+                if class.is_known(db, KnownClass::Object) {
+                    break;
+                } else if let Some(class) = class.known(db) {
+                    known_other_base = Some(class);
+                }
+            }
+        }
+        let Some(known_other_base) = known_other_base else {
+            return Truthiness::Ambiguous;
+        };
+
+        // REVIEW: Are the shapes of all different `KnownClass`es different?
+        if known_self_base == known_other_base {
+            Truthiness::AlwaysFalse
+        } else {
+            Truthiness::AlwaysTrue
+        }
+    }
+
     /// Iterate over this class's explicit bases, filtering out any bases that are not class objects.
     fn fully_static_explicit_bases(self, db: &'db dyn Db) -> impl Iterator<Item = Class<'db>> {
         self.explicit_bases(db)

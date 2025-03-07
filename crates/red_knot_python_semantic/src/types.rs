@@ -749,6 +749,29 @@ impl<'db> Type<'db> {
                 .iter()
                 .any(|&elem_ty| ty.is_assignable_to(db, elem_ty)),
 
+            (Type::Intersection(intersection), _) => {
+                // Due to the nature of intersection, a materialization of a dynamic type will always be a "smaller" type than any other fully static types.
+                // If the fully static types are assignable to the target type, then materialized types will also be assignable to the target type,
+                // so the dynamic types can simply be removed.
+                intersection
+                    .positive(db)
+                    .iter()
+                    .filter(|&pos_ty| !matches!(pos_ty, Type::Dynamic(_)))
+                    .any(|&pos_ty| pos_ty.is_assignable_to(db, target))
+            }
+
+            (_, Type::Intersection(intersection)) => {
+                // We don't need to filter out dynamic types here, because they are always assignable
+                intersection
+                    .positive(db)
+                    .iter()
+                    .all(|&pos_ty| self.is_assignable_to(db, pos_ty))
+                    && intersection
+                        .negative(db)
+                        .iter()
+                        .all(|&neg_ty| self.is_disjoint_from(db, neg_ty))
+            }
+
             // A tuple type S is assignable to a tuple type T if their lengths are the same, and
             // each element of S is assignable to the corresponding element of T.
             (Type::Tuple(self_tuple), Type::Tuple(target_tuple)) => {
@@ -868,6 +891,40 @@ impl<'db> Type<'db> {
         )
     }
 
+    /// Returns a set of all types that are part of the given type
+    /// (not including tuple/union/intersection types themselves).
+    fn decompose_types(self, db: &'db dyn Db) -> FxOrderSet<Type<'db>> {
+        let mut appeared = FxOrderSet::default();
+        self.decompose_types_(db, &mut appeared);
+        appeared
+    }
+
+    fn decompose_types_(self, db: &'db dyn Db, appeared: &mut FxOrderSet<Type<'db>>) {
+        match self {
+            Self::Tuple(tuple) => {
+                for elem in tuple.elements(db) {
+                    elem.decompose_types_(db, appeared);
+                }
+            }
+            Self::Intersection(intersection) => {
+                for elem in intersection.positive(db) {
+                    elem.decompose_types_(db, appeared);
+                }
+                for elem in intersection.negative(db) {
+                    elem.decompose_types_(db, appeared);
+                }
+            }
+            Self::Union(union) => {
+                for elem in union.elements(db) {
+                    elem.decompose_types_(db, appeared);
+                }
+            }
+            _ => {
+                appeared.insert(self);
+            }
+        }
+    }
+
     /// Returns true if this type and `other` are gradual equivalent.
     ///
     /// > Two gradual types `A` and `B` are equivalent
@@ -932,8 +989,14 @@ impl<'db> Type<'db> {
                 {
                     true
                 } else {
-                    // TODO we can do better here. For example:
-                    // X & ~Literal[1] is disjoint from Literal[1]
+                    if intersection
+                        .negative(db)
+                        .iter()
+                        .any(|n| n.is_equivalent_to(db, other))
+                    {
+                        return true;
+                    }
+                    // REVIEW: any other cases?
                     false
                 }
             }
@@ -1174,6 +1237,9 @@ impl<'db> Type<'db> {
                 Type::Instance(InstanceType { class: left_class }),
                 Type::Instance(InstanceType { class: right_class }),
             ) => {
+                if left_class.shape_differs(db, right_class).is_always_true() {
+                    return true;
+                }
                 (left_class.is_final(db) && !left_class.is_subclass_of(db, right_class))
                     || (right_class.is_final(db) && !right_class.is_subclass_of(db, left_class))
             }
@@ -1188,8 +1254,14 @@ impl<'db> Type<'db> {
                         .any(|(e1, e2)| e1.is_disjoint_from(db, *e2))
             }
 
-            (Type::Tuple(..), instance @ Type::Instance(_))
-            | (instance @ Type::Instance(_), Type::Tuple(..)) => {
+            (tuple @ Type::Tuple(_), instance @ Type::Instance(_))
+            | (instance @ Type::Instance(_), tuple @ Type::Tuple(_)) => {
+                // Workaround: no type can inherit from a type that includes itself
+                for element_ty in tuple.decompose_types(db) {
+                    if element_ty.is_equivalent_to(db, instance) {
+                        return true;
+                    }
+                }
                 // We cannot be sure if the tuple is disjoint from the instance because:
                 //   - 'other' might be the homogeneous arbitrary-length tuple type
                 //     tuple[T, ...] (which we don't have support for yet); if all of
