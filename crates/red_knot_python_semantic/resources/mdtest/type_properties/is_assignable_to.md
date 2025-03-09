@@ -233,13 +233,16 @@ static_assert(not is_assignable_to(Any | int | str, int))
 
 ```py
 from knot_extensions import static_assert, is_assignable_to, Intersection, Not
-from typing_extensions import Any, Literal
+from typing_extensions import Any, Literal, final
 
 class Parent: ...
 class Child1(Parent): ...
 class Child2(Parent): ...
 class Grandchild(Child1, Child2): ...
 class Unrelated: ...
+
+@final
+class Isolated: ...
 
 static_assert(is_assignable_to(Intersection[Child1, Child2], Child1))
 static_assert(is_assignable_to(Intersection[Child1, Child2], Child2))
@@ -276,10 +279,13 @@ static_assert(not is_assignable_to(Intersection[Any, int], str))
 static_assert(is_assignable_to(Intersection[Any, int], Intersection[int, Any]))
 static_assert(not is_assignable_to(Intersection[Any, int], Intersection[str, Any]))
 
-static_assert(is_assignable_to(Intersection[Unrelated, Any], Not[tuple[Unrelated, Any]]))
-static_assert(not is_assignable_to(Unrelated, tuple[Unrelated, Any]))
-static_assert(is_assignable_to(Unrelated, Not[tuple[Unrelated, Any]]))
 static_assert(is_assignable_to(Intersection[Any, tuple[Any, int]], Intersection[tuple[str, int], Any]))
+
+static_assert(is_assignable_to(Isolated, Not[tuple[Isolated, Any]]))
+static_assert(not is_assignable_to(Isolated, tuple[Isolated, Any]))
+static_assert(is_assignable_to(Intersection[Isolated, Any], Not[tuple[Isolated, Any]]))
+# Unrelated is not disjoint from tuple[Unrelated, Any] because subclasses of Unrelated may inherit tuple.
+static_assert(not is_assignable_to(Intersection[Unrelated, Any], Not[tuple[Unrelated, Any]]))
 ```
 
 ## General properties

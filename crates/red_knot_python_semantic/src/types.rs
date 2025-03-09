@@ -891,40 +891,6 @@ impl<'db> Type<'db> {
         )
     }
 
-    /// Returns a set of all types that are part of the given type
-    /// (not including tuple/union/intersection types themselves).
-    fn decompose_types(self, db: &'db dyn Db) -> FxOrderSet<Type<'db>> {
-        let mut appeared = FxOrderSet::default();
-        self.decompose_types_(db, &mut appeared);
-        appeared
-    }
-
-    fn decompose_types_(self, db: &'db dyn Db, appeared: &mut FxOrderSet<Type<'db>>) {
-        match self {
-            Self::Tuple(tuple) => {
-                for elem in tuple.elements(db) {
-                    elem.decompose_types_(db, appeared);
-                }
-            }
-            Self::Intersection(intersection) => {
-                for elem in intersection.positive(db) {
-                    elem.decompose_types_(db, appeared);
-                }
-                for elem in intersection.negative(db) {
-                    elem.decompose_types_(db, appeared);
-                }
-            }
-            Self::Union(union) => {
-                for elem in union.elements(db) {
-                    elem.decompose_types_(db, appeared);
-                }
-            }
-            _ => {
-                appeared.insert(self);
-            }
-        }
-    }
-
     /// Returns true if this type and `other` are gradual equivalent.
     ///
     /// > Two gradual types `A` and `B` are equivalent
@@ -1254,14 +1220,8 @@ impl<'db> Type<'db> {
                         .any(|(e1, e2)| e1.is_disjoint_from(db, *e2))
             }
 
-            (tuple @ Type::Tuple(_), instance @ Type::Instance(_))
-            | (instance @ Type::Instance(_), tuple @ Type::Tuple(_)) => {
-                // Workaround: no type can inherit from a type that includes itself
-                for element_ty in tuple.decompose_types(db) {
-                    if element_ty.is_equivalent_to(db, instance) {
-                        return true;
-                    }
-                }
+            (Type::Tuple(..), instance @ Type::Instance(_))
+            | (instance @ Type::Instance(_), Type::Tuple(..)) => {
                 // We cannot be sure if the tuple is disjoint from the instance because:
                 //   - 'other' might be the homogeneous arbitrary-length tuple type
                 //     tuple[T, ...] (which we don't have support for yet); if all of
