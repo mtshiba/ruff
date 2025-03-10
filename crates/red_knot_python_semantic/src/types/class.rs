@@ -101,8 +101,15 @@ impl<'db> Class<'db> {
             return Truthiness::Ambiguous;
         };
 
-        // REVIEW: Are the shapes of all different `KnownClass`es different?
         if known_self_base == known_other_base {
+            return Truthiness::AlwaysFalse;
+        }
+
+        if !known_self_base.can_be_base() || !known_other_base.can_be_base() {
+            Truthiness::AlwaysTrue
+        } else if !known_self_base.canonical_module(db).is_builtins()
+            || !known_other_base.canonical_module(db).is_builtins()
+        {
             Truthiness::AlwaysFalse
         } else {
             Truthiness::AlwaysTrue
@@ -1200,6 +1207,20 @@ impl<'db> KnownClass {
             Self::SpecialForm | Self::TypeVar | Self::TypeAliasType | Self::NoDefaultType | Self::SupportsIndex => {
                 matches!(module, KnownModule::Typing | KnownModule::TypingExtensions)
             }
+        }
+    }
+
+    pub(crate) fn can_be_base(self) -> bool {
+        match self {
+            Self::Bool
+            | Self::NoneType
+            | Self::EllipsisType
+            | Self::FunctionType
+            | Self::MethodType
+            | Self::MethodWrapperType
+            // TODO: other descriptor types
+            | Self::WrapperDescriptorType => false,
+            _ => true,
         }
     }
 }

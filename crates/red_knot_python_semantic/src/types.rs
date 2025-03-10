@@ -948,23 +948,16 @@ impl<'db> Type<'db> {
 
             (Type::Intersection(intersection), other)
             | (other, Type::Intersection(intersection)) => {
-                if intersection
+                intersection
                     .positive(db)
                     .iter()
                     .any(|p| p.is_disjoint_from(db, other))
-                {
-                    true
-                } else {
-                    if intersection
+                // is_disjoint_from(T, X & ~S) if T <: S
+                // since `T & ~S` is Never
+                || intersection
                         .negative(db)
                         .iter()
-                        .any(|n| n.is_equivalent_to(db, other))
-                    {
-                        return true;
-                    }
-                    // REVIEW: any other cases?
-                    false
-                }
+                        .any(|n| other.is_subtype_of(db, *n))
             }
 
             // any single-valued type is disjoint from another single-valued type

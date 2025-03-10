@@ -8,8 +8,13 @@ This means that it is known that no possible runtime object inhabits both types 
 ```py
 from typing_extensions import Literal, LiteralString, Any
 from knot_extensions import Intersection, Not, TypeOf, is_disjoint_from, static_assert
+from types import ModuleType, FunctionType, WrapperDescriptorType
+from collections import ChainMap, Counter
 
+# bool is not an acceptable base type.
 static_assert(is_disjoint_from(bool, str))
+# Inheriting both int and str is prohibited due to instance lay-out conflict.
+static_assert(is_disjoint_from(int, str))
 static_assert(not is_disjoint_from(bool, bool))
 static_assert(not is_disjoint_from(bool, int))
 static_assert(not is_disjoint_from(bool, object))
@@ -28,12 +33,23 @@ static_assert(is_disjoint_from(int, Not[int]))
 static_assert(not is_disjoint_from(int, Not[str]))
 static_assert(is_disjoint_from(Not[int], int))
 static_assert(not is_disjoint_from(Not[str], int))
+
+# FunctionType, WrapperDescriptorType, ... are not acceptable base types.
+static_assert(is_disjoint_from(ChainMap, FunctionType))
+static_assert(is_disjoint_from(FunctionType, WrapperDescriptorType))
+# int, ModuleType, ... are acceptable base types.
+static_assert(not is_disjoint_from(ChainMap, int))
+static_assert(not is_disjoint_from(ChainMap, Counter))
+static_assert(not is_disjoint_from(ChainMap, ModuleType))
+
+# Both int and str are subclasses of object, but `int & str` is empty.
+static_assert(is_disjoint_from(Intersection[int, str], object))
 ```
 
 ## Class hierarchies
 
 ```py
-from knot_extensions import is_disjoint_from, static_assert, Intersection, is_subtype_of
+from knot_extensions import Intersection, Not, is_disjoint_from, static_assert, is_subtype_of
 from typing import final
 
 class A: ...
@@ -62,6 +78,10 @@ static_assert(not is_disjoint_from(FinalSubclass, A))
 # ... which makes it disjoint from B1, B2:
 static_assert(is_disjoint_from(B1, FinalSubclass))
 static_assert(is_disjoint_from(B2, FinalSubclass))
+
+static_assert(is_disjoint_from(B1, Not[B1]))
+static_assert(is_disjoint_from(C, Intersection[A, Not[B1]]))
+static_assert(is_disjoint_from(Intersection[A, Not[B1]], C))
 ```
 
 ## Tuple types
@@ -190,7 +210,7 @@ static_assert(not is_disjoint_from(None, object))
 
 ```py
 from typing_extensions import Literal, LiteralString
-from knot_extensions import TypeOf, is_disjoint_from, static_assert
+from knot_extensions import Intersection, Not, TypeOf, is_disjoint_from, static_assert
 
 static_assert(is_disjoint_from(Literal[True], Literal[False]))
 static_assert(is_disjoint_from(Literal[True], Literal[1]))
@@ -217,6 +237,10 @@ static_assert(not is_disjoint_from(Literal[1], Literal[1]))
 static_assert(not is_disjoint_from(Literal["a"], Literal["a"]))
 static_assert(not is_disjoint_from(Literal["a"], LiteralString))
 static_assert(not is_disjoint_from(Literal["a"], str))
+
+static_assert(is_disjoint_from(Intersection[str, Not[Literal["a"]]], Literal["a"]))
+static_assert(is_disjoint_from(Intersection[str, Not[Literal["a", "b"]]], Literal["a"]))
+static_assert(not is_disjoint_from(Intersection[str, Not[Literal["a"]]], Literal["b"]))
 ```
 
 ### Class, module and function literals
