@@ -200,7 +200,7 @@ static_assert(is_disjoint_from(None, Intersection[int, Not[str]]))
 
 ```py
 from typing_extensions import Literal, LiteralString
-from knot_extensions import Intersection, Not, TypeOf, is_disjoint_from, static_assert
+from knot_extensions import Intersection, Not, TypeOf, is_disjoint_from, static_assert, AlwaysFalsy, AlwaysTruthy
 
 static_assert(is_disjoint_from(Literal[True], Literal[False]))
 static_assert(is_disjoint_from(Literal[True], Literal[1]))
@@ -231,6 +231,32 @@ static_assert(not is_disjoint_from(Literal["a"], str))
 static_assert(is_disjoint_from(Intersection[str, Not[Literal["a"]]], Literal["a"]))
 static_assert(is_disjoint_from(Intersection[str, Not[Literal["a", "b"]]], Literal["a"]))
 static_assert(not is_disjoint_from(Intersection[str, Not[Literal["a"]]], Literal["b"]))
+
+# TODO: no errors
+# error: [static-assert-error]
+static_assert(is_disjoint_from(Intersection[Not[Literal[True]], Not[Literal[False]]], bool))
+# error: [static-assert-error]
+static_assert(is_disjoint_from(AlwaysFalsy, Intersection[LiteralString, Not[Literal[""]]]))
+static_assert(is_disjoint_from(AlwaysTruthy, Literal[""]))
+
+# TODO: no errors
+# The condition `is_disjoint(T, Not[T])` must still be satisfied after the following transformations:
+# `LiteralString & AlwaysTruthy` -> `LiteralString & ~Literal[""]`
+# error: [static-assert-error]
+static_assert(is_disjoint_from(Intersection[LiteralString, Not[Literal[""]]], Not[LiteralString] | AlwaysFalsy))
+# `LiteralString & ~AlwaysTruthy` -> `LiteralString & Literal[""]`
+static_assert(is_disjoint_from(Intersection[LiteralString, Literal[""]], Not[LiteralString] | AlwaysTruthy))
+# `bool & ~AlwaysTruthy`, `bool & ~Literal[True]` -> `bool & Literal[False]`
+static_assert(is_disjoint_from(Intersection[bool, Literal[False]], Not[bool] | AlwaysTruthy))
+static_assert(is_disjoint_from(Intersection[bool, Literal[False]], Not[bool] | Literal[True]))
+# `LiteralString & AlwaysFalsy` -> `LiteralString & Literal[""]`
+static_assert(is_disjoint_from(Intersection[LiteralString, Literal[""]], Not[LiteralString] | AlwaysTruthy))
+# `LiteralString & ~AlwaysFalsy`  -> `LiteralString & ~Literal[""]`
+# error: [static-assert-error]
+static_assert(is_disjoint_from(Intersection[LiteralString, Not[Literal[""]]], Not[LiteralString] | AlwaysFalsy))
+# `bool & ~AlwaysFalsy`, `bool & ~Literal[False]` -> `bool & Literal[True]`
+static_assert(is_disjoint_from(Intersection[bool, Literal[True]], Not[bool] | AlwaysFalsy))
+static_assert(is_disjoint_from(Intersection[bool, Literal[True]], Not[bool] | Literal[False]))
 ```
 
 ### Class, module and function literals
