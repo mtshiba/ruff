@@ -397,15 +397,24 @@ class IntIterable:
     def __iter__(self) -> IntIterator:
         return IntIterator()
 
+class TupleIterator:
+    def __next__(self) -> tuple[int, str]:
+        return (1, "a")
+
+class TupleIterable:
+    def __iter__(self) -> TupleIterator:
+        return TupleIterator()
+
 class C:
     def __init__(self) -> None:
         [... for self.a in IntIterable()]
+        [... for (self.b, self.c) in TupleIterable()]
 
 c_instance = C()
 
-# TODO: Should be `Unknown | int`
-# error: [unresolved-attribute]
-reveal_type(c_instance.a)  # revealed: Unknown
+reveal_type(c_instance.a)  # revealed: Unknown | int
+reveal_type(c_instance.b)  # revealed: Unknown | int
+reveal_type(c_instance.c)  # revealed: Unknown | str
 ```
 
 #### Conditionally declared / bound attributes
