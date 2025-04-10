@@ -26,9 +26,7 @@ class C:
 c_instance = C(1)
 
 reveal_type(c_instance.inferred_from_value)  # revealed: Unknown | Literal[1, "a"]
-
-# TODO: Same here. This should be `Unknown | Literal[1, "a"]`
-reveal_type(c_instance.inferred_from_other_attribute)  # revealed: Unknown
+reveal_type(c_instance.inferred_from_other_attribute)  # revealed: Unknown | Literal[1, "a"]
 
 # There is no special handling of attributes that are (directly) assigned to a declared parameter,
 # which means we union with `Unknown` here, since the attribute itself is not declared. This is
@@ -181,9 +179,7 @@ class C:
 c_instance = C(1)
 
 reveal_type(c_instance.inferred_from_value)  # revealed: Unknown | Literal[1, "a"]
-
-# TODO: Should be `Unknown | Literal[1, "a"]`
-reveal_type(c_instance.inferred_from_other_attribute)  # revealed: Unknown
+reveal_type(c_instance.inferred_from_other_attribute)  # revealed: Unknown | Literal[1, "a"]
 
 reveal_type(c_instance.inferred_from_param)  # revealed: Unknown | int | None
 
@@ -678,7 +674,7 @@ class C:
     pure_class_variable2: ClassVar = 1
 
     def method(self):
-        # TODO: this should be an error
+        # error: [invalid-attribute-access] "Cannot assign to ClassVar `pure_class_variable1` from an instance of type `C`"
         self.pure_class_variable1 = "value set through instance"
 
 reveal_type(C.pure_class_variable1)  # revealed: str

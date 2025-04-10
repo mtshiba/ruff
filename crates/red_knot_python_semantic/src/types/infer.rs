@@ -1580,10 +1580,61 @@ impl<'db> TypeInferenceBuilder<'db> {
         } else {
             let ty = if let Some(default_ty) = default_ty {
                 UnionType::from_elements(self.db(), [Type::unknown(), default_ty])
+            } else if let Some(self_ty) =
+                self.infer_self_parameter(parameter_with_default, definition)
+            {
+                self_ty
             } else {
                 Type::unknown()
             };
             self.add_binding(parameter.into(), definition, ty);
+        }
+    }
+
+    fn infer_self_parameter(
+        &self,
+        parameter_with_default: &ast::ParameterWithDefault,
+        definition: Definition<'db>,
+    ) -> Option<Type<'db>> {
+        let method_scope = definition.scope(self.db());
+        let method_node = method_scope.node(self.db()).as_function()?;
+
+        let is_classmethod = method_node
+            .decorator_list
+            .iter()
+            .any(|decorator| {
+                let decorator_ty = self.file_expression_type(&decorator.expression);
+                matches!(
+                    decorator_ty,
+                    Type::ClassLiteral(class) if class.class.is_known(self.db(), KnownClass::Classmethod)
+                )
+            });
+
+        let first_parameter = method_node.parameters.args.first()?;
+        if first_parameter != parameter_with_default {
+            return None;
+        }
+
+        let class_scope = method_scope
+            .scope(self.db())
+            .parent()?
+            .to_scope_id(self.db(), self.file());
+        let class_node = class_scope.node(self.db()).as_class()?;
+        let name = &class_node.name;
+
+        let body_scope = self
+            .index
+            .node_scope(NodeWithScopeRef::Class(class_node))
+            .to_scope_id(self.db(), self.file());
+
+        let maybe_known_class = KnownClass::try_from_file_and_name(self.db(), self.file(), name);
+
+        let class = Class::new(self.db(), &name.id, body_scope, maybe_known_class);
+
+        if is_classmethod {
+            Some(Type::class_literal(class))
+        } else {
+            Some(Type::instance(class))
         }
     }
 
@@ -2288,6 +2339,27 @@ impl<'db> TypeInferenceBuilder<'db> {
             assignable
         };
 
+        let in_class_method = || -> bool {
+            if let Some(function) = self.scope().node(db).as_function() {
+                if let Some(first_parameter) = function.parameters.args.first() {
+                    if let Some(parent) = self.scope().scope(db).parent() {
+                        if parent
+                            .to_scope_id(db, self.file())
+                            .node(db)
+                            .as_class()
+                            .is_some()
+                            && target.value.as_name_expr().is_some_and(|name| {
+                                name.id() == first_parameter.parameter.name().id()
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+
         match object_ty {
             Type::Union(union) => {
                 if union.elements(self.db()).iter().all(|elem| {
@@ -2374,7 +2446,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                             )
                             .is_ok();
 
-                        if !successful_call && emit_diagnostics {
+                        if !in_class_method() && !successful_call && emit_diagnostics {
                             // TODO: Here, it would be nice to emit an additional diagnostic that explains why the call failed
                             self.context.report_lint(
                                 &INVALID_ASSIGNMENT,
@@ -2405,7 +2477,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                                     (true, Boundness::PossiblyUnbound)
                                 };
 
-                            if boundness == Boundness::PossiblyUnbound {
+                            if !in_class_method() && boundness == Boundness::PossiblyUnbound {
                                 report_possibly_unbound_attribute(
                                     &self.context,
                                     target,
@@ -2429,7 +2501,9 @@ impl<'db> TypeInferenceBuilder<'db> {
                     if let Symbol::Type(instance_attr_ty, instance_attr_boundness) =
                         object_ty.instance_member(db, attribute).symbol
                     {
-                        if instance_attr_boundness == Boundness::PossiblyUnbound {
+                        if !in_class_method()
+                            && instance_attr_boundness == Boundness::PossiblyUnbound
+                        {
                             report_possibly_unbound_attribute(
                                 &self.context,
                                 target,
@@ -2440,7 +2514,7 @@ impl<'db> TypeInferenceBuilder<'db> {
 
                         ensure_assignable_to(instance_attr_ty)
                     } else {
-                        if emit_diagnostics {
+                        if !in_class_method() && emit_diagnostics {
                             self.context.report_lint(
                                 &UNRESOLVED_ATTRIBUTE,
                                 target,
@@ -2477,7 +2551,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                                 )
                                 .is_ok();
 
-                            if !successful_call && emit_diagnostics {
+                            if !in_class_method() && !successful_call && emit_diagnostics {
                                 // TODO: Here, it would be nice to emit an additional diagnostic that explains why the call failed
                                 self.context.report_lint(
                                     &INVALID_ASSIGNMENT,
@@ -2535,7 +2609,9 @@ impl<'db> TypeInferenceBuilder<'db> {
                             .expect("called on Type::ClassLiteral or Type::SubclassOf")
                             .symbol
                         {
-                            if class_attr_boundness == Boundness::PossiblyUnbound {
+                            if !in_class_method()
+                                && class_attr_boundness == Boundness::PossiblyUnbound
+                            {
                                 report_possibly_unbound_attribute(
                                     &self.context,
                                     target,
@@ -2555,7 +2631,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                                 });
 
                             // Attribute is declared or bound on instance. Forbid access from the class object
-                            if emit_diagnostics {
+                            if !in_class_method() && emit_diagnostics {
                                 if attribute_is_bound_on_instance {
                                     self.context.report_lint(
                                     &INVALID_ATTRIBUTE_ACCESS,
