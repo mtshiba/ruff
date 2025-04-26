@@ -54,7 +54,7 @@ impl<'db> Definition<'db> {
     }
 
     pub fn focus_range(self, db: &'db dyn Db) -> FileRange {
-        FileRange::new(self.file(db), self.kind(db).target_range())
+        FileRange::new(self.file(db), self.kind(db).target().range())
     }
 }
 
@@ -541,6 +541,19 @@ pub(crate) enum DefinitionTarget<'db> {
     Expr(ast::ExprRef<'db>),
 }
 
+impl DefinitionTarget<'_> {
+    /// Returns the [`TextRange`] of the definition target.
+    ///
+    /// A definition target would mainly be the node representing the symbol being defined i.e.,
+    /// [`ast::ExprName`] or [`ast::Identifier`] but could also be other nodes.
+    pub(crate) fn range(&self) -> TextRange {
+        match self {
+            Self::Ident(ident) => ident.range,
+            Self::Expr(expr) => expr.range(),
+        }
+    }
+}
+
 /// The kind of a definition.
 ///
 /// ## Usage in salsa tracked structs
@@ -586,36 +599,6 @@ impl DefinitionKind<'_> {
         match self {
             DefinitionKind::StarImport(import) => Some(import),
             _ => None,
-        }
-    }
-
-    /// Returns the [`TextRange`] of the definition target.
-    ///
-    /// A definition target would mainly be the node representing the symbol being defined i.e.,
-    /// [`ast::ExprName`] or [`ast::Identifier`] but could also be other nodes.
-    pub(crate) fn target_range(&self) -> TextRange {
-        match self {
-            DefinitionKind::Import(import) => import.alias().range(),
-            DefinitionKind::ImportFrom(import) => import.alias().range(),
-            DefinitionKind::StarImport(import) => import.alias().range(),
-            DefinitionKind::Function(function) => function.name.range(),
-            DefinitionKind::Class(class) => class.name.range(),
-            DefinitionKind::TypeAlias(type_alias) => type_alias.name.range(),
-            DefinitionKind::NamedExpression(named) => named.target.range(),
-            DefinitionKind::Assignment(assignment) => assignment.target.range(),
-            DefinitionKind::AnnotatedAssignment(assign) => assign.target.range(),
-            DefinitionKind::AugmentedAssignment(aug_assign) => aug_assign.target.range(),
-            DefinitionKind::For(for_stmt) => for_stmt.target.range(),
-            DefinitionKind::Comprehension(comp) => comp.target().range(),
-            DefinitionKind::VariadicPositionalParameter(parameter) => parameter.name.range(),
-            DefinitionKind::VariadicKeywordParameter(parameter) => parameter.name.range(),
-            DefinitionKind::Parameter(parameter) => parameter.parameter.name.range(),
-            DefinitionKind::WithItem(with_item) => with_item.target.range(),
-            DefinitionKind::MatchPattern(match_pattern) => match_pattern.identifier.range(),
-            DefinitionKind::ExceptHandler(handler) => handler.node().range(),
-            DefinitionKind::TypeVar(type_var) => type_var.name.range(),
-            DefinitionKind::ParamSpec(param_spec) => param_spec.name.range(),
-            DefinitionKind::TypeVarTuple(type_var_tuple) => type_var_tuple.name.range(),
         }
     }
 

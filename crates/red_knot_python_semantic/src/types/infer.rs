@@ -149,7 +149,7 @@ pub(crate) fn infer_definition_types<'db>(
     let file = definition.file(db);
     let _span = tracing::trace_span!(
         "infer_definition_types",
-        range = ?definition.kind(db).target_range(),
+        range = ?definition.kind(db).target().range(),
         ?file
     )
     .entered();
@@ -188,7 +188,7 @@ pub(crate) fn infer_deferred_types<'db>(
     let _span = tracing::trace_span!(
         "infer_deferred_types",
         definition = ?definition.as_id(),
-        range = ?definition.kind(db).target_range(),
+        range = ?definition.kind(db).target().range(),
         ?file
     )
     .entered();
