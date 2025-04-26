@@ -266,7 +266,7 @@ use self::symbol_state::{
 };
 use crate::node_key::NodeKey;
 use crate::semantic_index::ast_ids::ScopedUseId;
-use crate::semantic_index::definition::Definition;
+use crate::semantic_index::definition::{Definition, DefinitionTarget};
 use crate::semantic_index::narrowing_constraints::{
     NarrowingConstraints, NarrowingConstraintsBuilder, NarrowingConstraintsIterator,
 };
@@ -277,7 +277,7 @@ use crate::semantic_index::symbol::{FileScopeId, ScopedSymbolId};
 use crate::semantic_index::visibility_constraints::{
     ScopedVisibilityConstraintId, VisibilityConstraints, VisibilityConstraintsBuilder,
 };
-use crate::types::Truthiness;
+use crate::types::{infer_narrowing_constraint, IntersectionBuilder, Truthiness, Type};
 
 mod symbol_state;
 
@@ -567,6 +567,33 @@ impl<'db> Iterator for ConstraintsIterator<'_, 'db> {
 }
 
 impl std::iter::FusedIterator for ConstraintsIterator<'_, '_> {}
+
+impl<'db> ConstraintsIterator<'_, 'db> {
+    pub(crate) fn narrow(
+        self,
+        db: &'db dyn crate::Db,
+        base_ty: Type<'db>,
+        target: DefinitionTarget,
+    ) -> Type<'db> {
+        let constraint_tys: Vec<_> = self
+            .filter_map(|constraint| infer_narrowing_constraint(db, constraint, target))
+            .collect();
+
+        if constraint_tys.is_empty() {
+            base_ty
+        } else {
+            let intersection_ty = constraint_tys
+                .into_iter()
+                .rev()
+                .fold(
+                    IntersectionBuilder::new(db).add_positive(base_ty),
+                    IntersectionBuilder::add_positive,
+                )
+                .build();
+            intersection_ty
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DeclarationsIterator<'map, 'db> {

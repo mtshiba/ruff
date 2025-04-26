@@ -535,6 +535,12 @@ impl DefinitionCategory {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DefinitionTarget<'db> {
+    Ident(&'db ast::Identifier),
+    Expr(ast::ExprRef<'db>),
+}
+
 /// The kind of a definition.
 ///
 /// ## Usage in salsa tracked structs
@@ -610,6 +616,60 @@ impl DefinitionKind<'_> {
             DefinitionKind::TypeVar(type_var) => type_var.name.range(),
             DefinitionKind::ParamSpec(param_spec) => param_spec.name.range(),
             DefinitionKind::TypeVarTuple(type_var_tuple) => type_var_tuple.name.range(),
+        }
+    }
+
+    pub(crate) fn target(&self) -> DefinitionTarget {
+        match self {
+            DefinitionKind::Import(import) => DefinitionTarget::Ident(&import.alias().name),
+            DefinitionKind::ImportFrom(import) => DefinitionTarget::Ident(&import.alias().name),
+            DefinitionKind::StarImport(import) => DefinitionTarget::Ident(&import.alias().name),
+            DefinitionKind::Function(function) => DefinitionTarget::Ident(&function.name),
+            DefinitionKind::Class(class) => DefinitionTarget::Ident(&class.name),
+            DefinitionKind::TypeAlias(type_alias) => {
+                DefinitionTarget::Expr(ast::ExprRef::from(&type_alias.name))
+            }
+            DefinitionKind::TypeVar(type_var) => DefinitionTarget::Ident(&type_var.name),
+            DefinitionKind::ParamSpec(param_spec) => DefinitionTarget::Ident(&param_spec.name),
+            DefinitionKind::TypeVarTuple(type_var_tuple) => {
+                DefinitionTarget::Ident(&type_var_tuple.name)
+            }
+            DefinitionKind::NamedExpression(named) => {
+                DefinitionTarget::Expr(ast::ExprRef::from(&named.target))
+            }
+            DefinitionKind::Parameter(parameter) => {
+                DefinitionTarget::Ident(&parameter.parameter.name)
+            }
+            DefinitionKind::VariadicPositionalParameter(parameter) => {
+                DefinitionTarget::Ident(&parameter.name)
+            }
+            DefinitionKind::VariadicKeywordParameter(parameter) => {
+                DefinitionTarget::Ident(&parameter.name)
+            }
+            DefinitionKind::Assignment(assignment) => {
+                DefinitionTarget::Expr(ast::ExprRef::from(assignment.target.node()))
+            }
+            DefinitionKind::AnnotatedAssignment(assignment) => {
+                DefinitionTarget::Expr(ast::ExprRef::from(assignment.target.node()))
+            }
+            DefinitionKind::AugmentedAssignment(aug_assign) => {
+                DefinitionTarget::Expr(ast::ExprRef::from(&aug_assign.target))
+            }
+            DefinitionKind::For(for_stmt) => {
+                DefinitionTarget::Expr(ast::ExprRef::from(for_stmt.target.node()))
+            }
+            DefinitionKind::Comprehension(comp) => {
+                DefinitionTarget::Expr(ast::ExprRef::from(comp.target()))
+            }
+            DefinitionKind::WithItem(with_item) => {
+                DefinitionTarget::Expr(ast::ExprRef::from(with_item.target.node()))
+            }
+            DefinitionKind::MatchPattern(match_pattern) => {
+                DefinitionTarget::Ident(&match_pattern.identifier)
+            }
+            DefinitionKind::ExceptHandler(handler) => {
+                DefinitionTarget::Ident(handler.node().name.as_ref().unwrap())
+            }
         }
     }
 

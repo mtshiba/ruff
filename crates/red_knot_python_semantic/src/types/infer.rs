@@ -50,14 +50,14 @@ use crate::node_key::NodeKey;
 use crate::semantic_index::ast_ids::{HasScopedExpressionId, HasScopedUseId, ScopedExpressionId};
 use crate::semantic_index::definition::{
     AnnotatedAssignmentDefinitionKind, AssignmentDefinitionKind, ComprehensionDefinitionKind,
-    Definition, DefinitionKind, DefinitionNodeKey, ExceptHandlerDefinitionKind,
+    Definition, DefinitionKind, DefinitionNodeKey, DefinitionTarget, ExceptHandlerDefinitionKind,
     ForStmtDefinitionKind, TargetKind, WithItemDefinitionKind,
 };
 use crate::semantic_index::expression::{Expression, ExpressionKind};
 use crate::semantic_index::symbol::{
     FileScopeId, NodeWithScopeKind, NodeWithScopeRef, ScopeId, ScopeKind,
 };
-use crate::semantic_index::{semantic_index, EagerBindingsResult, SemanticIndex};
+use crate::semantic_index::{semantic_index, use_def_map, EagerBindingsResult, SemanticIndex};
 use crate::symbol::{
     builtins_module_scope, builtins_symbol, explicit_global_symbol,
     module_type_implicit_global_symbol, symbol, symbol_from_bindings, symbol_from_declarations,
@@ -4877,6 +4877,40 @@ impl<'db> TypeInferenceBuilder<'db> {
         }
     }
 
+    fn narrow<'r>(&self, target: impl Into<ast::ExprRef<'r>>, ty: Type<'db>) -> Type<'db> {
+        fn root_name<'r>(expr: impl Into<ast::ExprRef<'r>>) -> Option<&'r ast::ExprName> {
+            match expr.into() {
+                ast::ExprRef::Name(name) => Some(name),
+                ast::ExprRef::Attribute(attr) => root_name(&attr.value),
+                ast::ExprRef::Subscript(subscript)
+                    if subscript.slice.is_string_literal_expr()
+                        || subscript.slice.is_number_literal_expr() =>
+                {
+                    root_name(&subscript.value)
+                }
+                ast::ExprRef::Named(named) => root_name(&named.target),
+                _ => None,
+            }
+        }
+
+        let target = target.into();
+
+        if let Some(name) = root_name(target) {
+            let db = self.db();
+            let scope = self.scope();
+
+            let use_id = name.scoped_use_id(db, scope);
+            let use_def = use_def_map(db, scope);
+            let mut bindings = use_def.bindings_at_use(use_id);
+            let binding = bindings.next().unwrap();
+            binding
+                .narrowing_constraint
+                .narrow(db, ty, DefinitionTarget::Expr(target))
+        } else {
+            ty
+        }
+    }
+
     /// Infer the type of a [`ast::ExprAttribute`] expression, assuming a load context.
     fn infer_attribute_load(&mut self, attribute: &ast::ExprAttribute) -> Type<'db> {
         let ast::ExprAttribute {
@@ -4891,6 +4925,7 @@ impl<'db> TypeInferenceBuilder<'db> {
 
         value_type
             .member(db, &attr.id)
+            .map_type(|ty| self.narrow(attribute, ty))
             .unwrap_with_diagnostic(|lookup_error| match lookup_error {
                 LookupError::Unbound(_) => {
                     let report_unresolved_attribute = self.is_reachable(attribute);
@@ -6223,7 +6258,8 @@ impl<'db> TypeInferenceBuilder<'db> {
         }
 
         let slice_ty = self.infer_expression(slice);
-        self.infer_subscript_expression_types(value, value_ty, slice_ty)
+        let result_ty = self.infer_subscript_expression_types(value, value_ty, slice_ty);
+        self.narrow(subscript, result_ty)
     }
 
     fn infer_explicit_class_specialization(
