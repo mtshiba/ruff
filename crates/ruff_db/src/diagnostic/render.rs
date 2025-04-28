@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use ruff_annotate_snippets::{
     Annotation as AnnotateAnnotation, Level as AnnotateLevel, Message as AnnotateMessage,
     Renderer as AnnotateRenderer, Snippet as AnnotateSnippet,
 };
+use ruff_linter::message::replace_whitespace_and_unprintable;
 use ruff_source_file::{LineIndex, OneIndexed, SourceCode};
 use ruff_text_size::{TextRange, TextSize};
 
@@ -293,6 +294,8 @@ impl<'a> ResolvedAnnotation<'a> {
                 OneIndexed::MIN,
             ),
             (Some(range), _) => {
+                let code = replace_whitespace_and_unprintable(source.text(), range);
+                let range = code.annotation_range;
                 let line_start = source.line_index(range.start());
                 let mut line_end = source.line_index(range.end());
                 // As a special case, if the *end* of our range comes
@@ -439,7 +442,7 @@ impl<'r> RenderableSnippets<'r> {
 #[derive(Debug)]
 struct RenderableSnippet<'r> {
     /// The actual snippet text.
-    snippet: &'r str,
+    snippet: Cow<'r, str>,
     /// The absolute line number corresponding to where this
     /// snippet begins.
     line_start: OneIndexed,
@@ -494,13 +497,15 @@ impl<'r> RenderableSnippet<'r> {
         let snippet = input
             .as_source_code()
             .slice(TextRange::new(snippet_start, snippet_end));
+        let source =
+            replace_whitespace_and_unprintable(snippet, TextRange::new(snippet_start, snippet_end));
 
         let annotations = anns
             .iter()
             .map(|ann| RenderableAnnotation::new(snippet_start, ann))
             .collect();
         RenderableSnippet {
-            snippet,
+            snippet: source.text,
             line_start,
             annotations,
             has_primary,
@@ -509,7 +514,7 @@ impl<'r> RenderableSnippet<'r> {
 
     /// Convert this to an "annotate" snippet.
     fn to_annotate<'a>(&'a self, path: &'a str) -> AnnotateSnippet<'a> {
-        AnnotateSnippet::source(self.snippet)
+        AnnotateSnippet::source(&self.snippet)
             .origin(path)
             .line_start(self.line_start.get())
             .annotations(

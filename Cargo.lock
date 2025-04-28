@@ -2892,6 +2892,7 @@ dependencies = [
  "path-slash",
  "ruff_annotate_snippets",
  "ruff_cache",
+ "ruff_linter",
  "ruff_notebook",
  "ruff_python_ast",
  "ruff_python_parser",

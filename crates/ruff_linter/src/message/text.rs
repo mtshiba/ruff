@@ -292,7 +292,7 @@ impl Display for MessageCodeFrame<'_> {
 ///
 /// The source code returned has an annotation that is updated to reflect
 /// changes made to the source code (if any).
-fn replace_whitespace_and_unprintable(source: &str, annotation_range: TextRange) -> SourceCode {
+pub fn replace_whitespace_and_unprintable(source: &str, annotation_range: TextRange) -> SourceCode {
     let mut result = String::new();
     let mut last_end = 0;
     let mut range = annotation_range;
@@ -362,9 +362,9 @@ fn replace_whitespace_and_unprintable(source: &str, annotation_range: TextRange)
     }
 }
 
-struct SourceCode<'a> {
-    text: Cow<'a, str>,
-    annotation_range: TextRange,
+pub struct SourceCode<'a> {
+    pub text: Cow<'a, str>,
+    pub annotation_range: TextRange,
 }
 
 impl<'a> SourceCode<'a> {

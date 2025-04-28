@@ -40,6 +40,8 @@ mod rdjson;
 mod sarif;
 mod text;
 
+pub use text::replace_whitespace_and_unprintable;
+
 /// Message represents either a diagnostic message corresponding to a rule violation or a syntax
 /// error message raised by the parser.
 #[derive(Clone, Debug, PartialEq, Eq)]
