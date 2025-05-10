@@ -1,10 +1,10 @@
 use crate::semantic_index::ast_ids::HasScopedExpressionId;
 use crate::semantic_index::expression::Expression;
+use crate::semantic_index::lvalue::{LValueTable, ScopeId, ScopedLValueId};
+use crate::semantic_index::lvalue_table;
 use crate::semantic_index::predicate::{
     PatternPredicate, PatternPredicateKind, Predicate, PredicateNode,
 };
-use crate::semantic_index::symbol::{ScopeId, ScopedSymbolId, SymbolTable};
-use crate::semantic_index::symbol_table;
 use crate::types::infer::infer_same_file_expression_type;
 use crate::types::{
     infer_expression_types, IntersectionBuilder, KnownClass, SubclassOfType, Truthiness, Type,
@@ -38,7 +38,7 @@ use super::UnionType;
 pub(crate) fn infer_narrowing_constraint<'db>(
     db: &'db dyn Db,
     predicate: Predicate<'db>,
-    symbol: ScopedSymbolId,
+    lvalue: ScopedLValueId,
 ) -> Option<Type<'db>> {
     let constraints = match predicate.node {
         PredicateNode::Expression(expression) => {
@@ -58,7 +58,7 @@ pub(crate) fn infer_narrowing_constraint<'db>(
         PredicateNode::StarImportPlaceholder(_) => return None,
     };
     if let Some(constraints) = constraints {
-        constraints.get(&symbol).copied()
+        constraints.get(&lvalue).copied()
     } else {
         None
     }
@@ -182,7 +182,7 @@ impl KnownConstraintFunction {
     }
 }
 
-type NarrowingConstraints<'db> = FxHashMap<ScopedSymbolId, Type<'db>>;
+type NarrowingConstraints<'db> = FxHashMap<ScopedLValueId, Type<'db>>;
 
 fn merge_constraints_and<'db>(
     into: &mut NarrowingConstraints<'db>,
@@ -339,8 +339,8 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
             })
     }
 
-    fn symbols(&self) -> &'db SymbolTable {
-        symbol_table(self.db, self.scope())
+    fn lvalues(&self) -> &'db LValueTable {
+        lvalue_table(self.db, self.scope())
     }
 
     fn scope(&self) -> ScopeId<'db> {
@@ -352,9 +352,9 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
     }
 
     #[track_caller]
-    fn expect_expr_name_symbol(&self, symbol: &str) -> ScopedSymbolId {
-        self.symbols()
-            .symbol_id_by_name(symbol)
+    fn expect_expr_name_symbol(&self, symbol: &str) -> ScopedLValueId {
+        self.lvalues()
+            .lvalue_id_by_name(symbol)
             .expect("We should always have a symbol for every `Name` node")
     }
 

@@ -6,7 +6,7 @@ use ruff_python_ast::name::Name;
 
 use crate::{
     db::Db,
-    semantic_index::{symbol_table, use_def_map},
+    semantic_index::{lvalue_table, use_def_map},
     symbol::{symbol_from_bindings, symbol_from_declarations},
     types::{ClassBase, ClassLiteral, KnownFunction, Type, TypeMapping, TypeQualifiers},
 };
@@ -269,19 +269,19 @@ fn cached_protocol_interface<'db>(
     {
         let parent_scope = parent_protocol.body_scope(db);
         let use_def_map = use_def_map(db, parent_scope);
-        let symbol_table = symbol_table(db, parent_scope);
+        let lvalue_table = lvalue_table(db, parent_scope);
 
         members.extend(
             use_def_map
                 .all_public_declarations()
-                .flat_map(|(symbol_id, declarations)| {
-                    symbol_from_declarations(db, declarations).map(|symbol| (symbol_id, symbol))
+                .flat_map(|(lvalue_id, declarations)| {
+                    symbol_from_declarations(db, declarations).map(|symbol| (lvalue_id, symbol))
                 })
-                .filter_map(|(symbol_id, symbol)| {
+                .filter_map(|(lvalue_id, symbol)| {
                     symbol
                         .symbol
                         .ignore_possibly_unbound()
-                        .map(|ty| (symbol_id, ty, symbol.qualifiers))
+                        .map(|ty| (lvalue_id, ty, symbol.qualifiers))
                 })
                 // Bindings in the class body that are not declared in the class body
                 // are not valid protocol members, and we plan to emit diagnostics for them
@@ -294,14 +294,18 @@ fn cached_protocol_interface<'db>(
                 .chain(
                     use_def_map
                         .all_public_bindings()
-                        .filter_map(|(symbol_id, bindings)| {
+                        .filter_map(|(lvalue_id, bindings)| {
                             symbol_from_bindings(db, bindings)
                                 .ignore_possibly_unbound()
-                                .map(|ty| (symbol_id, ty, TypeQualifiers::default()))
+                                .map(|ty| (lvalue_id, ty, TypeQualifiers::default()))
                         }),
                 )
-                .map(|(symbol_id, member, qualifiers)| {
-                    (symbol_table.symbol(symbol_id).name(), member, qualifiers)
+                .filter_map(|(lvalue_id, member, qualifiers)| {
+                    Some((
+                        lvalue_table.lvalue(lvalue_id).as_name()?,
+                        member,
+                        qualifiers,
+                    ))
                 })
                 .filter(|(name, _, _)| !excluded_from_proto_members(name))
                 .map(|(name, ty, qualifiers)| {

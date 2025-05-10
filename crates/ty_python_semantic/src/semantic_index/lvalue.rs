@@ -1,7 +1,8 @@
+use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
-use bitflags::bitflags;
+use bitflags::{bitflags, Flags};
 use hashbrown::hash_map::RawEntryMut;
 use ruff_db::files::File;
 use ruff_db::parsed::ParsedModule;
@@ -13,92 +14,258 @@ use rustc_hash::FxHasher;
 use crate::ast_node_ref::AstNodeRef;
 use crate::node_key::NodeKey;
 use crate::semantic_index::visibility_constraints::ScopedVisibilityConstraintId;
-use crate::semantic_index::{semantic_index, SemanticIndex, SymbolMap};
+use crate::semantic_index::{semantic_index, LValueSet, SemanticIndex};
 use crate::Db;
 
-#[derive(Eq, PartialEq, Debug)]
-pub struct Symbol {
-    name: Name,
-    flags: SymbolFlags,
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+enum LValueSubSegment {
+    /// A member access, e.g. `y` in `x.y`.
+    Member(ast::name::Name),
+    /// An integer index access, e.g. `1` in `x[1]`.
+    IntSubscript(ast::Int),
+    /// A string index access, e.g. `"foo"` in `x["foo"]`.
+    StringSubscript(String),
 }
 
-impl Symbol {
-    fn new(name: Name) -> Self {
+impl LValueSubSegment {
+    fn as_member(&self) -> Option<&ast::name::Name> {
+        match self {
+            LValueSubSegment::Member(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// A value that can be the left side of a `Definition`.
+/// If you want to perform a comparison based on the equality of segments (without including flags), use [`LValueSegments`].
+#[derive(Eq, PartialEq, Debug)]
+pub struct LValue {
+    root_name: Name,
+    sub_segments: Vec<LValueSubSegment>,
+    flags: LValueFlags,
+}
+
+impl std::fmt::Display for LValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.root_name)?;
+        for segment in &self.sub_segments {
+            match segment {
+                LValueSubSegment::Member(name) => write!(f, ".{name}")?,
+                LValueSubSegment::IntSubscript(int) => write!(f, "[{int}]")?,
+                LValueSubSegment::StringSubscript(string) => write!(f, "[\"{string}\"]")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<&ast::name::Name> for LValue {
+    type Error = Infallible;
+
+    fn try_from(name: &ast::name::Name) -> Result<Self, Infallible> {
+        Ok(LValue::name(name.clone()))
+    }
+}
+
+impl TryFrom<ast::name::Name> for LValue {
+    type Error = Infallible;
+
+    fn try_from(name: ast::name::Name) -> Result<Self, Infallible> {
+        Ok(LValue::name(name))
+    }
+}
+
+impl TryFrom<&ast::Expr> for LValue {
+    type Error = ();
+
+    fn try_from(expr: &ast::Expr) -> Result<Self, ()> {
+        match expr {
+            ast::Expr::Name(name) => Ok(LValue::name(name.id.clone())),
+            ast::Expr::Attribute(attr) => {
+                let mut lvalue = LValue::try_from(&*attr.value)?;
+                lvalue
+                    .sub_segments
+                    .push(LValueSubSegment::Member(attr.attr.id.clone()));
+                Ok(lvalue)
+            }
+            ast::Expr::Subscript(subscript) => {
+                let mut lvalue = LValue::try_from(&*subscript.value)?;
+                match &*subscript.slice {
+                    ast::Expr::NumberLiteral(number) if number.value.is_int() => {
+                        lvalue.sub_segments.push(LValueSubSegment::IntSubscript(
+                            number.value.as_int().unwrap().clone(),
+                        ));
+                    }
+                    ast::Expr::StringLiteral(string) => {
+                        lvalue
+                            .sub_segments
+                            .push(LValueSubSegment::StringSubscript(string.value.to_string()));
+                    }
+                    _ => {
+                        return Err(());
+                    }
+                }
+                Ok(lvalue)
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+impl LValue {
+    pub(super) fn name(name: Name) -> Self {
         Self {
-            name,
-            flags: SymbolFlags::empty(),
+            root_name: name,
+            sub_segments: Vec::new(),
+            flags: LValueFlags::empty(),
         }
     }
 
-    fn insert_flags(&mut self, flags: SymbolFlags) {
+    pub(super) fn member(mut self, name: ast::name::Name) -> Self {
+        self.sub_segments.push(LValueSubSegment::Member(name));
+        self.flags.clear();
+        self
+    }
+
+    fn insert_flags(&mut self, flags: LValueFlags) {
         self.flags.insert(flags);
     }
 
-    /// The symbol's name.
-    pub fn name(&self) -> &Name {
-        &self.name
+    pub(super) fn mark_instance_attribute(&mut self) {
+        self.flags.insert(LValueFlags::IS_INSTANCE_ATTRIBUTE);
     }
 
-    /// Is the symbol used in its containing scope?
+    pub(super) fn root_name(&self) -> &Name {
+        &self.root_name
+    }
+
+    pub(crate) fn as_name(&self) -> Option<&Name> {
+        if self.is_name() {
+            Some(&self.root_name)
+        } else {
+            None
+        }
+    }
+
+    /// The lvalue's name.
+    #[track_caller]
+    pub(crate) fn expect_name(&self) -> &Name {
+        debug_assert_eq!(self.sub_segments, vec![]);
+        &self.root_name
+    }
+
+    pub(super) fn is_instance_attribute(&self, name: &str) -> bool {
+        self.flags.contains(LValueFlags::IS_INSTANCE_ATTRIBUTE)
+            && self.sub_segments.len() == 1
+            && self.sub_segments[0].as_member().unwrap().as_str() == name
+    }
+
+    /// Is the lvalue used in its containing scope?
     pub fn is_used(&self) -> bool {
-        self.flags.contains(SymbolFlags::IS_USED)
+        self.flags.contains(LValueFlags::IS_USED)
     }
 
-    /// Is the symbol defined in its containing scope?
+    /// Is the lvalue defined in its containing scope?
     pub fn is_bound(&self) -> bool {
-        self.flags.contains(SymbolFlags::IS_BOUND)
+        self.flags.contains(LValueFlags::IS_BOUND)
     }
 
-    /// Is the symbol declared in its containing scope?
+    /// Is the lvalue declared in its containing scope?
     pub fn is_declared(&self) -> bool {
-        self.flags.contains(SymbolFlags::IS_DECLARED)
+        self.flags.contains(LValueFlags::IS_DECLARED)
+    }
+
+    pub fn is_name(&self) -> bool {
+        self.sub_segments.is_empty()
+    }
+
+    fn segments(&self) -> LValueSegments {
+        LValueSegments {
+            root_name: Some(&self.root_name),
+            sub_segments: &self.sub_segments,
+        }
     }
 }
 
 bitflags! {
-    /// Flags that can be queried to obtain information about a symbol in a given scope.
+    /// Flags that can be queried to obtain information about a lvalue in a given scope.
     ///
     /// See the doc-comment at the top of [`super::use_def`] for explanations of what it
-    /// means for a symbol to be *bound* as opposed to *declared*.
+    /// means for a lvalue to be *bound* as opposed to *declared*.
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    struct SymbolFlags: u8 {
-        const IS_USED         = 1 << 0;
-        const IS_BOUND        = 1 << 1;
-        const IS_DECLARED     = 1 << 2;
+    struct LValueFlags: u8 {
+        const IS_USED               = 1 << 0;
+        const IS_BOUND              = 1 << 1;
+        const IS_DECLARED           = 1 << 2;
         /// TODO: This flag is not yet set by anything
-        const MARKED_GLOBAL   = 1 << 3;
+        const MARKED_GLOBAL         = 1 << 3;
         /// TODO: This flag is not yet set by anything
-        const MARKED_NONLOCAL = 1 << 4;
+        const MARKED_NONLOCAL       = 1 << 4;
+        const IS_INSTANCE_ATTRIBUTE = 1 << 5;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LValueSegment<'db> {
+    Name(&'db ast::name::Name),
+    Member(&'db ast::name::Name),
+    IntSubscript(&'db ast::Int),
+    StringSubscript(&'db str),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct LValueSegments<'db> {
+    root_name: Option<&'db ast::name::Name>,
+    sub_segments: &'db [LValueSubSegment],
+}
+
+impl<'db> Iterator for LValueSegments<'db> {
+    type Item = LValueSegment<'db>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(name) = self.root_name.take() {
+            return Some(LValueSegment::Name(name));
+        }
+        if self.sub_segments.is_empty() {
+            return None;
+        }
+        let segment = &self.sub_segments[0];
+        self.sub_segments = &self.sub_segments[1..];
+        Some(match segment {
+            LValueSubSegment::Member(name) => LValueSegment::Member(name),
+            LValueSubSegment::IntSubscript(int) => LValueSegment::IntSubscript(int),
+            LValueSubSegment::StringSubscript(string) => LValueSegment::StringSubscript(string),
+        })
     }
 }
 
 /// ID that uniquely identifies a symbol in a file.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct FileSymbolId {
+pub struct FileLValueId {
     scope: FileScopeId,
-    scoped_symbol_id: ScopedSymbolId,
+    scoped_lvalue_id: ScopedLValueId,
 }
 
-impl FileSymbolId {
+impl FileLValueId {
     pub fn scope(self) -> FileScopeId {
         self.scope
     }
 
-    pub(crate) fn scoped_symbol_id(self) -> ScopedSymbolId {
-        self.scoped_symbol_id
+    pub(crate) fn scoped_lvalue_id(self) -> ScopedLValueId {
+        self.scoped_lvalue_id
     }
 }
 
-impl From<FileSymbolId> for ScopedSymbolId {
-    fn from(val: FileSymbolId) -> Self {
-        val.scoped_symbol_id()
+impl From<FileLValueId> for ScopedLValueId {
+    fn from(val: FileLValueId) -> Self {
+        val.scoped_lvalue_id()
     }
 }
 
-/// Symbol ID that uniquely identifies a symbol inside a [`Scope`].
+/// ID that uniquely identifies a lvalue inside a [`Scope`].
 #[newtype_index]
 #[derive(salsa::Update)]
-pub struct ScopedSymbolId;
+pub struct ScopedLValueId;
 
 /// A cross-module identifier of a scope that can be used as a salsa query parameter.
 #[salsa::tracked(debug)]
@@ -272,50 +439,75 @@ impl ScopeKind {
     }
 }
 
-/// Symbol table for a specific [`Scope`].
+/// [`LValue`] table for a specific [`Scope`].
 #[derive(Default, salsa::Update)]
-pub struct SymbolTable {
-    /// The symbols in this scope.
-    symbols: IndexVec<ScopedSymbolId, Symbol>,
+pub struct LValueTable {
+    /// The lvalues in this scope.
+    lvalues: IndexVec<ScopedLValueId, LValue>,
 
-    /// The symbols indexed by name.
-    symbols_by_name: SymbolMap,
+    /// The set of lvalues.
+    lvalue_set: LValueSet,
 }
 
-impl SymbolTable {
+impl LValueTable {
     fn shrink_to_fit(&mut self) {
-        self.symbols.shrink_to_fit();
+        self.lvalues.shrink_to_fit();
     }
 
-    pub(crate) fn symbol(&self, symbol_id: impl Into<ScopedSymbolId>) -> &Symbol {
-        &self.symbols[symbol_id.into()]
+    pub(crate) fn lvalue(&self, lvalue_id: impl Into<ScopedLValueId>) -> &LValue {
+        &self.lvalues[lvalue_id.into()]
     }
 
     #[expect(unused)]
-    pub(crate) fn symbol_ids(&self) -> impl Iterator<Item = ScopedSymbolId> {
-        self.symbols.indices()
+    pub(crate) fn lvalue_ids(&self) -> impl Iterator<Item = ScopedLValueId> {
+        self.lvalues.indices()
     }
 
-    pub fn symbols(&self) -> impl Iterator<Item = &Symbol> {
-        self.symbols.iter()
+    pub fn lvalues(&self) -> impl Iterator<Item = &LValue> {
+        self.lvalues.iter()
+    }
+
+    pub fn symbols(&self) -> impl Iterator<Item = &LValue> {
+        self.lvalues().filter(|lvalue| lvalue.is_name())
     }
 
     /// Returns the symbol named `name`.
-    pub(crate) fn symbol_by_name(&self, name: &str) -> Option<&Symbol> {
-        let id = self.symbol_id_by_name(name)?;
-        Some(self.symbol(id))
+    pub(crate) fn lvalue_by_name(&self, name: &str) -> Option<&LValue> {
+        let id = self.lvalue_id_by_name(name)?;
+        Some(self.lvalue(id))
     }
 
-    /// Returns the [`ScopedSymbolId`] of the symbol named `name`.
-    pub(crate) fn symbol_id_by_name(&self, name: &str) -> Option<ScopedSymbolId> {
+    /// Returns the [`ScopedLValueId`] of the lvalue named `name`.
+    pub(crate) fn lvalue_id_by_name(&self, name: &str) -> Option<ScopedLValueId> {
         let (id, ()) = self
-            .symbols_by_name
+            .lvalue_set
             .raw_entry()
             .from_hash(Self::hash_name(name), |id| {
-                self.symbol(*id).name().as_str() == name
+                self.lvalue(*id).as_name().map(Name::as_str) == Some(name)
             })?;
 
         Some(*id)
+    }
+
+    /// Returns the [`ScopedLValueId`] of the lvalue.
+    pub(crate) fn lvalue_id_by_lvalue(&self, lvalue: &LValue) -> Option<ScopedLValueId> {
+        let (id, ()) = self
+            .lvalue_set
+            .raw_entry()
+            .from_hash(Self::hash_lvalue(lvalue), |id| {
+                self.lvalue(*id).segments() == lvalue.segments()
+            })?;
+
+        Some(*id)
+    }
+
+    pub(crate) fn lvalue_id_by_instance_attribute_name(
+        &self,
+        name: &str,
+    ) -> Option<ScopedLValueId> {
+        self.lvalues
+            .indices()
+            .find(|id| self.lvalues[*id].is_instance_attribute(name))
     }
 
     fn hash_name(name: &str) -> u64 {
@@ -323,80 +515,111 @@ impl SymbolTable {
         name.hash(&mut hasher);
         hasher.finish()
     }
-}
 
-impl PartialEq for SymbolTable {
-    fn eq(&self, other: &Self) -> bool {
-        // We don't need to compare the symbols_by_name because the name is already captured in `Symbol`.
-        self.symbols == other.symbols
+    fn hash_lvalue(lvalue: &LValue) -> u64 {
+        let mut hasher = FxHasher::default();
+        lvalue.root_name().as_str().hash(&mut hasher);
+        for segment in &lvalue.sub_segments {
+            match segment {
+                LValueSubSegment::Member(name) => name.hash(&mut hasher),
+                LValueSubSegment::IntSubscript(int) => int.hash(&mut hasher),
+                LValueSubSegment::StringSubscript(string) => string.hash(&mut hasher),
+            }
+        }
+        hasher.finish()
     }
 }
 
-impl Eq for SymbolTable {}
+impl PartialEq for LValueTable {
+    fn eq(&self, other: &Self) -> bool {
+        // We don't need to compare the lvalue_set because the lvalue is already captured in `LValue`.
+        self.lvalues == other.lvalues
+    }
+}
 
-impl std::fmt::Debug for SymbolTable {
-    /// Exclude the `symbols_by_name` field from the debug output.
+impl Eq for LValueTable {}
+
+impl std::fmt::Debug for LValueTable {
+    /// Exclude the `lvalue_set` field from the debug output.
     /// It's very noisy and not useful for debugging.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SymbolTable")
-            .field(&self.symbols)
+        f.debug_tuple("LValueTable")
+            .field(&self.lvalues)
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Debug, Default)]
-pub(super) struct SymbolTableBuilder {
-    table: SymbolTable,
+pub(super) struct LValueTableBuilder {
+    table: LValueTable,
 }
 
-impl SymbolTableBuilder {
-    pub(super) fn add_symbol(&mut self, name: Name) -> (ScopedSymbolId, bool) {
-        let hash = SymbolTable::hash_name(&name);
+impl LValueTableBuilder {
+    pub(super) fn add_symbol(&mut self, name: Name) -> (ScopedLValueId, bool) {
+        let hash = LValueTable::hash_name(&name);
         let entry = self
             .table
-            .symbols_by_name
+            .lvalue_set
             .raw_entry_mut()
-            .from_hash(hash, |id| self.table.symbols[*id].name() == &name);
+            .from_hash(hash, |id| self.table.lvalues[*id].as_name() == Some(&name));
 
         match entry {
             RawEntryMut::Occupied(entry) => (*entry.key(), false),
             RawEntryMut::Vacant(entry) => {
-                let symbol = Symbol::new(name);
+                let symbol = LValue::name(name);
 
-                let id = self.table.symbols.push(symbol);
+                let id = self.table.lvalues.push(symbol);
                 entry.insert_with_hasher(hash, id, (), |id| {
-                    SymbolTable::hash_name(self.table.symbols[*id].name().as_str())
+                    LValueTable::hash_lvalue(&self.table.lvalues[*id])
                 });
                 (id, true)
             }
         }
     }
 
-    pub(super) fn mark_symbol_bound(&mut self, id: ScopedSymbolId) {
-        self.table.symbols[id].insert_flags(SymbolFlags::IS_BOUND);
+    pub(super) fn add_lvalue(&mut self, lvalue: LValue) -> (ScopedLValueId, bool) {
+        let hash = LValueTable::hash_lvalue(&lvalue);
+        let entry = self.table.lvalue_set.raw_entry_mut().from_hash(hash, |id| {
+            self.table.lvalues[*id].segments() == lvalue.segments()
+        });
+
+        match entry {
+            RawEntryMut::Occupied(entry) => (*entry.key(), false),
+            RawEntryMut::Vacant(entry) => {
+                let id = self.table.lvalues.push(lvalue);
+                entry.insert_with_hasher(hash, id, (), |id| {
+                    LValueTable::hash_lvalue(&self.table.lvalues[*id])
+                });
+                (id, true)
+            }
+        }
     }
 
-    pub(super) fn mark_symbol_declared(&mut self, id: ScopedSymbolId) {
-        self.table.symbols[id].insert_flags(SymbolFlags::IS_DECLARED);
+    pub(super) fn mark_lvalue_bound(&mut self, id: ScopedLValueId) {
+        self.table.lvalues[id].insert_flags(LValueFlags::IS_BOUND);
     }
 
-    pub(super) fn mark_symbol_used(&mut self, id: ScopedSymbolId) {
-        self.table.symbols[id].insert_flags(SymbolFlags::IS_USED);
+    pub(super) fn mark_lvalue_declared(&mut self, id: ScopedLValueId) {
+        self.table.lvalues[id].insert_flags(LValueFlags::IS_DECLARED);
     }
 
-    pub(super) fn symbols(&self) -> impl Iterator<Item = &Symbol> {
-        self.table.symbols()
+    pub(super) fn mark_lvalue_used(&mut self, id: ScopedLValueId) {
+        self.table.lvalues[id].insert_flags(LValueFlags::IS_USED);
     }
 
-    pub(super) fn symbol_id_by_name(&self, name: &str) -> Option<ScopedSymbolId> {
-        self.table.symbol_id_by_name(name)
+    pub(super) fn lvalues(&self) -> impl Iterator<Item = &LValue> {
+        self.table.lvalues()
     }
 
-    pub(super) fn symbol(&self, symbol_id: impl Into<ScopedSymbolId>) -> &Symbol {
-        self.table.symbol(symbol_id)
+    pub(super) fn lvalue_id_by_lvalue(&self, lvalue: &LValue) -> Option<ScopedLValueId> {
+        self.table.lvalue_id_by_lvalue(lvalue)
     }
 
-    pub(super) fn finish(mut self) -> SymbolTable {
+    pub(super) fn lvalue(&self, lvalue_id: impl Into<ScopedLValueId>) -> &LValue {
+        self.table.lvalue(lvalue_id)
+    }
+
+    pub(super) fn finish(mut self) -> LValueTable {
         self.table.shrink_to_fit();
         self.table
     }

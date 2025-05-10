@@ -19,9 +19,8 @@ use crate::{
         ast_ids::HasScopedExpressionId,
         attribute_assignments,
         definition::{DefinitionKind, TargetKind},
-        semantic_index,
-        symbol::ScopeId,
-        symbol_table, use_def_map,
+        lvalue::ScopeId,
+        lvalue_table, semantic_index, use_def_map,
     },
     symbol::{
         class_symbol, known_module_symbol, symbol_from_bindings, symbol_from_declarations,
@@ -1301,10 +1300,10 @@ impl<'db> ClassLiteral<'db> {
         let mut attributes = FxOrderMap::default();
 
         let class_body_scope = self.body_scope(db);
-        let table = symbol_table(db, class_body_scope);
+        let table = lvalue_table(db, class_body_scope);
 
         let use_def = use_def_map(db, class_body_scope);
-        for (symbol_id, declarations) in use_def.all_public_declarations() {
+        for (lvalue_id, declarations) in use_def.all_public_declarations() {
             // Here, we exclude all declarations that are not annotated assignments. We need this because
             // things like function definitions and nested classes would otherwise be considered dataclass
             // fields. The check is too broad in the sense that it also excludes (weird) constructs where
@@ -1326,7 +1325,7 @@ impl<'db> ClassLiteral<'db> {
                 continue;
             }
 
-            let symbol = table.symbol(symbol_id);
+            let symbol = table.lvalue(lvalue_id);
 
             if let Ok(attr) = symbol_from_declarations(db, declarations) {
                 if attr.is_class_var() {
@@ -1334,10 +1333,10 @@ impl<'db> ClassLiteral<'db> {
                 }
 
                 if let Some(attr_ty) = attr.symbol.ignore_possibly_unbound() {
-                    let bindings = use_def.public_bindings(symbol_id);
+                    let bindings = use_def.public_bindings(lvalue_id);
                     let default_ty = symbol_from_bindings(db, bindings).ignore_possibly_unbound();
 
-                    attributes.insert(symbol.name().clone(), (attr_ty, default_ty));
+                    attributes.insert(symbol.expect_name().clone(), (attr_ty, default_ty));
                 }
             }
         }
@@ -1426,7 +1425,7 @@ impl<'db> ClassLiteral<'db> {
         let file = class_body_scope.file(db);
         let index = semantic_index(db, file);
         let class_map = use_def_map(db, class_body_scope);
-        let class_table = symbol_table(db, class_body_scope);
+        let class_table = lvalue_table(db, class_body_scope);
 
         for (attribute_assignments, method_scope_id) in
             attribute_assignments(db, class_body_scope, name)
@@ -1437,7 +1436,7 @@ impl<'db> ClassLiteral<'db> {
             // The attribute assignment inherits the visibility of the method which contains it
             let is_method_visible = if let Some(method_def) = method_scope.node(db).as_function() {
                 let method = index.expect_single_definition(method_def);
-                let method_symbol = class_table.symbol_id_by_name(&method_def.name).unwrap();
+                let method_symbol = class_table.lvalue_id_by_name(&method_def.name).unwrap();
                 class_map
                     .public_bindings(method_symbol)
                     .find_map(|bind| {
@@ -1662,12 +1661,12 @@ impl<'db> ClassLiteral<'db> {
         // - Proper diagnostics
 
         let body_scope = self.body_scope(db);
-        let table = symbol_table(db, body_scope);
+        let table = lvalue_table(db, body_scope);
 
-        if let Some(symbol_id) = table.symbol_id_by_name(name) {
+        if let Some(lvalue_id) = table.lvalue_id_by_name(name) {
             let use_def = use_def_map(db, body_scope);
 
-            let declarations = use_def.public_declarations(symbol_id);
+            let declarations = use_def.public_declarations(lvalue_id);
             let declared_and_qualifiers = symbol_from_declarations(db, declarations);
             match declared_and_qualifiers {
                 Ok(SymbolAndQualifiers {
@@ -1676,7 +1675,7 @@ impl<'db> ClassLiteral<'db> {
                 }) => {
                     // The attribute is declared in the class body.
 
-                    let bindings = use_def.public_bindings(symbol_id);
+                    let bindings = use_def.public_bindings(lvalue_id);
                     let inferred = symbol_from_bindings(db, bindings);
                     let has_binding = !inferred.is_unbound();
 
