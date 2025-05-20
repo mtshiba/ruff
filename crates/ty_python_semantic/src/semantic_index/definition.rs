@@ -8,16 +8,16 @@ use ruff_text_size::{Ranged, TextRange};
 use crate::Db;
 use crate::ast_node_ref::AstNodeRef;
 use crate::node_key::NodeKey;
-use crate::semantic_index::place::{FileScopeId, ScopeId, ScopedPlaceId};
+use crate::semantic_index::symbol::{FileScopeId, ScopeId, ScopedSymbolId};
 use crate::unpack::{Unpack, UnpackPosition};
 
-/// A definition of a place.
+/// A definition of a symbol.
 ///
 /// ## ID stability
 /// The `Definition`'s ID is stable when the only field that change is its `kind` (AST node).
 ///
 /// The `Definition` changes when the `file`, `scope`, or `place` change. This can be
-/// because a new scope gets inserted before the `Definition` or a new place is inserted
+/// because a new scope gets inserted before the `Definition` or a new symbol is inserted
 /// before this `Definition`. However, the ID can be considered stable and it is okay to use
 /// `Definition` in cross-module` salsa queries or as a field on other salsa tracked structs.
 #[salsa::tracked(debug)]
@@ -28,8 +28,8 @@ pub struct Definition<'db> {
     /// The scope in which the definition occurs.
     pub(crate) file_scope: FileScopeId,
 
-    /// The place ID of the definition.
-    pub(crate) place: ScopedPlaceId,
+    /// The symbol ID of the definition.
+    pub(crate) symbol: ScopedSymbolId,
 
     /// WARNING: Only access this field when doing type inference for the same
     /// file as where `Definition` is defined to avoid cross-file query dependencies.
@@ -232,7 +232,7 @@ pub(crate) struct ImportDefinitionNodeRef<'a> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct StarImportDefinitionNodeRef<'a> {
     pub(crate) node: &'a ast::StmtImportFrom,
-    pub(crate) place_id: ScopedPlaceId,
+    pub(crate) symbol_id: ScopedSymbolId,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -323,10 +323,10 @@ impl<'db> DefinitionNodeRef<'db> {
                 is_reexported,
             }),
             DefinitionNodeRef::ImportStar(star_import) => {
-                let StarImportDefinitionNodeRef { node, place_id } = star_import;
+                let StarImportDefinitionNodeRef { node, symbol_id } = star_import;
                 DefinitionKind::StarImport(StarImportDefinitionKind {
                     node: unsafe { AstNodeRef::new(parsed, node) },
-                    place_id,
+                    symbol_id,
                 })
             }
             DefinitionNodeRef::Function(function) => {
@@ -456,7 +456,7 @@ impl<'db> DefinitionNodeRef<'db> {
 
             // INVARIANT: for an invalid-syntax statement such as `from foo import *, bar, *`,
             // we only create a `StarImportDefinitionKind` for the *first* `*` alias in the names list.
-            Self::ImportStar(StarImportDefinitionNodeRef { node, place_id: _ }) => node
+            Self::ImportStar(StarImportDefinitionNodeRef { node, symbol_id: _ }) => node
                 .names
                 .iter()
                 .find(|alias| &alias.name == "*")
@@ -517,7 +517,7 @@ pub(crate) enum DefinitionCategory {
 }
 
 impl DefinitionCategory {
-    /// True if this definition establishes a "declared type" for the place.
+    /// True if this definition establishes a "declared type" for the symbol.
     ///
     /// If so, any assignments reached by this definition are in error if they assign a value of a
     /// type not assignable to the declared type.
@@ -530,7 +530,7 @@ impl DefinitionCategory {
         )
     }
 
-    /// True if this definition assigns a value to the place.
+    /// True if this definition assigns a value to the symbol.
     ///
     /// False only for annotated assignments without a RHS.
     pub(crate) fn is_binding(self) -> bool {
@@ -591,7 +591,7 @@ impl DefinitionKind<'_> {
 
     /// Returns the [`TextRange`] of the definition target.
     ///
-    /// A definition target would mainly be the node representing the place being defined i.e.,
+    /// A definition target would mainly be the node representing the symbol being defined i.e.,
     /// [`ast::ExprName`], [`ast::Identifier`], [`ast::ExprAttribute`] or [`ast::ExprSubscript`] but could also be other nodes.
     pub(crate) fn target_range(&self) -> TextRange {
         match self {
@@ -722,7 +722,7 @@ impl<'db> From<Option<(UnpackPosition, Unpack<'db>)>> for TargetKind<'db> {
 #[derive(Clone, Debug)]
 pub struct StarImportDefinitionKind {
     node: AstNodeRef<ast::StmtImportFrom>,
-    place_id: ScopedPlaceId,
+    symbol_id: ScopedSymbolId,
 }
 
 impl StarImportDefinitionKind {
@@ -744,8 +744,8 @@ impl StarImportDefinitionKind {
             )
     }
 
-    pub(crate) fn place_id(&self) -> ScopedPlaceId {
-        self.place_id
+    pub(crate) fn symbol_id(&self) -> ScopedSymbolId {
+        self.symbol_id
     }
 }
 

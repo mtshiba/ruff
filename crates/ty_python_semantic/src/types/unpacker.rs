@@ -7,7 +7,7 @@ use ruff_python_ast::{self as ast, AnyNodeRef};
 
 use crate::Db;
 use crate::semantic_index::ast_ids::{HasScopedExpressionId, ScopedExpressionId};
-use crate::semantic_index::place::ScopeId;
+use crate::semantic_index::symbol::ScopeId;
 use crate::types::{Type, TypeCheckDiagnostics, infer_expression_types, todo_type};
 use crate::unpack::{UnpackKind, UnpackValue};
 

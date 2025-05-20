@@ -31,15 +31,15 @@ use crate::semantic_index::definition::{
     StarImportDefinitionNodeRef, WithItemDefinitionNodeRef,
 };
 use crate::semantic_index::expression::{Expression, ExpressionKind};
-use crate::semantic_index::place::{
-    FileScopeId, NodeWithScopeKey, NodeWithScopeKind, NodeWithScopeRef, PlaceExpr,
-    PlaceTableBuilder, Scope, ScopeId, ScopeKind, ScopedPlaceId,
-};
 use crate::semantic_index::predicate::{
     PatternPredicate, PatternPredicateKind, Predicate, PredicateNode, ScopedPredicateId,
     StarImportPlaceholderPredicate,
 };
 use crate::semantic_index::re_exports::exported_names;
+use crate::semantic_index::symbol::{
+    FileScopeId, NodeWithScopeKey, NodeWithScopeKind, NodeWithScopeRef, PlaceExpr, Scope, ScopeId,
+    ScopeKind, ScopedSymbolId, SymbolTableBuilder,
+};
 use crate::semantic_index::use_def::{
     EagerSnapshotKey, FlowSnapshot, ScopedEagerSnapshotId, UseDefMapBuilder,
 };
@@ -98,12 +98,12 @@ pub(super) struct SemanticIndexBuilder<'db> {
     // Semantic Index fields
     scopes: IndexVec<FileScopeId, Scope>,
     scope_ids_by_scope: IndexVec<FileScopeId, ScopeId<'db>>,
-    place_tables: IndexVec<FileScopeId, PlaceTableBuilder>,
+    symbol_tables: IndexVec<FileScopeId, SymbolTableBuilder>,
     ast_ids: IndexVec<FileScopeId, AstIdsBuilder>,
     use_def_maps: IndexVec<FileScopeId, UseDefMapBuilder<'db>>,
     scopes_by_node: FxHashMap<NodeWithScopeKey, FileScopeId>,
     scopes_by_expression: FxHashMap<ExpressionNodeKey, FileScopeId>,
-    globals_by_scope: FxHashMap<FileScopeId, FxHashSet<ScopedPlaceId>>,
+    globals_by_scope: FxHashMap<FileScopeId, FxHashSet<ScopedSymbolId>>,
     definitions_by_node: FxHashMap<DefinitionNodeKey, Definitions<'db>>,
     expressions_by_node: FxHashMap<ExpressionNodeKey, Expression<'db>>,
     imported_modules: FxHashSet<ModuleName>,
@@ -132,7 +132,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             has_future_annotations: false,
 
             scopes: IndexVec::new(),
-            place_tables: IndexVec::new(),
+            symbol_tables: IndexVec::new(),
             ast_ids: IndexVec::new(),
             scope_ids_by_scope: IndexVec::new(),
             use_def_maps: IndexVec::new(),
@@ -255,7 +255,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.try_node_context_stack_manager.enter_nested_scope();
 
         let file_scope_id = self.scopes.push(scope);
-        self.place_tables.push(PlaceTableBuilder::default());
+        self.symbol_tables.push(SymbolTableBuilder::default());
         self.use_def_maps
             .push(UseDefMapBuilder::new(is_class_scope));
         let ast_id_scope = self.ast_ids.push(AstIdsBuilder::default());
@@ -299,31 +299,32 @@ impl<'db> SemanticIndexBuilder<'db> {
         for enclosing_scope_info in self.scope_stack.iter().rev() {
             let enclosing_scope_id = enclosing_scope_info.file_scope_id;
             let enclosing_scope_kind = self.scopes[enclosing_scope_id].kind();
-            let enclosing_place_table = &self.place_tables[enclosing_scope_id];
+            let enclosing_symbol_table = &self.symbol_tables[enclosing_scope_id];
 
-            for nested_place in self.place_tables[popped_scope_id].places() {
-                // Skip this place if this enclosing scope doesn't contain any bindings for it.
-                // Note that even if this place is bound in the popped scope,
+            for nested_symbol in self.symbol_tables[popped_scope_id].symbols() {
+                // Skip this symbol if this enclosing scope doesn't contain any bindings for it.
+                // Note that even if this symbol is bound in the popped scope,
                 // it may refer to the enclosing scope bindings
                 // so we also need to snapshot the bindings of the enclosing scope.
 
-                let Some(enclosing_place_id) = enclosing_place_table.place_id_by_expr(nested_place)
+                let Some(enclosing_symbol_id) =
+                    enclosing_symbol_table.symbol_id_by_expr(nested_symbol)
                 else {
                     continue;
                 };
-                let enclosing_place = enclosing_place_table.place_expr(enclosing_place_id);
+                let enclosing_symbol = enclosing_symbol_table.place_expr(enclosing_symbol_id);
 
-                // Snapshot the state of this place that are visible at this point in this
+                // Snapshot the state of this symbol that are visible at this point in this
                 // enclosing scope.
                 let key = EagerSnapshotKey {
                     enclosing_scope: enclosing_scope_id,
-                    enclosing_place: enclosing_place_id,
+                    enclosing_symbol: enclosing_symbol_id,
                     nested_scope: popped_scope_id,
                 };
                 let eager_snapshot = self.use_def_maps[enclosing_scope_id].snapshot_eager_state(
-                    enclosing_place_id,
+                    enclosing_symbol_id,
                     enclosing_scope_kind,
-                    enclosing_place.is_bound(),
+                    enclosing_symbol.is_bound(),
                 );
                 self.eager_snapshots.insert(key, eager_snapshot);
             }
@@ -331,7 +332,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             // Lazy scopes are "sticky": once we see a lazy scope we stop doing lookups
             // eagerly, even if we would encounter another eager enclosing scope later on.
             // Also, narrowing constraints outside a lazy scope are not applicable.
-            // TODO: If the place has never been rewritten, they are applicable.
+            // TODO: If the symbol has never been rewritten, they are applicable.
             if !enclosing_scope_kind.is_eager() {
                 break;
             }
@@ -340,9 +341,9 @@ impl<'db> SemanticIndexBuilder<'db> {
         popped_scope_id
     }
 
-    fn current_place_table(&mut self) -> &mut PlaceTableBuilder {
+    fn current_symbol_table(&mut self) -> &mut SymbolTableBuilder {
         let scope_id = self.current_scope();
-        &mut self.place_tables[scope_id]
+        &mut self.symbol_tables[scope_id]
     }
 
     fn current_use_def_map_mut(&mut self) -> &mut UseDefMapBuilder<'db> {
@@ -377,36 +378,36 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.current_use_def_map_mut().merge(state);
     }
 
-    /// Add a symbol to the place table and the use-def map.
-    /// Return the [`ScopedPlaceId`] that uniquely identifies the symbol in both.
-    fn add_symbol(&mut self, name: Name) -> ScopedPlaceId {
-        let (place_id, added) = self.current_place_table().add_symbol(name);
+    /// Add a symbol to the symbol table and the use-def map.
+    /// Return the [`ScopedSymbolId`] that uniquely identifies the symbol in both.
+    fn add_symbol(&mut self, name: Name) -> ScopedSymbolId {
+        let (symbol_id, added) = self.current_symbol_table().add_symbol(name);
         if added {
-            self.current_use_def_map_mut().add_place(place_id);
+            self.current_use_def_map_mut().add_symbol(symbol_id);
         }
-        place_id
+        symbol_id
     }
 
-    /// Add a place to the place table and the use-def map.
-    /// Return the [`ScopedPlaceId`] that uniquely identifies the place in both.
-    fn add_place(&mut self, place_expr: PlaceExpr) -> ScopedPlaceId {
-        let (place_id, added) = self.current_place_table().add_place(place_expr);
+    /// Add a symbol to the symbol table and the use-def map.
+    /// Return the [`ScopedSymbolId`] that uniquely identifies the symbol in both.
+    fn add_place_expr(&mut self, place_expr: PlaceExpr) -> ScopedSymbolId {
+        let (symbol_id, added) = self.current_symbol_table().add_place_expr(place_expr);
         if added {
-            self.current_use_def_map_mut().add_place(place_id);
+            self.current_use_def_map_mut().add_symbol(symbol_id);
         }
-        place_id
+        symbol_id
     }
 
-    fn mark_place_bound(&mut self, id: ScopedPlaceId) {
-        self.current_place_table().mark_place_bound(id);
+    fn mark_symbol_bound(&mut self, id: ScopedSymbolId) {
+        self.current_symbol_table().mark_symbol_bound(id);
     }
 
-    fn mark_place_declared(&mut self, id: ScopedPlaceId) {
-        self.current_place_table().mark_place_declared(id);
+    fn mark_symbol_declared(&mut self, id: ScopedSymbolId) {
+        self.current_symbol_table().mark_symbol_declared(id);
     }
 
-    fn mark_place_used(&mut self, id: ScopedPlaceId) {
-        self.current_place_table().mark_place_used(id);
+    fn mark_symbol_used(&mut self, id: ScopedSymbolId) {
+        self.current_symbol_table().mark_symbol_used(id);
     }
 
     fn add_entry_for_definition_key(&mut self, key: DefinitionNodeKey) -> &mut Definitions<'db> {
@@ -422,10 +423,11 @@ impl<'db> SemanticIndexBuilder<'db> {
     /// for all nodes *except* [`ast::Alias`] nodes representing `*` imports.
     fn add_definition(
         &mut self,
-        place: ScopedPlaceId,
+        symbol: ScopedSymbolId,
         definition_node: impl Into<DefinitionNodeRef<'db>> + std::fmt::Debug + Copy,
     ) -> Definition<'db> {
-        let (definition, num_definitions) = self.push_additional_definition(place, definition_node);
+        let (definition, num_definitions) =
+            self.push_additional_definition(symbol, definition_node);
         debug_assert_eq!(
             num_definitions, 1,
             "Attempted to create multiple `Definition`s associated with AST node {definition_node:?}"
@@ -446,7 +448,7 @@ impl<'db> SemanticIndexBuilder<'db> {
     /// prefer to use `self.add_definition()`, which ensures that this invariant is maintained.
     fn push_additional_definition(
         &mut self,
-        place: ScopedPlaceId,
+        symbol: ScopedSymbolId,
         definition_node: impl Into<DefinitionNodeRef<'db>>,
     ) -> (Definition<'db>, usize) {
         let definition_node: DefinitionNodeRef<'_> = definition_node.into();
@@ -454,8 +456,8 @@ impl<'db> SemanticIndexBuilder<'db> {
         // SAFETY: `definition_node` is guaranteed to be a child of `self.module`
         let kind = unsafe { definition_node.into_owned(self.module.clone()) };
         let is_instance_attribute = self
-            .current_place_table()
-            .place_expr(place)
+            .current_symbol_table()
+            .place_expr(symbol)
             .is_instance_attribute();
         let category = kind.category(self.source_type.is_stub(), is_instance_attribute);
         let is_reexported = kind.is_reexported();
@@ -464,7 +466,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             self.db,
             self.file,
             self.current_scope(),
-            place,
+            symbol,
             kind,
             is_reexported,
             countme::Count::default(),
@@ -477,19 +479,19 @@ impl<'db> SemanticIndexBuilder<'db> {
         };
 
         if category.is_binding() {
-            self.mark_place_bound(place);
+            self.mark_symbol_bound(symbol);
         }
         if category.is_declaration() {
-            self.mark_place_declared(place);
+            self.mark_symbol_declared(symbol);
         }
 
         let use_def = self.current_use_def_map_mut();
         match category {
             DefinitionCategory::DeclarationAndBinding => {
-                use_def.record_declaration_and_binding(place, definition);
+                use_def.record_declaration_and_binding(symbol, definition);
             }
-            DefinitionCategory::Declaration => use_def.record_declaration(place, definition),
-            DefinitionCategory::Binding => use_def.record_binding(place, definition),
+            DefinitionCategory::Declaration => use_def.record_declaration(symbol, definition),
+            DefinitionCategory::Binding => use_def.record_binding(symbol, definition),
         }
 
         let mut try_node_stack_manager = std::mem::take(&mut self.try_node_context_stack_manager);
@@ -802,8 +804,8 @@ impl<'db> SemanticIndexBuilder<'db> {
                 // TODO create Definition for PEP 695 typevars
                 // note that the "bound" on the typevar is a totally different thing than whether
                 // or not a name is "bound" by a typevar declaration; the latter is always true.
-                self.mark_place_bound(symbol);
-                self.mark_place_declared(symbol);
+                self.mark_symbol_bound(symbol);
+                self.mark_symbol_declared(symbol);
                 if let Some(bounds) = bound {
                     self.visit_expr(bounds);
                 }
@@ -1002,8 +1004,8 @@ impl<'db> SemanticIndexBuilder<'db> {
 
         assert_eq!(&self.current_assignments, &[]);
 
-        let mut place_tables: IndexVec<_, _> = self
-            .place_tables
+        let mut symbol_tables: IndexVec<_, _> = self
+            .symbol_tables
             .into_iter()
             .map(|builder| Arc::new(builder.finish()))
             .collect();
@@ -1021,7 +1023,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             .collect();
 
         self.scopes.shrink_to_fit();
-        place_tables.shrink_to_fit();
+        symbol_tables.shrink_to_fit();
         use_def_maps.shrink_to_fit();
         ast_ids.shrink_to_fit();
         self.scopes_by_expression.shrink_to_fit();
@@ -1034,7 +1036,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.globals_by_scope.shrink_to_fit();
 
         SemanticIndex {
-            place_tables,
+            symbol_tables,
             scopes: self.scopes,
             definitions_by_node: self.definitions_by_node,
             expressions_by_node: self.expressions_by_node,
@@ -1157,7 +1159,7 @@ where
                 // used to collect all the overloaded definitions of a function. This needs to be
                 // done on the `Identifier` node as opposed to `ExprName` because that's what the
                 // AST uses.
-                self.mark_place_used(symbol);
+                self.mark_symbol_used(symbol);
                 let use_id = self.current_ast_ids().record_use(name);
                 self.current_use_def_map_mut()
                     .record_use(symbol, use_id, NodeKey::from_node(name));
@@ -1298,10 +1300,7 @@ where
                         // For more details, see the doc-comment on `StarImportPlaceholderPredicate`.
                         for export in exported_names(self.db, referenced_module) {
                             let symbol_id = self.add_symbol(export.clone());
-                            let node_ref = StarImportDefinitionNodeRef {
-                                node,
-                                place_id: symbol_id,
-                            };
+                            let node_ref = StarImportDefinitionNodeRef { node, symbol_id };
                             let star_import = StarImportPlaceholderPredicate::new(
                                 self.db,
                                 self.file,
@@ -1310,7 +1309,7 @@ where
                             );
 
                             let pre_definition =
-                                self.current_use_def_map().single_place_snapshot(symbol_id);
+                                self.current_use_def_map().single_symbol_snapshot(symbol_id);
                             self.push_additional_definition(symbol_id, node_ref);
                             self.current_use_def_map_mut()
                                 .record_and_negate_star_import_visibility_constraint(
@@ -1865,7 +1864,7 @@ where
             ast::Stmt::Global(ast::StmtGlobal { range: _, names }) => {
                 for name in names {
                     let symbol_id = self.add_symbol(name.id.clone());
-                    let symbol_table = self.current_place_table();
+                    let symbol_table = self.current_symbol_table();
                     let symbol = symbol_table.place_expr(symbol_id);
                     if symbol.is_bound() || symbol.is_declared() || symbol.is_used() {
                         self.report_semantic_error(SemanticSyntaxError {
@@ -1888,8 +1887,8 @@ where
             ast::Stmt::Delete(ast::StmtDelete { targets, range: _ }) => {
                 for target in targets {
                     if let Ok(target) = PlaceExpr::try_from(target) {
-                        let place_id = self.add_place(target);
-                        self.current_place_table().mark_place_used(place_id);
+                        let symbol_id = self.add_place_expr(target);
+                        self.current_symbol_table().mark_symbol_used(symbol_id);
                     }
                 }
                 walk_stmt(self, stmt);
@@ -1957,20 +1956,20 @@ where
                         (ast::ExprContext::Del, _) => (false, true),
                         (ast::ExprContext::Invalid, _) => (false, false),
                     };
-                    let place_id = self.add_place(place_expr);
+                    let symbol_id = self.add_place_expr(place_expr);
 
                     if is_use {
-                        self.mark_place_used(place_id);
+                        self.mark_symbol_used(symbol_id);
                         let use_id = self.current_ast_ids().record_use(expr);
                         self.current_use_def_map_mut()
-                            .record_use(place_id, use_id, node_key);
+                            .record_use(symbol_id, use_id, node_key);
                     }
 
                     if is_definition {
                         match self.current_assignment() {
                             Some(CurrentAssignment::Assign { node, unpack }) => {
                                 self.add_definition(
-                                    place_id,
+                                    symbol_id,
                                     AssignmentDefinitionNodeRef {
                                         unpack,
                                         value: &node.value,
@@ -1981,7 +1980,7 @@ where
                             Some(CurrentAssignment::AnnAssign(ann_assign)) => {
                                 self.add_standalone_type_expression(&ann_assign.annotation);
                                 self.add_definition(
-                                    place_id,
+                                    symbol_id,
                                     AnnotatedAssignmentDefinitionNodeRef {
                                         node: ann_assign,
                                         annotation: &ann_assign.annotation,
@@ -1991,11 +1990,11 @@ where
                                 );
                             }
                             Some(CurrentAssignment::AugAssign(aug_assign)) => {
-                                self.add_definition(place_id, aug_assign);
+                                self.add_definition(symbol_id, aug_assign);
                             }
                             Some(CurrentAssignment::For { node, unpack }) => {
                                 self.add_definition(
-                                    place_id,
+                                    symbol_id,
                                     ForStmtDefinitionNodeRef {
                                         unpack,
                                         iterable: &node.iter,
@@ -2008,7 +2007,7 @@ where
                                 // TODO(dhruvmanila): If the current scope is a comprehension, then the
                                 // named expression is implicitly nonlocal. This is yet to be
                                 // implemented.
-                                self.add_definition(place_id, named);
+                                self.add_definition(symbol_id, named);
                             }
                             Some(CurrentAssignment::Comprehension {
                                 unpack,
@@ -2026,7 +2025,7 @@ where
                                     self.current_ast_ids().record_expression(expr);
                                 }
                                 self.add_definition(
-                                    place_id,
+                                    symbol_id,
                                     ComprehensionDefinitionNodeRef {
                                         unpack,
                                         iterable: &node.iter,
@@ -2043,7 +2042,7 @@ where
                                 unpack,
                             }) => {
                                 self.add_definition(
-                                    place_id,
+                                    symbol_id,
                                     WithItemDefinitionNodeRef {
                                         unpack,
                                         context_expr: &item.context_expr,

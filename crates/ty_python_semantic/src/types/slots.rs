@@ -1,7 +1,7 @@
 use ruff_python_ast as ast;
 
 use crate::db::Db;
-use crate::place::{Boundness, Place};
+use crate::symbol::{Boundness, Symbol};
 use crate::types::class_base::ClassBase;
 use crate::types::diagnostic::report_base_with_incompatible_slots;
 use crate::types::{ClassLiteral, Type};
@@ -24,7 +24,7 @@ enum SlotsKind {
 
 impl SlotsKind {
     fn from(db: &dyn Db, base: ClassLiteral) -> Self {
-        let Place::Type(slots_ty, bound) = base.own_class_member(db, None, "__slots__").place
+        let Symbol::Type(slots_ty, bound) = base.own_class_member(db, None, "__slots__").symbol
         else {
             return Self::NotSpecified;
         };

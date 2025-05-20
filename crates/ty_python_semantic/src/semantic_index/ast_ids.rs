@@ -6,14 +6,14 @@ use ruff_python_ast::ExprRef;
 
 use crate::Db;
 use crate::semantic_index::ast_ids::node_key::ExpressionNodeKey;
-use crate::semantic_index::place::ScopeId;
 use crate::semantic_index::semantic_index;
+use crate::semantic_index::symbol::ScopeId;
 
 /// AST ids for a single scope.
 ///
 /// The motivation for building the AST ids per scope isn't about reducing invalidation because
 /// the struct changes whenever the parsed AST changes. Instead, it's mainly that we can
-/// build the AST ids struct when building the place table and also keep the property that
+/// build the AST ids struct when building the symbol table and also keep the property that
 /// IDs of outer scopes are unaffected by changes in inner scopes.
 ///
 /// For example, we don't want that adding new statements to `foo` changes the statement id of `x = foo()` in:
@@ -49,7 +49,7 @@ fn ast_ids<'db>(db: &'db dyn Db, scope: ScopeId) -> &'db AstIds {
     semantic_index(db, scope.file(db)).ast_ids(scope.file_scope_id(db))
 }
 
-/// Uniquely identifies a use of a name in a [`crate::semantic_index::place::FileScopeId`].
+/// Uniquely identifies a use of a name in a [`crate::semantic_index::symbol::FileScopeId`].
 #[newtype_index]
 pub struct ScopedUseId;
 
@@ -93,7 +93,7 @@ impl HasScopedUseId for ast::ExprRef<'_> {
     }
 }
 
-/// Uniquely identifies an [`ast::Expr`] in a [`crate::semantic_index::place::FileScopeId`].
+/// Uniquely identifies an [`ast::Expr`] in a [`crate::semantic_index::symbol::FileScopeId`].
 #[newtype_index]
 #[derive(salsa::Update)]
 pub struct ScopedExpressionId;

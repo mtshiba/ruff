@@ -1,4 +1,4 @@
-use crate::place::PlaceAndQualifiers;
+use crate::symbol::SymbolAndQualifiers;
 use crate::types::{
     ClassType, DynamicType, KnownClass, MemberLookupPolicy, Type, TypeMapping, TypeVarInstance,
 };
@@ -99,7 +99,7 @@ impl<'db> SubclassOfType<'db> {
         db: &'db dyn Db,
         name: &str,
         policy: MemberLookupPolicy,
-    ) -> Option<PlaceAndQualifiers<'db>> {
+    ) -> Option<SymbolAndQualifiers<'db>> {
         Type::from(self.subclass_of).find_name_in_mro_with_policy(db, name, policy)
     }
 
