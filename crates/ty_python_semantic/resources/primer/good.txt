@@ -12,7 +12,6 @@ alerta
 altair
 anyio
 apprise
-arviz
 async-utils
 asynq
 attrs
@@ -20,7 +19,6 @@ bandersnatch
 beartype
 bidict
 black
-bokeh
 boostedblob
 check-jsonschema
 cki-lib
@@ -99,11 +97,9 @@ sockeye
 speedrun.com_global_scoreboard_webapp
 sphinx
 starlette
-static-frame
 stone
 strawberry
 streamlit
-sympy
 tornado
 trio
 twine

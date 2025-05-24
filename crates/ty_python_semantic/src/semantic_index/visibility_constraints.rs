@@ -655,7 +655,9 @@ impl VisibilityConstraints {
             PredicateNode::Pattern(inner) => Self::analyze_single_pattern_predicate(db, inner),
             PredicateNode::StarImportPlaceholder(star_import) => {
                 let symbol_table = symbol_table(db, star_import.scope(db));
-                let symbol_name = symbol_table.symbol(star_import.symbol_id(db)).name();
+                let symbol_name = symbol_table
+                    .place_expr(star_import.symbol_id(db))
+                    .expect_name();
                 let referenced_file = star_import.referenced_file(db);
 
                 let requires_explicit_reexport = match dunder_all_names(db, referenced_file) {

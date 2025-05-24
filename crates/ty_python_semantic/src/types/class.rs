@@ -1390,7 +1390,7 @@ impl<'db> ClassLiteral<'db> {
                 continue;
             }
 
-            let symbol = table.symbol(symbol_id);
+            let symbol = table.place_expr(symbol_id);
 
             if let Ok(attr) = symbol_from_declarations(db, declarations) {
                 if attr.is_class_var() {
@@ -1401,7 +1401,7 @@ impl<'db> ClassLiteral<'db> {
                     let bindings = use_def.public_bindings(symbol_id);
                     let default_ty = symbol_from_bindings(db, bindings).ignore_possibly_unbound();
 
-                    attributes.insert(symbol.name().clone(), (attr_ty, default_ty));
+                    attributes.insert(symbol.expect_name().clone(), (attr_ty, default_ty));
                 }
             }
         }
@@ -1600,7 +1600,7 @@ impl<'db> ClassLiteral<'db> {
 
                                 union_of_inferred_types = union_of_inferred_types.add(inferred_ty);
                             }
-                            TargetKind::NameOrAttribute => {
+                            TargetKind::Single => {
                                 // We found an un-annotated attribute assignment of the form:
                                 //
                                 //     self.name = <value>
@@ -1626,7 +1626,7 @@ impl<'db> ClassLiteral<'db> {
 
                                 union_of_inferred_types = union_of_inferred_types.add(inferred_ty);
                             }
-                            TargetKind::NameOrAttribute => {
+                            TargetKind::Single => {
                                 // We found an attribute assignment like:
                                 //
                                 //     for self.name in <iterable>:
@@ -1656,7 +1656,7 @@ impl<'db> ClassLiteral<'db> {
 
                                 union_of_inferred_types = union_of_inferred_types.add(inferred_ty);
                             }
-                            TargetKind::NameOrAttribute => {
+                            TargetKind::Single => {
                                 // We found an attribute assignment like:
                                 //
                                 //     with <context_manager> as self.name:
@@ -1686,7 +1686,7 @@ impl<'db> ClassLiteral<'db> {
 
                                 union_of_inferred_types = union_of_inferred_types.add(inferred_ty);
                             }
-                            TargetKind::NameOrAttribute => {
+                            TargetKind::Single => {
                                 // We found an attribute assignment like:
                                 //
                                 //     [... for self.name in <iterable>]
@@ -1935,7 +1935,7 @@ impl InheritanceCycle {
 /// for easier syntax when interacting with very common classes.
 ///
 /// Feel free to expand this enum if you ever find yourself using the same class in multiple
-/// places.
+/// symbols.
 /// Note: good candidates are any classes in `[crate::module_resolver::module::KnownModule]`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(strum_macros::EnumIter))]
