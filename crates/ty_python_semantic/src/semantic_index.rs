@@ -20,8 +20,8 @@ use crate::semantic_index::definition::{Definition, DefinitionNodeKey, Definitio
 use crate::semantic_index::expression::Expression;
 use crate::semantic_index::narrowing_constraints::ScopedNarrowingConstraint;
 use crate::semantic_index::symbol::{
-    FileScopeId, NodeWithScopeKey, NodeWithScopeRef, Scope, ScopeId, ScopeKind, ScopedSymbolId,
-    SymbolTable,
+    FileScopeId, NodeWithScopeKey, NodeWithScopeRef, PlaceExpr, Scope, ScopeId, ScopeKind,
+    ScopedSymbolId, SymbolTable,
 };
 use crate::semantic_index::use_def::{EagerSnapshotKey, ScopedEagerSnapshotId, UseDefMap};
 
@@ -124,13 +124,10 @@ pub(crate) fn attribute_assignments<'db, 's>(
             };
 
         function_scope.node().as_function()?;
-        let attribute_table = index.instance_attribute_table(function_scope_id);
-        let symbol = attribute_table.symbol_id_by_name(name)?;
+        let symbol_table = index.symbol_table(function_scope_id);
+        let symbol = symbol_table.symbol_id_by_instance_attribute_name(name)?;
         let use_def = &index.use_def_maps[function_scope_id];
-        Some((
-            use_def.instance_attribute_bindings(symbol),
-            function_scope_id,
-        ))
+        Some((use_def.public_bindings(symbol), function_scope_id))
     })
 }
 
@@ -154,9 +151,6 @@ pub(crate) enum EagerSnapshotResult<'map, 'db> {
 pub(crate) struct SemanticIndex<'db> {
     /// List of all symbol tables in this file, indexed by scope.
     symbol_tables: IndexVec<FileScopeId, Arc<SymbolTable>>,
-
-    /// List of all instance attribute tables in this file, indexed by scope.
-    instance_attribute_tables: IndexVec<FileScopeId, SymbolTable>,
 
     /// List of all scopes in this file.
     scopes: IndexVec<FileScopeId, Scope>,
@@ -212,10 +206,6 @@ impl<'db> SemanticIndex<'db> {
     #[track_caller]
     pub(super) fn symbol_table(&self, scope_id: FileScopeId) -> Arc<SymbolTable> {
         self.symbol_tables[scope_id].clone()
-    }
-
-    pub(super) fn instance_attribute_table(&self, scope_id: FileScopeId) -> &SymbolTable {
-        &self.instance_attribute_tables[scope_id]
     }
 
     /// Returns the use-def map for a specific scope.
@@ -418,7 +408,7 @@ impl<'db> SemanticIndex<'db> {
     pub(crate) fn eager_snapshot(
         &self,
         enclosing_scope: FileScopeId,
-        symbol: &str,
+        expr: &PlaceExpr,
         nested_scope: FileScopeId,
     ) -> EagerSnapshotResult<'_, 'db> {
         for (ancestor_scope_id, ancestor_scope) in self.ancestor_scopes(nested_scope) {
@@ -429,7 +419,7 @@ impl<'db> SemanticIndex<'db> {
                 return EagerSnapshotResult::NoLongerInEagerContext;
             }
         }
-        let Some(symbol_id) = self.symbol_tables[enclosing_scope].symbol_id_by_name(symbol) else {
+        let Some(symbol_id) = self.symbol_tables[enclosing_scope].symbol_id_by_expr(expr) else {
             return EagerSnapshotResult::NotFound;
         };
         let key = EagerSnapshotKey {
@@ -454,9 +444,9 @@ pub struct AncestorsIter<'a> {
 }
 
 impl<'a> AncestorsIter<'a> {
-    fn new(module_symbol_table: &'a SemanticIndex, start: FileScopeId) -> Self {
+    fn new(module_table: &'a SemanticIndex, start: FileScopeId) -> Self {
         Self {
-            scopes: &module_symbol_table.scopes,
+            scopes: &module_table.scopes,
             next_id: Some(start),
         }
     }
@@ -482,9 +472,9 @@ pub struct DescendantsIter<'a> {
 }
 
 impl<'a> DescendantsIter<'a> {
-    fn new(symbol_table: &'a SemanticIndex, scope_id: FileScopeId) -> Self {
-        let scope = &symbol_table.scopes[scope_id];
-        let scopes = &symbol_table.scopes[scope.descendants()];
+    fn new(index: &'a SemanticIndex, scope_id: FileScopeId) -> Self {
+        let scope = &index.scopes[scope_id];
+        let scopes = &index.scopes[scope.descendants()];
 
         Self {
             next_id: scope_id + 1,
@@ -519,8 +509,8 @@ pub struct ChildrenIter<'a> {
 }
 
 impl<'a> ChildrenIter<'a> {
-    fn new(module_symbol_table: &'a SemanticIndex, parent: FileScopeId) -> Self {
-        let descendants = DescendantsIter::new(module_symbol_table, parent);
+    fn new(module_table: &'a SemanticIndex, parent: FileScopeId) -> Self {
+        let descendants = DescendantsIter::new(module_table, parent);
 
         Self {
             parent,
@@ -590,7 +580,7 @@ mod tests {
     fn names(table: &SymbolTable) -> Vec<String> {
         table
             .symbols()
-            .map(|symbol| symbol.name().to_string())
+            .filter_map(|expr| Some(expr.as_name()?.to_string()))
             .collect()
     }
 

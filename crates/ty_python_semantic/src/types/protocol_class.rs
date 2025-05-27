@@ -353,8 +353,12 @@ fn cached_protocol_interface<'db>(
                                 .map(|ty| (symbol_id, ty, TypeQualifiers::default()))
                         }),
                 )
-                .map(|(symbol_id, member, qualifiers)| {
-                    (symbol_table.symbol(symbol_id).name(), member, qualifiers)
+                .filter_map(|(symbol_id, member, qualifiers)| {
+                    Some((
+                        symbol_table.place_expr(symbol_id).as_name()?,
+                        member,
+                        qualifiers,
+                    ))
                 })
                 .filter(|(name, _, _)| !excluded_from_proto_members(name))
                 .map(|(name, ty, qualifiers)| {

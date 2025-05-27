@@ -13,6 +13,12 @@
 //!   declarations; annotated function parameters are also declarations. We consider `def` and
 //!   `class` statements to also be declarations, so as to prohibit accidentally shadowing them.
 //!
+//! * A "place" is semantically a location where a value can be read or written,
+//!   and syntactically an expression that can be placed on the left-hand side of an assignment,
+//!   e.g. `x`, `x[0]`, `x.y` (The term is borrowed from Rust). In Python syntax,
+//!   an expression like `f().x` is also allowed for left-hand side so it can be called a symbol,
+//!   but we do not record declarations / bindings like `f().x: int`, `f().x = ...`.
+//!
 //! Annotated assignments with a right-hand side, and annotated function parameters, are both
 //! bindings and declarations.
 //!
@@ -105,8 +111,8 @@
 //!
 //! So that's one question our use-def map needs to answer: given a specific use of a symbol, which
 //! binding(s) can reach that use. In [`AstIds`](crate::semantic_index::ast_ids::AstIds) we number
-//! all uses (that means a `Name` node with `Load` context) so we have a `ScopedUseId` to
-//! efficiently represent each use.
+//! all uses (that means a `Name`/`ExprAttribute`/`ExprSubscript` node with `Load` context)
+//! so we have a `ScopedUseId` to efficiently represent each use.
 //!
 //! We also need to know, for a given definition of a symbol, what type narrowing constraints apply
 //! to it. For instance, in this code sample:
@@ -136,7 +142,7 @@
 //!
 //! Another case we need to handle is when a symbol is referenced from a different scope (for
 //! example, an import or a nonlocal reference). We call this "public" use of a symbol. For public
-//! use of a symbol, we prefer the declared type, if there are any declarations of that symbol; if
+//! use of a symbol, we prefer the declared type, if there are any declarations of that place; if
 //! not, we fall back to the inferred type. So we also need to know which declarations and bindings
 //! can reach the end of the scope.
 //!
@@ -145,7 +151,7 @@
 //! via a function call partway through the local scope that ends up using a symbol from the scope
 //! via a global or nonlocal reference.) But modeling this fully accurately requires whole-program
 //! analysis that isn't tractable for an efficient analysis, since it means a given symbol could
-//! have a different type every place it's referenced throughout the program, depending on the
+//! have a different type every symbol it's referenced throughout the program, depending on the
 //! shape of arbitrarily-sized call/import graphs. So we follow other Python type checkers in
 //! making the simplifying assumption that usually the scope will finish execution before its
 //! symbols are made visible to other scopes; for instance, most imports will import from a
@@ -323,9 +329,6 @@ pub(crate) struct UseDefMap<'db> {
     /// [`SymbolState`] visible at end of scope for each symbol.
     public_symbols: IndexVec<ScopedSymbolId, SymbolState>,
 
-    /// [`SymbolState`] for each instance attribute.
-    instance_attributes: IndexVec<ScopedSymbolId, SymbolState>,
-
     /// Snapshot of bindings in this scope that can be used to resolve a reference in a nested
     /// eager scope.
     eager_snapshots: EagerSnapshots,
@@ -407,13 +410,6 @@ impl<'db> UseDefMap<'db> {
         self.bindings_iterator(self.public_symbols[symbol].bindings())
     }
 
-    pub(crate) fn instance_attribute_bindings(
-        &self,
-        symbol: ScopedSymbolId,
-    ) -> BindingWithConstraintsIterator<'_, 'db> {
-        self.bindings_iterator(self.instance_attributes[symbol].bindings())
-    }
-
     pub(crate) fn eager_snapshot(
         &self,
         eager_bindings: ScopedEagerSnapshotId,
@@ -422,8 +418,8 @@ impl<'db> UseDefMap<'db> {
             Some(EagerSnapshot::Constraint(constraint)) => {
                 EagerSnapshotResult::FoundConstraint(*constraint)
             }
-            Some(EagerSnapshot::Bindings(symbol_bindings)) => {
-                EagerSnapshotResult::FoundBindings(self.bindings_iterator(symbol_bindings))
+            Some(EagerSnapshot::Bindings(bindings)) => {
+                EagerSnapshotResult::FoundBindings(self.bindings_iterator(bindings))
             }
             None => EagerSnapshotResult::NotFound,
         }
@@ -653,7 +649,6 @@ impl std::iter::FusedIterator for DeclarationsIterator<'_, '_> {}
 #[derive(Clone, Debug)]
 pub(super) struct FlowSnapshot {
     symbol_states: IndexVec<ScopedSymbolId, SymbolState>,
-    instance_attribute_states: IndexVec<ScopedSymbolId, SymbolState>,
     scope_start_visibility: ScopedVisibilityConstraintId,
     reachability: ScopedVisibilityConstraintId,
 }
@@ -733,9 +728,6 @@ pub(super) struct UseDefMapBuilder<'db> {
     /// Currently live bindings and declarations for each symbol.
     symbol_states: IndexVec<ScopedSymbolId, SymbolState>,
 
-    /// Currently live bindings for each instance attribute.
-    instance_attribute_states: IndexVec<ScopedSymbolId, SymbolState>,
-
     /// Snapshots of symbol states in this scope that can be used to resolve a reference in a
     /// nested eager scope.
     eager_snapshots: EagerSnapshots,
@@ -759,7 +751,6 @@ impl<'db> UseDefMapBuilder<'db> {
             bindings_by_declaration: FxHashMap::default(),
             symbol_states: IndexVec::new(),
             eager_snapshots: EagerSnapshots::default(),
-            instance_attribute_states: IndexVec::new(),
             is_class_scope,
         }
     }
@@ -775,31 +766,12 @@ impl<'db> UseDefMapBuilder<'db> {
         debug_assert_eq!(symbol, new_symbol);
     }
 
-    pub(super) fn add_attribute(&mut self, symbol: ScopedSymbolId) {
-        let new_symbol = self
-            .instance_attribute_states
-            .push(SymbolState::undefined(self.scope_start_visibility));
-        debug_assert_eq!(symbol, new_symbol);
-    }
-
     pub(super) fn record_binding(&mut self, symbol: ScopedSymbolId, binding: Definition<'db>) {
         let def_id = self.all_definitions.push(Some(binding));
         let symbol_state = &mut self.symbol_states[symbol];
         self.declarations_by_binding
             .insert(binding, symbol_state.declarations().clone());
         symbol_state.record_binding(def_id, self.scope_start_visibility, self.is_class_scope);
-    }
-
-    pub(super) fn record_attribute_binding(
-        &mut self,
-        symbol: ScopedSymbolId,
-        binding: Definition<'db>,
-    ) {
-        let def_id = self.all_definitions.push(Some(binding));
-        let attribute_state = &mut self.instance_attribute_states[symbol];
-        self.declarations_by_binding
-            .insert(binding, attribute_state.declarations().clone());
-        attribute_state.record_binding(def_id, self.scope_start_visibility, self.is_class_scope);
     }
 
     pub(super) fn add_predicate(&mut self, predicate: Predicate<'db>) -> ScopedPredicateId {
@@ -812,10 +784,6 @@ impl<'db> UseDefMapBuilder<'db> {
             state
                 .record_narrowing_constraint(&mut self.narrowing_constraints, narrowing_constraint);
         }
-        for state in &mut self.instance_attribute_states {
-            state
-                .record_narrowing_constraint(&mut self.narrowing_constraints, narrowing_constraint);
-        }
     }
 
     pub(super) fn record_visibility_constraint(
@@ -823,9 +791,6 @@ impl<'db> UseDefMapBuilder<'db> {
         constraint: ScopedVisibilityConstraintId,
     ) {
         for state in &mut self.symbol_states {
-            state.record_visibility_constraint(&mut self.visibility_constraints, constraint);
-        }
-        for state in &mut self.instance_attribute_states {
             state.record_visibility_constraint(&mut self.visibility_constraints, constraint);
         }
         self.scope_start_visibility = self
@@ -849,7 +814,7 @@ impl<'db> UseDefMapBuilder<'db> {
     /// visibility constraints in the use-def map the same way as all other visibility constraints
     /// was shown to lead to [significant regressions] for small codebases where typeshed
     /// dominates. (Although `*` imports are not common generally, they are used in several
-    /// important places by typeshed.)
+    /// important symbols by typeshed.)
     ///
     /// To solve these regressions, it was observed that we could do significantly less work for
     /// `*`-import definitions. We do a number of things differently here to our normal handling of
@@ -925,9 +890,6 @@ impl<'db> UseDefMapBuilder<'db> {
     /// of it, as the `if`-`elif`-`elif` chain doesn't include any new bindings of `x`.
     pub(super) fn simplify_visibility_constraints(&mut self, snapshot: FlowSnapshot) {
         debug_assert!(self.symbol_states.len() >= snapshot.symbol_states.len());
-        debug_assert!(
-            self.instance_attribute_states.len() >= snapshot.instance_attribute_states.len()
-        );
 
         // If there are any control flow paths that have become unreachable between `snapshot` and
         // now, then it's not valid to simplify any visibility constraints to `snapshot`.
@@ -942,13 +904,6 @@ impl<'db> UseDefMapBuilder<'db> {
         // for symbols that have the same bindings and declarations present compared to the
         // snapshot.
         for (current, snapshot) in self.symbol_states.iter_mut().zip(snapshot.symbol_states) {
-            current.simplify_visibility_constraints(snapshot);
-        }
-        for (current, snapshot) in self
-            .instance_attribute_states
-            .iter_mut()
-            .zip(snapshot.instance_attribute_states)
-        {
             current.simplify_visibility_constraints(snapshot);
         }
     }
@@ -994,7 +949,7 @@ impl<'db> UseDefMapBuilder<'db> {
         use_id: ScopedUseId,
         node_key: NodeKey,
     ) {
-        // We have a use of a symbol; clone the current bindings for that symbol, and record them
+        // We have a use of a place; clone the current bindings for that symbol, and record them
         // as the live bindings for this use.
         let new_use = self
             .bindings_by_use
@@ -1031,11 +986,10 @@ impl<'db> UseDefMapBuilder<'db> {
         }
     }
 
-    /// Take a snapshot of the current visible-symbols state.
+    /// Take a snapshot of the current visible-places state.
     pub(super) fn snapshot(&self) -> FlowSnapshot {
         FlowSnapshot {
             symbol_states: self.symbol_states.clone(),
-            instance_attribute_states: self.instance_attribute_states.clone(),
             scope_start_visibility: self.scope_start_visibility,
             reachability: self.reachability,
         }
@@ -1048,12 +1002,9 @@ impl<'db> UseDefMapBuilder<'db> {
         // greater than the number of known symbols in a previously-taken snapshot.
         let num_symbols = self.symbol_states.len();
         debug_assert!(num_symbols >= snapshot.symbol_states.len());
-        let num_attributes = self.instance_attribute_states.len();
-        debug_assert!(num_attributes >= snapshot.instance_attribute_states.len());
 
         // Restore the current visible-definitions state to the given snapshot.
         self.symbol_states = snapshot.symbol_states;
-        self.instance_attribute_states = snapshot.instance_attribute_states;
         self.scope_start_visibility = snapshot.scope_start_visibility;
         self.reachability = snapshot.reachability;
 
@@ -1062,10 +1013,6 @@ impl<'db> UseDefMapBuilder<'db> {
         // snapshot, the correct state to fill them in with is "undefined".
         self.symbol_states.resize(
             num_symbols,
-            SymbolState::undefined(self.scope_start_visibility),
-        );
-        self.instance_attribute_states.resize(
-            num_attributes,
             SymbolState::undefined(self.scope_start_visibility),
         );
     }
@@ -1093,9 +1040,6 @@ impl<'db> UseDefMapBuilder<'db> {
         // IDs must line up), so the current number of known symbols must always be equal to or
         // greater than the number of known symbols in a previously-taken snapshot.
         debug_assert!(self.symbol_states.len() >= snapshot.symbol_states.len());
-        debug_assert!(
-            self.instance_attribute_states.len() >= snapshot.instance_attribute_states.len()
-        );
 
         let mut snapshot_definitions_iter = snapshot.symbol_states.into_iter();
         for current in &mut self.symbol_states {
@@ -1111,23 +1055,7 @@ impl<'db> UseDefMapBuilder<'db> {
                     &mut self.narrowing_constraints,
                     &mut self.visibility_constraints,
                 );
-                // Symbol not present in snapshot, so it's unbound/undeclared from that path.
-            }
-        }
-        let mut snapshot_definitions_iter = snapshot.instance_attribute_states.into_iter();
-        for current in &mut self.instance_attribute_states {
-            if let Some(snapshot) = snapshot_definitions_iter.next() {
-                current.merge(
-                    snapshot,
-                    &mut self.narrowing_constraints,
-                    &mut self.visibility_constraints,
-                );
-            } else {
-                current.merge(
-                    SymbolState::undefined(snapshot.scope_start_visibility),
-                    &mut self.narrowing_constraints,
-                    &mut self.visibility_constraints,
-                );
+                // symbol not present in snapshot, so it's unbound/undeclared from that path.
             }
         }
 
@@ -1143,7 +1071,6 @@ impl<'db> UseDefMapBuilder<'db> {
     pub(super) fn finish(mut self) -> UseDefMap<'db> {
         self.all_definitions.shrink_to_fit();
         self.symbol_states.shrink_to_fit();
-        self.instance_attribute_states.shrink_to_fit();
         self.bindings_by_use.shrink_to_fit();
         self.node_reachability.shrink_to_fit();
         self.declarations_by_binding.shrink_to_fit();
@@ -1158,7 +1085,6 @@ impl<'db> UseDefMapBuilder<'db> {
             bindings_by_use: self.bindings_by_use,
             node_reachability: self.node_reachability,
             public_symbols: self.symbol_states,
-            instance_attributes: self.instance_attribute_states,
             declarations_by_binding: self.declarations_by_binding,
             bindings_by_declaration: self.bindings_by_declaration,
             eager_snapshots: self.eager_snapshots,

@@ -3,7 +3,7 @@ use ruff_db::files::File;
 use crate::dunder_all::dunder_all_names;
 use crate::module_resolver::file_to_module;
 use crate::semantic_index::definition::Definition;
-use crate::semantic_index::symbol::{ScopeId, ScopedSymbolId};
+use crate::semantic_index::symbol::{PlaceExpr, PlaceExprSubSegment, ScopeId, ScopedSymbolId};
 use crate::semantic_index::{
     BindingWithConstraints, BindingWithConstraintsIterator, DeclarationsIterator, symbol_table,
 };
@@ -57,7 +57,7 @@ pub(crate) enum Symbol<'db> {
 }
 
 impl<'db> Symbol<'db> {
-    /// Constructor that creates a `Symbol` with boundness [`Boundness::Bound`].
+    /// Constructor that creates a `Place` with boundness [`Boundness::Bound`].
     pub(crate) fn bound(ty: impl Into<Type<'db>>) -> Self {
         Symbol::Type(ty.into(), Boundness::Bound)
     }
@@ -192,17 +192,39 @@ impl<'db> LookupError<'db> {
 /// and the `Err` variant represents a symbol that is either definitely or possibly unbound.
 ///
 /// Note that this type is exactly isomorphic to [`Symbol`].
-/// In the future, we could possibly consider removing `Symbol` and using this type everywhere instead.
+/// In the future, we could possibly consider removing `Place` and using this type everywhere instead.
 pub(crate) type LookupResult<'db> = Result<TypeAndQualifiers<'db>, LookupError<'db>>;
 
 /// Infer the public type of a symbol (its type as seen from outside its scope) in the given
 /// `scope`.
+#[allow(unused)]
 pub(crate) fn symbol<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
     name: &str,
 ) -> SymbolAndQualifiers<'db> {
     symbol_impl(db, scope, name, RequiresExplicitReExport::No)
+}
+
+/// Infer the public type of a symbol (its type as seen from outside its scope) in the given
+/// `scope`.
+pub(crate) fn place<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    expr: &PlaceExpr,
+) -> SymbolAndQualifiers<'db> {
+    place_impl(db, scope, expr, RequiresExplicitReExport::No)
+}
+
+/// Used when the bound type cannot be obtained using [`place`]/[`symbol_from_declarations`]/[`symbol_from_bindings`].
+/// For example, if the symbol `x.y.z` is not assigned within the scope,
+/// this will look up the symbol `x` and resolve `x.y.z` in a chained manner.
+pub(crate) fn fallback_place<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    expr: &PlaceExpr,
+) -> SymbolAndQualifiers<'db> {
+    fallback_place_impl(db, scope, expr, RequiresExplicitReExport::No)
 }
 
 /// Infer the public type of a class symbol (its type as seen from outside its scope) in the given
@@ -277,6 +299,7 @@ pub(crate) fn explicit_global_symbol<'db>(
 /// rather than being looked up as symbols explicitly defined/declared in the global scope.
 ///
 /// Use [`imported_symbol`] to perform the lookup as seen from outside the file (e.g. via imports).
+#[allow(unused)]
 pub(crate) fn global_symbol<'db>(
     db: &'db dyn Db,
     file: File,
@@ -542,9 +565,9 @@ impl<'db> SymbolAndQualifiers<'db> {
     ///    1. If `self` is definitely unbound, return the result of `fallback_fn()`.
     ///    2. Else, if `fallback` is definitely unbound, return `self`.
     ///    3. Else, if `self` is possibly unbound and `fallback` is definitely bound,
-    ///       return `Symbol(<union of self-type and fallback-type>, Boundness::Bound)`
+    ///       return `Place(<union of self-type and fallback-type>, Boundness::Bound)`
     ///    4. Else, if `self` is possibly unbound and `fallback` is possibly unbound,
-    ///       return `Symbol(<union of self-type and fallback-type>, Boundness::PossiblyUnbound)`
+    ///       return `Place(<union of self-type and fallback-type>, Boundness::PossiblyUnbound)`
     #[must_use]
     pub(crate) fn or_fall_back_to(
         self,
@@ -648,10 +671,15 @@ fn symbol_by_id<'db>(
             // `TYPE_CHECKING` is a special variable that should only be assigned `False`
             // at runtime, but is always considered `True` in type checking.
             // See mdtest/known_constants.md#user-defined-type_checking for details.
-            let is_considered_non_modifiable = matches!(
-                symbol_table(db, scope).symbol(symbol_id).name().as_str(),
-                "__slots__" | "TYPE_CHECKING"
-            );
+            let is_considered_non_modifiable =
+                symbol_table(db, scope).place_expr(symbol_id).is_name()
+                    && matches!(
+                        symbol_table(db, scope)
+                            .place_expr(symbol_id)
+                            .expect_name()
+                            .as_str(),
+                        "__slots__" | "TYPE_CHECKING"
+                    );
 
             if scope.file(db).is_stub(db.upcast()) {
                 // We generally trust module-level undeclared symbols in stubs and do not union
@@ -717,6 +745,57 @@ fn symbol_impl<'db>(
         .symbol_id_by_name(name)
         .map(|symbol| symbol_by_id(db, scope, symbol, requires_explicit_reexport))
         .unwrap_or_default()
+}
+
+/// Implementation of [`place`].
+fn place_impl<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    expr: &PlaceExpr,
+    requires_explicit_reexport: RequiresExplicitReExport,
+) -> SymbolAndQualifiers<'db> {
+    let _span = tracing::trace_span!("place", ?expr).entered();
+
+    symbol_table(db, scope)
+        .symbol_id_by_expr(expr)
+        .map(|symbol| symbol_by_id(db, scope, symbol, requires_explicit_reexport))
+        .unwrap_or_default()
+}
+
+/// Implementation of [`fallback_place`].
+fn fallback_place_impl<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    expr: &PlaceExpr,
+    requires_explicit_reexport: RequiresExplicitReExport,
+) -> SymbolAndQualifiers<'db> {
+    let _span = tracing::trace_span!("fallback_place", ?expr).entered();
+
+    let mut result = symbol_table(db, scope)
+        .symbol_id_by_name(expr.root_name())
+        .map(|symbol| symbol_by_id(db, scope, symbol, requires_explicit_reexport))
+        .unwrap_or_default();
+
+    for segment in expr.sub_segments() {
+        let Symbol::Type(ty, Boundness::Bound) = result.symbol else {
+            return SymbolAndQualifiers::default();
+        };
+
+        match segment {
+            PlaceExprSubSegment::Member(member) => {
+                result = ty.member(db, member);
+            }
+            // TODO:
+            PlaceExprSubSegment::IntSubscript(_) => {
+                return SymbolAndQualifiers::default();
+            }
+            PlaceExprSubSegment::StringSubscript(_) => {
+                return SymbolAndQualifiers::default();
+            }
+        }
+    }
+
+    result
 }
 
 /// Implementation of [`symbol_from_bindings`].
@@ -964,7 +1043,7 @@ fn is_reexported(db: &dyn Db, definition: Definition<'_>) -> bool {
         return false;
     };
     let table = symbol_table(db, definition.scope(db));
-    let symbol_name = table.symbol(definition.symbol(db)).name();
+    let symbol_name = table.place_expr(definition.symbol(db)).expect_name();
     all_names.contains(symbol_name)
 }
 
@@ -972,6 +1051,7 @@ mod implicit_globals {
     use ruff_python_ast as ast;
 
     use crate::db::Db;
+    use crate::semantic_index::symbol::PlaceExpr;
     use crate::semantic_index::{self, symbol_table, use_def_map};
     use crate::symbol::SymbolAndQualifiers;
     use crate::types::{KnownClass, Type};
@@ -980,11 +1060,11 @@ mod implicit_globals {
 
     pub(crate) fn module_type_implicit_global_declaration<'db>(
         db: &'db dyn Db,
-        name: &str,
+        expr: &PlaceExpr,
     ) -> SymbolFromDeclarationsResult<'db> {
         if !module_type_symbols(db)
             .iter()
-            .any(|module_type_member| &**module_type_member == name)
+            .any(|module_type_member| Some(module_type_member) == expr.as_name())
         {
             return Ok(Symbol::Unbound.into());
         }
@@ -994,7 +1074,7 @@ mod implicit_globals {
         };
         let module_type_scope = module_type_class.body_scope(db);
         let symbol_table = symbol_table(db, module_type_scope);
-        let Some(symbol_id) = symbol_table.symbol_id_by_name(name) else {
+        let Some(symbol_id) = symbol_table.symbol_id_by_expr(expr) else {
             return Ok(Symbol::Unbound.into());
         };
         symbol_from_declarations(
@@ -1077,8 +1157,8 @@ mod implicit_globals {
 
         module_type_symbol_table
             .symbols()
-            .filter(|symbol| symbol.is_declared())
-            .map(semantic_index::symbol::Symbol::name)
+            .filter(|symbol| symbol.is_declared() && symbol.is_name())
+            .map(semantic_index::symbol::PlaceExpr::expect_name)
             .filter(|symbol_name| {
                 !matches!(&***symbol_name, "__dict__" | "__getattr__" | "__init__")
             })
