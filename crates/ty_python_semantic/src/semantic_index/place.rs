@@ -38,7 +38,7 @@ impl PlaceExprSubSegment {
 
 /// An expression that can be the target of a `Definition`.
 /// If you want to perform a comparison based on the equality of segments (without including flags), use [`PlaceSegments`].
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub struct PlaceExpr {
     root_name: Name,
     sub_segments: Vec<PlaceExprSubSegment>,
@@ -236,20 +236,31 @@ impl PlaceExpr {
         }
     }
 
-    pub(crate) fn contains(&self, sub: &PlaceExpr) -> bool {
-        self.root_name == sub.root_name
-            && self.sub_segments.len() > sub.sub_segments.len()
-            && self.sub_segments[..sub.sub_segments.len()] == sub.sub_segments
+    fn root_exprs(&self) -> RootExprs<'_> {
+        RootExprs {
+            expr: self,
+            len: self.sub_segments.len(),
+        }
     }
+}
 
-    pub(crate) fn root(&self) -> Option<PlaceExpr> {
-        if self.sub_segments.is_empty() {
+struct RootExprs<'e> {
+    expr: &'e PlaceExpr,
+    len: usize,
+}
+
+impl Iterator for RootExprs<'_> {
+    type Item = PlaceExpr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.len == 0 {
             return None;
         }
+        self.len -= 1;
         Some(PlaceExpr {
-            root_name: self.root_name.clone(),
-            sub_segments: self.sub_segments[..self.sub_segments.len() - 1].to_vec(),
-            flags: self.flags,
+            root_name: self.expr.root_name.clone(),
+            sub_segments: self.expr.sub_segments[..self.len].to_vec(),
+            flags: self.expr.flags,
         })
     }
 }
@@ -526,7 +537,8 @@ impl PlaceTable {
     }
 
     pub(crate) fn root_place_exprs(&self, expr: &PlaceExpr) -> impl Iterator<Item = &PlaceExpr> {
-        self.places.iter().filter(|place| expr.contains(place))
+        expr.root_exprs()
+            .filter_map(|place_expr| self.place_by_expr(&place_expr))
     }
 
     #[expect(unused)]
@@ -669,14 +681,12 @@ impl PlaceTableBuilder {
                 entry.insert_with_hasher(hash, id, (), |id| {
                     PlaceTable::hash_place_expr(&self.table.places[*id])
                 });
-                let mut place_expr = self.table.places[id].clone();
                 let new_id = self.associated_place_ids.push(vec![]);
                 debug_assert_eq!(new_id, id);
-                while let Some(root) = place_expr.root() {
+                for root in self.table.places[id].root_exprs() {
                     if let Some(root_id) = self.table.place_id_by_expr(&root) {
                         self.associated_place_ids[root_id].push(id);
                     }
-                    place_expr = root;
                 }
                 (id, true)
             }
