@@ -5714,7 +5714,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                 return Place::Unbound.into();
             }
 
-            /*for root_expr in place_table.root_place_exprs(expr) {
+            for root_expr in place_table.root_place_exprs(expr) {
                 let mut expr_ref = expr_ref;
                 for _ in 0..(expr.sub_segments().len() - root_expr.sub_segments().len()) {
                     match expr_ref {
@@ -5731,7 +5731,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                 if let Place::Type(_, _) = parent_place {
                     return Place::Unbound.into();
                 }
-            }*/
+            }
 
             if let Some(use_id) = use_id {
                 constraint_keys.push((file_scope_id, ConstraintKey::UseId(use_id)));
@@ -5792,7 +5792,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                         // There are no visible bindings / constraint here.
                         // Don't fall back to non-eager place resolution.
                         EagerSnapshotResult::NotFound => {
-                            /*let enclosing_place_table =
+                            let enclosing_place_table =
                                 self.index.place_table(enclosing_scope_file_id);
                             for enclosing_root_place in enclosing_place_table.root_place_exprs(expr)
                             {
@@ -5803,7 +5803,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                                         return Place::Unbound.into();
                                     }
                                 }
-                            }*/
+                            }
                             continue;
                         }
                         EagerSnapshotResult::NoLongerInEagerContext => {}
