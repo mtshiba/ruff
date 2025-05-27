@@ -53,9 +53,7 @@ use crate::place::{
     module_type_implicit_global_symbol, place, place_from_bindings, place_from_declarations,
     typing_extensions_symbol,
 };
-use crate::semantic_index::ast_ids::{
-    HasScopedExpressionId, HasScopedUseId, ScopedExpressionId, ScopedUseId,
-};
+use crate::semantic_index::ast_ids::{HasScopedExpressionId, HasScopedUseId, ScopedExpressionId};
 use crate::semantic_index::definition::{
     AnnotatedAssignmentDefinitionKind, AssignmentDefinitionKind, ComprehensionDefinitionKind,
     Definition, DefinitionKind, DefinitionNodeKey, ExceptHandlerDefinitionKind,
@@ -5633,18 +5631,21 @@ impl<'db> TypeInferenceBuilder<'db> {
             .inner_type()
     }
 
-    fn infer_local_place_load(
-        &self,
+    /// Infer the type of a place expression, assuming a load context.
+    fn infer_place_load(
+        &mut self,
         expr: &PlaceExpr,
         expr_ref: ast::ExprRef,
-    ) -> (Place<'db>, Option<ScopedUseId>) {
+    ) -> (PlaceAndQualifiers<'db>, Vec<(FileScopeId, ConstraintKey)>) {
         let db = self.db();
         let scope = self.scope();
         let file_scope_id = scope.file_scope_id(db);
         let place_table = self.index.place_table(file_scope_id);
         let use_def = self.index.use_def_map(file_scope_id);
 
-        if self.is_deferred() {
+        let mut constraint_keys = vec![];
+        // If we're inferring types of deferred expressions, always treat them as public symbols
+        let (local_scope_place, use_id) = if self.is_deferred() {
             let place = if let Some(place_id) = place_table.place_id_by_expr(expr) {
                 place_from_bindings(db, use_def.public_bindings(place_id))
             } else {
@@ -5659,23 +5660,7 @@ impl<'db> TypeInferenceBuilder<'db> {
             let use_id = expr_ref.scoped_use_id(db, scope);
             let place = place_from_bindings(db, use_def.bindings_at_use(use_id));
             (place, Some(use_id))
-        }
-    }
-
-    /// Infer the type of a place expression, assuming a load context.
-    fn infer_place_load(
-        &self,
-        expr: &PlaceExpr,
-        expr_ref: ast::ExprRef,
-    ) -> (PlaceAndQualifiers<'db>, Vec<(FileScopeId, ConstraintKey)>) {
-        let db = self.db();
-        let scope = self.scope();
-        let file_scope_id = scope.file_scope_id(db);
-        let place_table = self.index.place_table(file_scope_id);
-
-        let mut constraint_keys = vec![];
-        // If we're inferring types of deferred expressions, always treat them as public symbols
-        let (local_scope_place, use_id) = self.infer_local_place_load(expr, expr_ref);
+        };
 
         let place = PlaceAndQualifiers::from(local_scope_place).or_fall_back_to(db, || {
             let has_bindings_in_this_scope = match place_table.place_by_expr(expr) {
@@ -5712,25 +5697,6 @@ impl<'db> TypeInferenceBuilder<'db> {
             // scope. (At runtime, it would use the `LOAD_FAST` opcode.)
             if has_bindings_in_this_scope && scope.is_function_like(db) {
                 return Place::Unbound.into();
-            }
-
-            for root_expr in place_table.root_place_exprs(expr) {
-                let mut expr_ref = expr_ref;
-                for _ in 0..(expr.sub_segments().len() - root_expr.sub_segments().len()) {
-                    match expr_ref {
-                        ast::ExprRef::Attribute(attribute) => {
-                            expr_ref = ast::ExprRef::from(&attribute.value);
-                        }
-                        ast::ExprRef::Subscript(subscript) => {
-                            expr_ref = ast::ExprRef::from(&subscript.value);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                let (parent_place, _use_id) = self.infer_local_place_load(root_expr, expr_ref);
-                if let Place::Type(_, _) = parent_place {
-                    return Place::Unbound.into();
-                }
             }
 
             if let Some(use_id) = use_id {
@@ -5773,8 +5739,7 @@ impl<'db> TypeInferenceBuilder<'db> {
                             ));
                         }
                         EagerSnapshotResult::FoundBindings(bindings) => {
-                            if expr.is_name()
-                                && !enclosing_scope_id.is_function_like(db)
+                            if !enclosing_scope_id.is_function_like(db)
                                 && !is_immediately_enclosing_scope
                             {
                                 continue;
@@ -5792,18 +5757,6 @@ impl<'db> TypeInferenceBuilder<'db> {
                         // There are no visible bindings / constraint here.
                         // Don't fall back to non-eager place resolution.
                         EagerSnapshotResult::NotFound => {
-                            let enclosing_place_table =
-                                self.index.place_table(enclosing_scope_file_id);
-                            for enclosing_root_place in enclosing_place_table.root_place_exprs(expr)
-                            {
-                                if enclosing_root_place.is_bound() {
-                                    if let Place::Type(_, _) =
-                                        place(db, enclosing_scope_id, enclosing_root_place).place
-                                    {
-                                        return Place::Unbound.into();
-                                    }
-                                }
-                            }
                             continue;
                         }
                         EagerSnapshotResult::NoLongerInEagerContext => {}
@@ -5814,8 +5767,8 @@ impl<'db> TypeInferenceBuilder<'db> {
                     continue;
                 }
 
-                let enclosing_place_table = self.index.place_table(enclosing_scope_file_id);
-                let Some(enclosing_place) = enclosing_place_table.place_by_expr(expr) else {
+                let enclosing_symbol_table = self.index.place_table(enclosing_scope_file_id);
+                let Some(enclosing_place) = enclosing_symbol_table.place_by_expr(expr) else {
                     continue;
                 };
                 if enclosing_place.is_bound() {
@@ -9693,7 +9646,7 @@ mod tests {
         let scope = global_scope(db, file);
         use_def_map(db, scope)
             .public_bindings(place_table(db, scope).place_id_by_name(name).unwrap())
-            .find_map(|b| b.binding.definition())
+            .find_map(|b| b.binding)
             .expect("no binding found")
     }
 
