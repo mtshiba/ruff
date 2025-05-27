@@ -237,18 +237,9 @@ impl PlaceExpr {
     }
 
     pub(crate) fn contains(&self, sub: &PlaceExpr) -> bool {
-        if self.root_name != sub.root_name {
-            return false;
-        }
-        if self.sub_segments.len() <= sub.sub_segments.len() {
-            return false;
-        }
-        for (self_segment, other_segment) in self.sub_segments.iter().zip(sub.sub_segments.iter()) {
-            if self_segment != other_segment {
-                return false;
-            }
-        }
-        true
+        self.root_name == sub.root_name
+            && self.sub_segments.len() > sub.sub_segments.len()
+            && self.sub_segments[..sub.sub_segments.len()] == sub.sub_segments
     }
 }
 
@@ -523,6 +514,15 @@ impl PlaceTable {
         &self.places[place_id.into()]
     }
 
+    pub(crate) fn associated_place_ids(
+        &self,
+        expr: &PlaceExpr,
+    ) -> impl Iterator<Item = ScopedPlaceId> {
+        self.places
+            .iter_enumerated()
+            .filter_map(|(id, place)| place.contains(expr).then_some(id))
+    }
+
     pub(crate) fn root_place_exprs(&self, expr: &PlaceExpr) -> impl Iterator<Item = &PlaceExpr> {
         self.places.iter().filter(|place| expr.contains(place))
     }
@@ -625,8 +625,6 @@ impl std::fmt::Debug for PlaceTable {
 #[derive(Debug, Default)]
 pub(super) struct PlaceTableBuilder {
     table: PlaceTable,
-
-    associated_places: IndexVec<ScopedPlaceId, Vec<ScopedPlaceId>>,
 }
 
 impl PlaceTableBuilder {
@@ -647,8 +645,6 @@ impl PlaceTableBuilder {
                 entry.insert_with_hasher(hash, id, (), |id| {
                     PlaceTable::hash_place_expr(&self.table.places[*id])
                 });
-                let new_id = self.associated_places.push(vec![]);
-                debug_assert_eq!(new_id, id);
                 (id, true)
             }
         }
@@ -661,31 +657,12 @@ impl PlaceTableBuilder {
         });
 
         match entry {
-            RawEntryMut::Occupied(entry) => {
-                let id = *entry.key();
-                let place_expr = &self.table.places[id];
-                self.associated_places[id] = self
-                    .table
-                    .places
-                    .iter_enumerated()
-                    .filter_map(|(id, place)| place.contains(place_expr).then_some(id))
-                    .collect();
-                (*entry.key(), false)
-            }
+            RawEntryMut::Occupied(entry) => (*entry.key(), false),
             RawEntryMut::Vacant(entry) => {
                 let id = self.table.places.push(place_expr);
                 entry.insert_with_hasher(hash, id, (), |id| {
                     PlaceTable::hash_place_expr(&self.table.places[*id])
                 });
-                let place_expr = &self.table.places[id];
-                let new_id = self.associated_places.push(
-                    self.table
-                        .places
-                        .iter_enumerated()
-                        .filter_map(|(id, place)| place.contains(place_expr).then_some(id))
-                        .collect(),
-                );
-                debug_assert_eq!(new_id, id);
                 (id, true)
             }
         }
@@ -719,7 +696,8 @@ impl PlaceTableBuilder {
         &self,
         place: ScopedPlaceId,
     ) -> impl Iterator<Item = ScopedPlaceId> {
-        self.associated_places[place].iter().copied()
+        let place_expr = self.place_expr(place);
+        self.table.associated_place_ids(place_expr)
     }
 
     pub(super) fn finish(mut self) -> PlaceTable {
