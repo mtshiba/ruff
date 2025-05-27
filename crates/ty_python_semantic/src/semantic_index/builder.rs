@@ -504,12 +504,12 @@ impl<'db> SemanticIndexBuilder<'db> {
         match category {
             DefinitionCategory::DeclarationAndBinding => {
                 use_def.record_declaration_and_binding(place, definition, is_place_name);
-                // self.delete_associated_bindings(place);
+                self.delete_associated_bindings(place);
             }
             DefinitionCategory::Declaration => use_def.record_declaration(place, definition),
             DefinitionCategory::Binding => {
                 use_def.record_binding(place, definition, is_place_name);
-                // self.delete_associated_bindings(place);
+                self.delete_associated_bindings(place);
             }
         }
 
