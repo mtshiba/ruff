@@ -836,19 +836,18 @@ fn place_from_bindings_impl<'db>(
              narrowing_constraint,
              visibility_constraint,
          }| {
-            let binding =
-                match binding {
-                    DefinitionState::Defined(binding) => binding,
-                    DefinitionState::Undefined => {
-                        return None;
-                    }
-                    DefinitionState::Deleted => {
-                        deleted_visibility = deleted_visibility.or(
-                            visibility_constraints.evaluate(db, predicates, visibility_constraint)
-                        );
-                        return None;
-                    }
-                };
+            let binding = match binding {
+                DefinitionState::Defined(binding) => binding,
+                DefinitionState::Undefined => {
+                    return None;
+                }
+                DefinitionState::Deleted => {
+                    /*deleted_visibility = deleted_visibility.or(
+                        visibility_constraints.evaluate(db, predicates, visibility_constraint)
+                    );*/
+                    return None;
+                }
+            };
 
             if is_non_exported(binding) {
                 return None;

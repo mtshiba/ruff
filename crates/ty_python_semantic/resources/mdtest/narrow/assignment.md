@@ -30,7 +30,7 @@ reveal_type(a.x)  # revealed: Literal[0]
 
 if True:
     a = A()
-reveal_type(a.x)  # revealed: int | None
+reveal_type(a.x)  # revealed: Never
 
 a.x = 0
 reveal_type(a.x)  # revealed: Literal[0]
