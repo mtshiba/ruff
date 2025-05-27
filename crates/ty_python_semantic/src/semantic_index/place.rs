@@ -38,7 +38,7 @@ impl PlaceExprSubSegment {
 
 /// An expression that can be the target of a `Definition`.
 /// If you want to perform a comparison based on the equality of segments (without including flags), use [`PlaceSegments`].
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub struct PlaceExpr {
     root_name: Name,
     sub_segments: Vec<PlaceExprSubSegment>,
@@ -240,6 +240,17 @@ impl PlaceExpr {
         self.root_name == sub.root_name
             && self.sub_segments.len() > sub.sub_segments.len()
             && self.sub_segments[..sub.sub_segments.len()] == sub.sub_segments
+    }
+
+    pub(crate) fn root(&self) -> Option<PlaceExpr> {
+        if self.sub_segments.is_empty() {
+            return None;
+        }
+        Some(PlaceExpr {
+            root_name: self.root_name.clone(),
+            sub_segments: self.sub_segments[..self.sub_segments.len() - 1].to_vec(),
+            flags: self.flags,
+        })
     }
 }
 
@@ -514,15 +525,6 @@ impl PlaceTable {
         &self.places[place_id.into()]
     }
 
-    pub(crate) fn associated_place_ids(
-        &self,
-        expr: &PlaceExpr,
-    ) -> impl Iterator<Item = ScopedPlaceId> {
-        self.places
-            .iter_enumerated()
-            .filter_map(|(id, place)| place.contains(expr).then_some(id))
-    }
-
     pub(crate) fn root_place_exprs(&self, expr: &PlaceExpr) -> impl Iterator<Item = &PlaceExpr> {
         self.places.iter().filter(|place| expr.contains(place))
     }
@@ -625,6 +627,8 @@ impl std::fmt::Debug for PlaceTable {
 #[derive(Debug, Default)]
 pub(super) struct PlaceTableBuilder {
     table: PlaceTable,
+
+    associated_place_ids: IndexVec<ScopedPlaceId, Vec<ScopedPlaceId>>,
 }
 
 impl PlaceTableBuilder {
@@ -645,6 +649,8 @@ impl PlaceTableBuilder {
                 entry.insert_with_hasher(hash, id, (), |id| {
                     PlaceTable::hash_place_expr(&self.table.places[*id])
                 });
+                let new_id = self.associated_place_ids.push(vec![]);
+                debug_assert_eq!(new_id, id);
                 (id, true)
             }
         }
@@ -663,6 +669,15 @@ impl PlaceTableBuilder {
                 entry.insert_with_hasher(hash, id, (), |id| {
                     PlaceTable::hash_place_expr(&self.table.places[*id])
                 });
+                let mut place_expr = self.table.places[id].clone();
+                let new_id = self.associated_place_ids.push(vec![]);
+                debug_assert_eq!(new_id, id);
+                while let Some(root) = place_expr.root() {
+                    if let Some(root_id) = self.table.place_id_by_expr(&root) {
+                        self.associated_place_ids[root_id].push(id);
+                    }
+                    place_expr = root;
+                }
                 (id, true)
             }
         }
@@ -696,8 +711,7 @@ impl PlaceTableBuilder {
         &self,
         place: ScopedPlaceId,
     ) -> impl Iterator<Item = ScopedPlaceId> {
-        let place_expr = self.place_expr(place);
-        self.table.associated_place_ids(place_expr)
+        self.associated_place_ids[place].iter().copied()
     }
 
     pub(super) fn finish(mut self) -> PlaceTable {
