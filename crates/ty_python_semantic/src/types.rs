@@ -1365,7 +1365,9 @@ impl<'db> Type<'db> {
             }
             // A protocol instance can never be a subtype of a nominal type, with the *sole* exception of `object`.
             (Type::ProtocolInstance(_), _) => false,
-            (_, Type::ProtocolInstance(protocol)) => self.satisfies_protocol(db, protocol),
+            (_, Type::ProtocolInstance(protocol)) => {
+                self.satisfies_protocol(db, protocol, relation)
+            }
 
             // All `StringLiteral` types are a subtype of `LiteralString`.
             (Type::StringLiteral(_), Type::LiteralString) => true,
@@ -1878,12 +1880,17 @@ impl<'db> Type<'db> {
                 left.is_disjoint_from(db, right)
             }
 
-            // TODO: we could also consider `protocol` to be disjoint from `nominal` if `nominal`
-            // has the right member but the type of its member is disjoint from the type of the
-            // member on `protocol`.
             (Type::ProtocolInstance(protocol), nominal @ Type::NominalInstance(n))
             | (nominal @ Type::NominalInstance(n), Type::ProtocolInstance(protocol)) => {
-                n.class.is_final(db) && !nominal.satisfies_protocol(db, protocol)
+                (n.class.is_final(db)
+                    && !nominal.satisfies_protocol(db, protocol, TypeRelation::Subtyping))
+                    || protocol.interface(db).members(db).any(|member| {
+                        nominal
+                            .member(db, member.name())
+                            .place
+                            .ignore_possibly_unbound()
+                            .is_some_and(|ty| ty.is_disjoint_from(db, member.ty()))
+                    })
             }
 
             (
@@ -1909,18 +1916,20 @@ impl<'db> Type<'db> {
                 | Type::ModuleLiteral(..)
                 | Type::GenericAlias(..)
                 | Type::IntLiteral(..)),
-            ) => !ty.satisfies_protocol(db, protocol),
+            ) => !ty.satisfies_protocol(db, protocol, TypeRelation::Subtyping),
 
             (Type::ProtocolInstance(protocol), Type::SpecialForm(special_form))
             | (Type::SpecialForm(special_form), Type::ProtocolInstance(protocol)) => !special_form
                 .instance_fallback(db)
-                .satisfies_protocol(db, protocol),
+                .satisfies_protocol(db, protocol, TypeRelation::Subtyping),
 
             (Type::ProtocolInstance(protocol), Type::KnownInstance(known_instance))
             | (Type::KnownInstance(known_instance), Type::ProtocolInstance(protocol)) => {
-                !known_instance
-                    .instance_fallback(db)
-                    .satisfies_protocol(db, protocol)
+                !known_instance.instance_fallback(db).satisfies_protocol(
+                    db,
+                    protocol,
+                    TypeRelation::Subtyping,
+                )
             }
 
             (Type::Callable(_), Type::ProtocolInstance(_))
@@ -8086,6 +8095,10 @@ impl<'db> IntersectionType<'db> {
 
     pub fn iter_positive(&self, db: &'db dyn Db) -> impl Iterator<Item = Type<'db>> {
         self.positive(db).iter().copied()
+    }
+
+    pub fn iter_negative(&self, db: &'db dyn Db) -> impl Iterator<Item = Type<'db>> {
+        self.negative(db).iter().copied()
     }
 
     pub fn has_one_element(&self, db: &'db dyn Db) -> bool {

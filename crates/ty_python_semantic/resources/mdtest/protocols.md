@@ -509,9 +509,8 @@ static_assert(is_assignable_to(FooSub, HasX))
 class Bar:
     x: str
 
-# TODO: these should pass
-static_assert(not is_subtype_of(Bar, HasX))  # error: [static-assert-error]
-static_assert(not is_assignable_to(Bar, HasX))  # error: [static-assert-error]
+static_assert(not is_subtype_of(Bar, HasX))
+static_assert(not is_assignable_to(Bar, HasX))
 
 class Baz:
     y: int
