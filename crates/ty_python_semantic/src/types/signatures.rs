@@ -207,6 +207,14 @@ impl<'db> CallableSignature<'db> {
             .iter()
             .any(|signature| signature.has_divergent_type(db))
     }
+
+    pub(super) fn replace_divergent_type(&self, db: &'db dyn Db) -> Self {
+        Self::from_overloads(
+            self.overloads
+                .iter()
+                .map(|signature| signature.replace_divergent_type(db)),
+        )
+    }
 }
 
 impl<'a, 'db> IntoIterator for &'a CallableSignature<'db> {
@@ -936,9 +944,18 @@ impl<'db> Signature<'db> {
     }
 
     fn has_divergent_type(&self, db: &'db dyn Db) -> bool {
-        self.return_ty
-            .is_some_and(|return_ty| return_ty.has_divergent_type(db))
+        self.return_ty.is_some_and(|ty| ty.has_divergent_type(db))
             || self.parameters.has_divergent_type(db)
+    }
+
+    fn replace_divergent_type(&self, db: &'db dyn Db) -> Self {
+        Self {
+            generic_context: self.generic_context,
+            inherited_generic_context: self.inherited_generic_context,
+            definition: self.definition,
+            parameters: self.parameters.replace_divergent_type(db),
+            return_ty: self.return_ty.map(|ty| ty.replace_divergent_type(db)),
+        }
     }
 }
 
@@ -1246,6 +1263,17 @@ impl<'db> Parameters<'db> {
                 .is_some_and(|ty| ty.has_divergent_type(db))
         })
     }
+
+    fn replace_divergent_type(&self, db: &'db dyn Db) -> Self {
+        Self {
+            value: self
+                .value
+                .iter()
+                .map(|param| param.replace_divergent_type(db))
+                .collect(),
+            is_gradual: self.is_gradual,
+        }
+    }
 }
 
 impl<'db, 'a> IntoIterator for &'a Parameters<'db> {
@@ -1526,6 +1554,17 @@ impl<'db> Parameter<'db> {
             | ParameterKind::PositionalOrKeyword { default_type, .. }
             | ParameterKind::KeywordOnly { default_type, .. } => default_type,
             ParameterKind::Variadic { .. } | ParameterKind::KeywordVariadic { .. } => None,
+        }
+    }
+
+    fn replace_divergent_type(&self, db: &'db dyn Db) -> Self {
+        Self {
+            annotated_type: self
+                .annotated_type
+                .as_ref()
+                .map(|ty| ty.replace_divergent_type(db)),
+            kind: self.kind.clone(),
+            form: self.form,
         }
     }
 }

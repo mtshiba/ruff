@@ -241,6 +241,16 @@ impl<'db> ProtocolInterface<'db> {
             interface: self,
         }
     }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        Self::new(
+            db,
+            self.inner(db)
+                .iter()
+                .map(|(name, data)| (name.clone(), data.replace_divergent_type(db)))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash, salsa::Update)]
@@ -317,6 +327,13 @@ impl<'db> ProtocolMemberData<'db> {
             data: self.kind,
         }
     }
+
+    fn replace_divergent_type(&self, db: &'db dyn Db) -> Self {
+        Self {
+            kind: self.kind.replace_divergent_type(db),
+            qualifiers: self.qualifiers,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, salsa::Update, Hash)]
@@ -377,6 +394,20 @@ impl<'db> ProtocolMemberKind<'db> {
             }
             ProtocolMemberKind::Other(ty) => {
                 ProtocolMemberKind::Other(ty.materialize(db, variance))
+            }
+        }
+    }
+
+    fn replace_divergent_type(&self, db: &'db dyn Db) -> Self {
+        match self {
+            ProtocolMemberKind::Method(callable) => {
+                ProtocolMemberKind::Method(callable.replace_divergent_type(db))
+            }
+            ProtocolMemberKind::Property(property) => {
+                ProtocolMemberKind::Property(property.replace_divergent_type(db))
+            }
+            ProtocolMemberKind::Other(ty) => {
+                ProtocolMemberKind::Other(ty.replace_divergent_type(db))
             }
         }
     }

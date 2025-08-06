@@ -634,11 +634,23 @@ impl<'db> Specialization<'db> {
         }
     }
 
-    pub(crate) fn has_divergent_type(self, db: &'db dyn Db) -> bool {
-        self.types(db).iter().any(|ty| ty.has_divergent_type(db))
-            || self
-                .tuple_inner(db)
+    pub(super) fn has_divergent_type(self, db: &'db dyn Db) -> bool {
+        self.types(db).iter().any(|ty| ty.has_divergent_type(db)) || {
+            self.tuple_inner(db)
                 .is_some_and(|tuple| tuple.has_divergent_type(db))
+        }
+    }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        let types: Box<[_]> = self
+            .types(db)
+            .iter()
+            .map(|ty| ty.replace_divergent_type(db))
+            .collect();
+        let tuple_inner = self
+            .tuple_inner(db)
+            .map(|tuple| tuple.replace_divergent_type(db));
+        Specialization::new(db, self.generic_context(db), types, tuple_inner)
     }
 }
 

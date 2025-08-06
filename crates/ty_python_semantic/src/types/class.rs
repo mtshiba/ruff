@@ -238,6 +238,14 @@ impl<'db> GenericAlias<'db> {
         // look in `self.tuple`.
         self.specialization(db).find_legacy_typevars(db, typevars);
     }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        GenericAlias::new(
+            db,
+            self.origin(db),
+            self.specialization(db).replace_divergent_type(db),
+        )
+    }
 }
 
 impl<'db> From<GenericAlias<'db>> for Type<'db> {
@@ -1019,6 +1027,13 @@ impl<'db> ClassType<'db> {
         match self {
             ClassType::NonGeneric(_) => false,
             ClassType::Generic(generic) => generic.specialization(db).has_divergent_type(db),
+        }
+    }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        match self {
+            ClassType::NonGeneric(non_generic) => ClassType::NonGeneric(non_generic),
+            ClassType::Generic(generic) => ClassType::Generic(generic.replace_divergent_type(db)),
         }
     }
 }

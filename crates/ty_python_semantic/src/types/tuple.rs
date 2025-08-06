@@ -295,6 +295,10 @@ impl<'db> TupleType<'db> {
             .all_elements()
             .any(|ty| ty.has_divergent_type(db))
     }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        TupleType::new(db, self.tuple(db).clone().replace_divergent_type(db)).unwrap()
+    }
 }
 
 /// A tuple spec describes the contents of a tuple type, which might be fixed- or variable-length.
@@ -480,6 +484,10 @@ impl<'db> FixedLengthTuple<Type<'db>> {
 
     fn is_single_valued(&self, db: &'db dyn Db) -> bool {
         self.0.iter().all(|ty| ty.is_single_valued(db))
+    }
+
+    fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        FixedLengthTuple::from_elements(self.0.into_iter().map(|ty| ty.replace_divergent_type(db)))
     }
 }
 
@@ -902,6 +910,22 @@ impl<'db> VariableLengthTuple<Type<'db>> {
                     EitherOrBoth::Left(_) | EitherOrBoth::Right(_) => false,
                 })
     }
+
+    fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        VariableLengthTuple {
+            prefix: self
+                .prefix
+                .into_iter()
+                .map(|ty| ty.replace_divergent_type(db))
+                .collect(),
+            variable: self.variable.replace_divergent_type(db),
+            suffix: self
+                .suffix
+                .into_iter()
+                .map(|ty| ty.replace_divergent_type(db))
+                .collect(),
+        }
+    }
 }
 
 #[allow(unsafe_code)]
@@ -1215,6 +1239,13 @@ impl<'db> Tuple<Type<'db>> {
         match self {
             Tuple::Fixed(tuple) => tuple.is_single_valued(db),
             Tuple::Variable(_) => false,
+        }
+    }
+
+    fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        match self {
+            Tuple::Fixed(tuple) => Tuple::Fixed(tuple.replace_divergent_type(db)),
+            Tuple::Variable(tuple) => Tuple::Variable(tuple.replace_divergent_type(db)),
         }
     }
 }

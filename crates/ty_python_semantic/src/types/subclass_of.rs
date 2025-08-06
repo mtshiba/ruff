@@ -196,6 +196,12 @@ impl<'db> SubclassOfType<'db> {
             SubclassOfInner::Dynamic(dynamic_type) => Type::Dynamic(dynamic_type),
         }
     }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        Self {
+            subclass_of: self.subclass_of.replace_divergent_type(db),
+        }
+    }
 }
 
 /// An enumeration of the different kinds of `type[]` types that a [`SubclassOfType`] can represent:
@@ -262,6 +268,14 @@ impl<'db> SubclassOfInner<'db> {
             }),
             Type::GenericAlias(generic) => Some(Self::Class(ClassType::Generic(generic))),
             _ => None,
+        }
+    }
+
+    fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        match self {
+            Self::Class(class) => Self::Class(class.replace_divergent_type(db)),
+            Self::Dynamic(DynamicType::Divergent) => Self::Dynamic(DynamicType::Unknown),
+            Self::Dynamic(dynamic) => Self::Dynamic(dynamic),
         }
     }
 }

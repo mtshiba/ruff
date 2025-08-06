@@ -155,6 +155,10 @@ impl<'db> NominalInstanceType<'db> {
     ) {
         self.class.find_legacy_typevars(db, typevars);
     }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        Self::from_class(self.class.replace_divergent_type(db))
+    }
 }
 
 impl<'db> From<NominalInstanceType<'db>> for Type<'db> {
@@ -354,6 +358,15 @@ impl<'db> ProtocolInstanceType<'db> {
             .members(db)
             .any(|member| member.ty().has_divergent_type(db))
     }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        match self.inner {
+            Protocol::FromClass(class) => Self::from_class(class.replace_divergent_type(db)),
+            Protocol::Synthesized(synthesized) => {
+                Self::synthesized(synthesized.replace_divergent_type(db))
+            }
+        }
+    }
 }
 
 /// An enumeration of the two kinds of protocol types: those that originate from a class
@@ -431,6 +444,10 @@ mod synthesized_protocol {
 
         pub(in crate::types) fn interface(self) -> ProtocolInterface<'db> {
             self.0
+        }
+
+        pub(in crate::types) fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+            Self(self.0.replace_divergent_type(db))
         }
     }
 }

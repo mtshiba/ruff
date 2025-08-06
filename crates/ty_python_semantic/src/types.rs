@@ -125,6 +125,24 @@ fn has_divergent_type_cycle_initial<'db>(_db: &'db dyn Db, _slf: Type<'db>, _uni
     false
 }
 
+fn replace_divergent_type_cycle_recover<'db>(
+    _db: &'db dyn Db,
+    _value: &Type<'db>,
+    _count: u32,
+    _self: Type<'db>,
+    _unit: (),
+) -> salsa::CycleRecoveryAction<Type<'db>> {
+    salsa::CycleRecoveryAction::Iterate
+}
+
+fn replace_divergent_type_cycle_initial<'db>(
+    _db: &'db dyn Db,
+    _self: Type<'db>,
+    _unit: (),
+) -> Type<'db> {
+    Type::unknown()
+}
+
 pub fn check_types(db: &dyn Db, file: File) -> Vec<Diagnostic> {
     let _span = tracing::trace_span!("check_types", ?file).entered();
 
@@ -472,6 +490,14 @@ impl<'db> PropertyInstanceType<'db> {
             db,
             self.getter(db).map(|ty| ty.materialize(db, variance)),
             self.setter(db).map(|ty| ty.materialize(db, variance)),
+        )
+    }
+
+    fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        Self::new(
+            db,
+            self.getter(db).map(|ty| ty.replace_divergent_type(db)),
+            self.setter(db).map(|ty| ty.replace_divergent_type(db)),
         )
     }
 }
@@ -4580,11 +4606,13 @@ impl<'db> Type<'db> {
     /// Returns the inferred return type of `self` if it is a function literal / bound method.
     fn infer_return_type(self, db: &'db dyn Db) -> Option<Type<'db>> {
         match self {
-            Type::FunctionLiteral(function_type) if !function_type.file(db).is_stub(db) => {
-                Some(function_type.infer_return_type(db))
-            }
+            Type::FunctionLiteral(function_type) if !function_type.file(db).is_stub(db) => Some(
+                function_type
+                    .infer_return_type(db)
+                    .replace_divergent_type(db),
+            ),
             Type::BoundMethod(method_type) if !method_type.function(db).file(db).is_stub(db) => {
-                Some(method_type.infer_return_type(db))
+                Some(method_type.infer_return_type(db).replace_divergent_type(db))
             }
             _ => None,
         }
@@ -6103,6 +6131,37 @@ impl<'db> Type<'db> {
             | Type::FunctionLiteral(_)
             | Type::BoundMethod(_)
             | Type::Dynamic(_) => false,
+        }
+    }
+
+    pub(super) fn replace_divergent_type(self, db: &'db dyn Db) -> Type<'db> {
+        self._replace_divergent_type(db, ())
+    }
+
+    #[allow(clippy::used_underscore_binding)]
+    #[salsa::tracked(cycle_fn=replace_divergent_type_cycle_recover, cycle_initial=replace_divergent_type_cycle_initial, heap_size=get_size2::heap_size)]
+    pub(super) fn _replace_divergent_type(self, db: &'db dyn Db, _unit: ()) -> Self {
+        match self {
+            Type::Dynamic(DynamicType::Divergent) => Type::Dynamic(DynamicType::Unknown),
+            Type::Union(union) => union.map(db, |ty| ty.replace_divergent_type(db)),
+            Type::Intersection(intersection) => intersection.replace_divergent_type(db),
+            Type::Tuple(tuple) => Type::Tuple(tuple.replace_divergent_type(db)),
+            Type::GenericAlias(alias) => Type::GenericAlias(alias.replace_divergent_type(db)),
+            Type::NominalInstance(instance) => {
+                Type::NominalInstance(instance.replace_divergent_type(db))
+            }
+            Type::Callable(callable) => Type::Callable(callable.replace_divergent_type(db)),
+            Type::ProtocolInstance(protocol) => {
+                Type::ProtocolInstance(protocol.replace_divergent_type(db))
+            }
+            Type::TypeIs(type_is) => Type::TypeIs(type_is.replace_divergent_type(db)),
+            Type::PropertyInstance(property) => {
+                Type::PropertyInstance(property.replace_divergent_type(db))
+            }
+            Type::SubclassOf(subclass_of) => {
+                Type::SubclassOf(subclass_of.replace_divergent_type(db))
+            }
+            _ => self,
         }
     }
 }
@@ -8139,6 +8198,14 @@ impl<'db> CallableType<'db> {
     fn has_divergent_type(self, db: &'db dyn Db) -> bool {
         self.signatures(db).has_divergent_type(db)
     }
+
+    fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        CallableType::new(
+            db,
+            self.signatures(db).replace_divergent_type(db),
+            self.is_function_like(db),
+        )
+    }
 }
 
 /// Represents a specific instance of `types.MethodWrapperType`
@@ -8942,6 +9009,12 @@ impl<'db> IntersectionType<'db> {
     pub fn has_one_element(&self, db: &'db dyn Db) -> bool {
         (self.positive(db).len() + self.negative(db).len()) == 1
     }
+
+    fn replace_divergent_type(self, db: &'db dyn Db) -> Type<'db> {
+        self.map_with_boundness(db, |ty| Place::bound(ty.replace_divergent_type(db)))
+            .ignore_possibly_unbound()
+            .unwrap()
+    }
 }
 
 /// # Ordering
@@ -9400,6 +9473,14 @@ impl<'db> TypeIsType<'db> {
 
     pub fn is_unbound(&self, db: &'db dyn Db) -> bool {
         self.place_info(db).is_none()
+    }
+
+    fn replace_divergent_type(self, db: &'db dyn Db) -> Self {
+        Self::new(
+            db,
+            self.return_type(db).replace_divergent_type(db),
+            self.place_info(db),
+        )
     }
 }
 
