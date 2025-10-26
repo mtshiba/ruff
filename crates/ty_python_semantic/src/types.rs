@@ -32,7 +32,7 @@ pub(crate) use self::signatures::{CallableSignature, Signature};
 pub(crate) use self::subclass_of::{SubclassOfInner, SubclassOfType};
 use crate::module_name::ModuleName;
 use crate::module_resolver::{KnownModule, resolve_module};
-use crate::place::{Boundness, Place, PlaceAndQualifiers, imported_symbol};
+use crate::place::{Definedness, Place, PlaceAndQualifiers, TypeOrigin, imported_symbol};
 use crate::semantic_index::definition::{Definition, DefinitionKind};
 use crate::semantic_index::place::ScopedPlaceId;
 use crate::semantic_index::scope::ScopeId;
@@ -54,8 +54,8 @@ use crate::types::function::{
     DataclassTransformerParams, FunctionDecorators, FunctionSpans, FunctionType, KnownFunction,
 };
 use crate::types::generics::{
-    GenericContext, PartialSpecialization, Specialization, bind_typevar, typing_self,
-    walk_generic_context,
+    GenericContext, InferableTypeVars, PartialSpecialization, Specialization, bind_typevar,
+    typing_self, walk_generic_context,
 };
 use crate::types::infer::{InferExpression, infer_unpack_types};
 use crate::types::mro::{Mro, MroError, MroIterator};
@@ -187,7 +187,7 @@ pub(crate) fn declaration_type<'db>(
     if let Some(cycle_recovery) = inference.cycle_recovery() {
         let decl_ty = inference.declaration_type(definition);
         let union = UnionType::from_elements(db, [decl_ty.inner_type(), cycle_recovery]);
-        TypeAndQualifiers::new(union, decl_ty.qualifiers())
+        TypeAndQualifiers::new(union, TypeOrigin::Declared, decl_ty.qualifiers())
     } else {
         inference.declaration_type(definition)
     }
@@ -688,21 +688,27 @@ impl<'db> PropertyInstanceType<'db> {
         }
     }
 
-    fn when_equivalent_to(self, db: &'db dyn Db, other: Self) -> ConstraintSet<'db> {
-        self.is_equivalent_to_impl(db, other, &IsEquivalentVisitor::default())
+    fn when_equivalent_to(
+        self,
+        db: &'db dyn Db,
+        other: Self,
+        inferable: InferableTypeVars<'_, 'db>,
+    ) -> ConstraintSet<'db> {
+        self.is_equivalent_to_impl(db, other, inferable, &IsEquivalentVisitor::default())
     }
 
     fn is_equivalent_to_impl(
         self,
         db: &'db dyn Db,
         other: Self,
+        inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         let getter_equivalence = if let Some(getter) = self.getter(db) {
             let Some(other_getter) = other.getter(db) else {
                 return ConstraintSet::from(false);
             };
-            getter.is_equivalent_to_impl(db, other_getter, visitor)
+            getter.is_equivalent_to_impl(db, other_getter, inferable, visitor)
         } else {
             if other.getter(db).is_some() {
                 return ConstraintSet::from(false);
@@ -715,7 +721,7 @@ impl<'db> PropertyInstanceType<'db> {
                 let Some(other_setter) = other.setter(db) else {
                     return ConstraintSet::from(false);
                 };
-                setter.is_equivalent_to_impl(db, other_setter, visitor)
+                setter.is_equivalent_to_impl(db, other_setter, inferable, visitor)
             } else {
                 if other.setter(db).is_some() {
                     return ConstraintSet::from(false);
@@ -1314,9 +1320,18 @@ impl<'db> Type<'db> {
     }
 
     /// Remove the union elements that are not related to `target`.
-    pub(crate) fn filter_disjoint_elements(self, db: &'db dyn Db, target: Type<'db>) -> Type<'db> {
+    pub(crate) fn filter_disjoint_elements(
+        self,
+        db: &'db dyn Db,
+        target: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+    ) -> Type<'db> {
         if let Type::Union(union) = self {
-            union.filter(db, |elem| !elem.is_disjoint_from(db, target))
+            union.filter(db, |elem| {
+                !elem
+                    .when_disjoint_from(db, target, inferable)
+                    .is_always_satisfied()
+            })
         } else {
             self
         }
@@ -1635,7 +1650,7 @@ impl<'db> Type<'db> {
                     )
                     .place;
 
-                if let Place::Type(ty, Boundness::Bound) = call_symbol {
+                if let Place::Defined(ty, _, Definedness::AlwaysDefined) = call_symbol {
                     ty.try_upcast_to_callable(db)
                 } else {
                     None
@@ -1705,29 +1720,41 @@ impl<'db> Type<'db> {
     ///
     /// See [`TypeRelation::Subtyping`] for more details.
     pub(crate) fn is_subtype_of(self, db: &'db dyn Db, target: Type<'db>) -> bool {
-        self.when_subtype_of(db, target).is_always_satisfied()
+        self.when_subtype_of(db, target, InferableTypeVars::None)
+            .is_always_satisfied()
     }
 
-    fn when_subtype_of(self, db: &'db dyn Db, target: Type<'db>) -> ConstraintSet<'db> {
-        self.has_relation_to(db, target, TypeRelation::Subtyping)
+    fn when_subtype_of(
+        self,
+        db: &'db dyn Db,
+        target: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+    ) -> ConstraintSet<'db> {
+        self.has_relation_to(db, target, inferable, TypeRelation::Subtyping)
     }
 
     /// Return true if this type is assignable to type `target`.
     ///
     /// See [`TypeRelation::Assignability`] for more details.
     pub(crate) fn is_assignable_to(self, db: &'db dyn Db, target: Type<'db>) -> bool {
-        self.when_assignable_to(db, target).is_always_satisfied()
+        self.when_assignable_to(db, target, InferableTypeVars::None)
+            .is_always_satisfied()
     }
 
-    fn when_assignable_to(self, db: &'db dyn Db, target: Type<'db>) -> ConstraintSet<'db> {
-        self.has_relation_to(db, target, TypeRelation::Assignability)
+    fn when_assignable_to(
+        self,
+        db: &'db dyn Db,
+        target: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+    ) -> ConstraintSet<'db> {
+        self.has_relation_to(db, target, inferable, TypeRelation::Assignability)
     }
 
     /// Return `true` if it would be redundant to add `self` to a union that already contains `other`.
     ///
     /// See [`TypeRelation::Redundancy`] for more details.
     pub(crate) fn is_redundant_with(self, db: &'db dyn Db, other: Type<'db>) -> bool {
-        self.has_relation_to(db, other, TypeRelation::Redundancy)
+        self.has_relation_to(db, other, InferableTypeVars::None, TypeRelation::Redundancy)
             .is_always_satisfied()
     }
 
@@ -1735,11 +1762,13 @@ impl<'db> Type<'db> {
         self,
         db: &'db dyn Db,
         target: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
         relation: TypeRelation,
     ) -> ConstraintSet<'db> {
         self.has_relation_to_impl(
             db,
             target,
+            inferable,
             relation,
             &HasRelationToVisitor::default(),
             &IsDisjointVisitor::default(),
@@ -1750,6 +1779,7 @@ impl<'db> Type<'db> {
         self,
         db: &'db dyn Db,
         target: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
         relation: TypeRelation,
         relation_visitor: &HasRelationToVisitor<'db>,
         disjointness_visitor: &IsDisjointVisitor<'db>,
@@ -1789,6 +1819,7 @@ impl<'db> Type<'db> {
                     self_alias.value_type(db).has_relation_to_impl(
                         db,
                         target,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -1801,6 +1832,7 @@ impl<'db> Type<'db> {
                     self.has_relation_to_impl(
                         db,
                         target_alias.value_type(db),
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -1817,6 +1849,7 @@ impl<'db> Type<'db> {
                 field.default_type(db).has_relation_to_impl(
                     db,
                     right,
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
@@ -1899,6 +1932,7 @@ impl<'db> Type<'db> {
                         .has_relation_to_impl(
                             db,
                             target,
+                            inferable,
                             relation,
                             relation_visitor,
                             disjointness_visitor,
@@ -1908,6 +1942,7 @@ impl<'db> Type<'db> {
                             constraint.has_relation_to_impl(
                                 db,
                                 target,
+                                inferable,
                                 relation,
                                 relation_visitor,
                                 disjointness_visitor,
@@ -1929,6 +1964,7 @@ impl<'db> Type<'db> {
                             self.has_relation_to_impl(
                                 db,
                                 *constraint,
+                                inferable,
                                 relation,
                                 relation_visitor,
                                 disjointness_visitor,
@@ -1949,6 +1985,7 @@ impl<'db> Type<'db> {
                             self.has_relation_to_impl(
                                 db,
                                 *constraint,
+                                inferable,
                                 relation,
                                 relation_visitor,
                                 disjointness_visitor,
@@ -1973,6 +2010,7 @@ impl<'db> Type<'db> {
                 elem_ty.has_relation_to_impl(
                     db,
                     target,
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
@@ -1983,6 +2021,7 @@ impl<'db> Type<'db> {
                 self.has_relation_to_impl(
                     db,
                     elem_ty,
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
@@ -1999,6 +2038,7 @@ impl<'db> Type<'db> {
                     self.has_relation_to_impl(
                         db,
                         pos_ty,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2030,6 +2070,7 @@ impl<'db> Type<'db> {
                         self_ty.is_disjoint_from_impl(
                             db,
                             neg_ty,
+                            inferable,
                             disjointness_visitor,
                             relation_visitor,
                         )
@@ -2041,6 +2082,7 @@ impl<'db> Type<'db> {
                     elem_ty.has_relation_to_impl(
                         db,
                         target,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2062,6 +2104,7 @@ impl<'db> Type<'db> {
                             .has_relation_to_impl(
                                 db,
                                 bound,
+                                inferable,
                                 relation,
                                 relation_visitor,
                                 disjointness_visitor,
@@ -2075,6 +2118,7 @@ impl<'db> Type<'db> {
                     self.has_relation_to_impl(
                         db,
                         bound,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2096,7 +2140,7 @@ impl<'db> Type<'db> {
             (left, Type::AlwaysTruthy) => ConstraintSet::from(left.bool(db).is_always_true()),
             // Currently, the only supertype of `AlwaysFalsy` and `AlwaysTruthy` is the universal set (object instance).
             (Type::AlwaysFalsy | Type::AlwaysTruthy, _) => {
-                target.when_equivalent_to(db, Type::object())
+                target.when_equivalent_to(db, Type::object(), inferable)
             }
 
             // These clauses handle type variants that include function literals. A function
@@ -2105,18 +2149,33 @@ impl<'db> Type<'db> {
             // applied to the signature. Different specializations of the same function literal are
             // only subtypes of each other if they result in the same signature.
             (Type::FunctionLiteral(self_function), Type::FunctionLiteral(target_function)) => {
-                self_function.has_relation_to_impl(db, target_function, relation, relation_visitor)
+                self_function.has_relation_to_impl(
+                    db,
+                    target_function,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                )
             }
             (Type::BoundMethod(self_method), Type::BoundMethod(target_method)) => self_method
                 .has_relation_to_impl(
                     db,
                     target_method,
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
                 ),
             (Type::KnownBoundMethod(self_method), Type::KnownBoundMethod(target_method)) => {
-                self_method.has_relation_to_impl(db, target_method, relation, relation_visitor)
+                self_method.has_relation_to_impl(
+                    db,
+                    target_method,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                )
             }
 
             // No literal type is a subtype of any other literal type, unless they are the same
@@ -2145,6 +2204,7 @@ impl<'db> Type<'db> {
                     self_callable.has_relation_to_impl(
                         db,
                         other_callable,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2156,6 +2216,7 @@ impl<'db> Type<'db> {
                     callable.has_relation_to_impl(
                         db,
                         target,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2168,6 +2229,7 @@ impl<'db> Type<'db> {
                     self.satisfies_protocol(
                         db,
                         protocol,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2211,6 +2273,7 @@ impl<'db> Type<'db> {
                 instance.has_relation_to_impl(
                     db,
                     target,
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
@@ -2218,16 +2281,36 @@ impl<'db> Type<'db> {
             }),
 
             // The same reasoning applies for these special callable types:
-            (Type::BoundMethod(_), _) => KnownClass::MethodType
-                .to_instance(db)
-                .has_relation_to_impl(db, target, relation, relation_visitor, disjointness_visitor),
-            (Type::KnownBoundMethod(method), _) => method
-                .class()
-                .to_instance(db)
-                .has_relation_to_impl(db, target, relation, relation_visitor, disjointness_visitor),
+            (Type::BoundMethod(_), _) => {
+                KnownClass::MethodType.to_instance(db).has_relation_to_impl(
+                    db,
+                    target,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                )
+            }
+            (Type::KnownBoundMethod(method), _) => {
+                method.class().to_instance(db).has_relation_to_impl(
+                    db,
+                    target,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                )
+            }
             (Type::WrapperDescriptor(_), _) => KnownClass::WrapperDescriptorType
                 .to_instance(db)
-                .has_relation_to_impl(db, target, relation, relation_visitor, disjointness_visitor),
+                .has_relation_to_impl(
+                    db,
+                    target,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                ),
 
             (Type::DataclassDecorator(_) | Type::DataclassTransformer(_), _) => {
                 // TODO: Implement subtyping using an equivalent `Callable` type.
@@ -2240,6 +2323,7 @@ impl<'db> Type<'db> {
                 .has_relation_to_impl(
                     db,
                     right.return_type(db),
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
@@ -2248,6 +2332,7 @@ impl<'db> Type<'db> {
                     right.return_type(db).has_relation_to_impl(
                         db,
                         left.return_type(db),
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2258,6 +2343,7 @@ impl<'db> Type<'db> {
             (Type::TypeIs(_), _) => KnownClass::Bool.to_instance(db).has_relation_to_impl(
                 db,
                 target,
+                inferable,
                 relation,
                 relation_visitor,
                 disjointness_visitor,
@@ -2270,6 +2356,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         target,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2278,10 +2365,13 @@ impl<'db> Type<'db> {
 
             (Type::Callable(_), _) => ConstraintSet::from(false),
 
-            (Type::BoundSuper(_), Type::BoundSuper(_)) => self.when_equivalent_to(db, target),
+            (Type::BoundSuper(_), Type::BoundSuper(_)) => {
+                self.when_equivalent_to(db, target, inferable)
+            }
             (Type::BoundSuper(_), _) => KnownClass::Super.to_instance(db).has_relation_to_impl(
                 db,
                 target,
+                inferable,
                 relation,
                 relation_visitor,
                 disjointness_visitor,
@@ -2296,6 +2386,7 @@ impl<'db> Type<'db> {
                     ClassType::NonGeneric(class).has_relation_to_impl(
                         db,
                         subclass_of_class,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2309,6 +2400,7 @@ impl<'db> Type<'db> {
                     ClassType::Generic(alias).has_relation_to_impl(
                         db,
                         subclass_of_class,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2321,6 +2413,7 @@ impl<'db> Type<'db> {
                 self_subclass_ty.has_relation_to_impl(
                     db,
                     target_subclass_ty,
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
@@ -2330,12 +2423,26 @@ impl<'db> Type<'db> {
             // `Literal[str]` is a subtype of `type` because the `str` class object is an instance of its metaclass `type`.
             // `Literal[abc.ABC]` is a subtype of `abc.ABCMeta` because the `abc.ABC` class object
             // is an instance of its metaclass `abc.ABCMeta`.
-            (Type::ClassLiteral(class), _) => class
-                .metaclass_instance_type(db)
-                .has_relation_to_impl(db, target, relation, relation_visitor, disjointness_visitor),
+            (Type::ClassLiteral(class), _) => {
+                class.metaclass_instance_type(db).has_relation_to_impl(
+                    db,
+                    target,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                )
+            }
             (Type::GenericAlias(alias), _) => ClassType::from(alias)
                 .metaclass_instance_type(db)
-                .has_relation_to_impl(db, target, relation, relation_visitor, disjointness_visitor),
+                .has_relation_to_impl(
+                    db,
+                    target,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                ),
 
             // `type[Any]` is a subtype of `type[object]`, and is assignable to any `type[...]`
             (Type::SubclassOf(subclass_of_ty), other) if subclass_of_ty.is_dynamic() => {
@@ -2344,6 +2451,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         other,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2353,6 +2461,7 @@ impl<'db> Type<'db> {
                             other.has_relation_to_impl(
                                 db,
                                 KnownClass::Type.to_instance(db),
+                                inferable,
                                 relation,
                                 relation_visitor,
                                 disjointness_visitor,
@@ -2368,6 +2477,7 @@ impl<'db> Type<'db> {
                 other.has_relation_to_impl(
                     db,
                     KnownClass::Type.to_instance(db),
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
@@ -2386,7 +2496,14 @@ impl<'db> Type<'db> {
                 .into_class()
                 .map(|class| class.metaclass_instance_type(db))
                 .unwrap_or_else(|| KnownClass::Type.to_instance(db))
-                .has_relation_to_impl(db, target, relation, relation_visitor, disjointness_visitor),
+                .has_relation_to_impl(
+                    db,
+                    target,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                ),
 
             // For example: `Type::SpecialForm(SpecialFormType::Type)` is a subtype of `Type::NominalInstance(_SpecialForm)`,
             // because `Type::SpecialForm(SpecialFormType::Type)` is a set with exactly one runtime value in it
@@ -2394,6 +2511,7 @@ impl<'db> Type<'db> {
             (Type::SpecialForm(left), right) => left.instance_fallback(db).has_relation_to_impl(
                 db,
                 right,
+                inferable,
                 relation,
                 relation_visitor,
                 disjointness_visitor,
@@ -2402,6 +2520,7 @@ impl<'db> Type<'db> {
             (Type::KnownInstance(left), right) => left.instance_fallback(db).has_relation_to_impl(
                 db,
                 right,
+                inferable,
                 relation,
                 relation_visitor,
                 disjointness_visitor,
@@ -2414,6 +2533,7 @@ impl<'db> Type<'db> {
                     self_instance.has_relation_to_impl(
                         db,
                         target_instance,
+                        inferable,
                         relation,
                         relation_visitor,
                         disjointness_visitor,
@@ -2421,12 +2541,20 @@ impl<'db> Type<'db> {
                 })
             }
 
-            (Type::PropertyInstance(_), _) => KnownClass::Property
-                .to_instance(db)
-                .has_relation_to_impl(db, target, relation, relation_visitor, disjointness_visitor),
+            (Type::PropertyInstance(_), _) => {
+                KnownClass::Property.to_instance(db).has_relation_to_impl(
+                    db,
+                    target,
+                    inferable,
+                    relation,
+                    relation_visitor,
+                    disjointness_visitor,
+                )
+            }
             (_, Type::PropertyInstance(_)) => self.has_relation_to_impl(
                 db,
                 KnownClass::Property.to_instance(db),
+                inferable,
                 relation,
                 relation_visitor,
                 disjointness_visitor,
@@ -2453,17 +2581,24 @@ impl<'db> Type<'db> {
     ///
     /// [equivalent to]: https://typing.python.org/en/latest/spec/glossary.html#term-equivalent
     pub(crate) fn is_equivalent_to(self, db: &'db dyn Db, other: Type<'db>) -> bool {
-        self.when_equivalent_to(db, other).is_always_satisfied()
+        self.when_equivalent_to(db, other, InferableTypeVars::None)
+            .is_always_satisfied()
     }
 
-    fn when_equivalent_to(self, db: &'db dyn Db, other: Type<'db>) -> ConstraintSet<'db> {
-        self.is_equivalent_to_impl(db, other, &IsEquivalentVisitor::default())
+    fn when_equivalent_to(
+        self,
+        db: &'db dyn Db,
+        other: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+    ) -> ConstraintSet<'db> {
+        self.is_equivalent_to_impl(db, other, inferable, &IsEquivalentVisitor::default())
     }
 
     pub(crate) fn is_equivalent_to_impl(
         self,
         db: &'db dyn Db,
         other: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         if self == other {
@@ -2492,44 +2627,44 @@ impl<'db> Type<'db> {
             (Type::TypeAlias(self_alias), _) => {
                 let self_alias_ty = self_alias.value_type(db).normalized(db);
                 visitor.visit((self_alias_ty, other), || {
-                    self_alias_ty.is_equivalent_to_impl(db, other, visitor)
+                    self_alias_ty.is_equivalent_to_impl(db, other, inferable, visitor)
                 })
             }
 
             (_, Type::TypeAlias(other_alias)) => {
                 let other_alias_ty = other_alias.value_type(db).normalized(db);
                 visitor.visit((self, other_alias_ty), || {
-                    self.is_equivalent_to_impl(db, other_alias_ty, visitor)
+                    self.is_equivalent_to_impl(db, other_alias_ty, inferable, visitor)
                 })
             }
 
             (Type::NominalInstance(first), Type::NominalInstance(second)) => {
-                first.is_equivalent_to_impl(db, second, visitor)
+                first.is_equivalent_to_impl(db, second, inferable, visitor)
             }
 
             (Type::Union(first), Type::Union(second)) => {
-                first.is_equivalent_to_impl(db, second, visitor)
+                first.is_equivalent_to_impl(db, second, inferable, visitor)
             }
 
             (Type::Intersection(first), Type::Intersection(second)) => {
-                first.is_equivalent_to_impl(db, second, visitor)
+                first.is_equivalent_to_impl(db, second, inferable, visitor)
             }
 
             (Type::FunctionLiteral(self_function), Type::FunctionLiteral(target_function)) => {
-                self_function.is_equivalent_to_impl(db, target_function, visitor)
+                self_function.is_equivalent_to_impl(db, target_function, inferable, visitor)
             }
             (Type::BoundMethod(self_method), Type::BoundMethod(target_method)) => {
-                self_method.is_equivalent_to_impl(db, target_method, visitor)
+                self_method.is_equivalent_to_impl(db, target_method, inferable, visitor)
             }
             (Type::KnownBoundMethod(self_method), Type::KnownBoundMethod(target_method)) => {
-                self_method.is_equivalent_to_impl(db, target_method, visitor)
+                self_method.is_equivalent_to_impl(db, target_method, inferable, visitor)
             }
             (Type::Callable(first), Type::Callable(second)) => {
-                first.is_equivalent_to_impl(db, second, visitor)
+                first.is_equivalent_to_impl(db, second, inferable, visitor)
             }
 
             (Type::ProtocolInstance(first), Type::ProtocolInstance(second)) => {
-                first.is_equivalent_to_impl(db, second, visitor)
+                first.is_equivalent_to_impl(db, second, inferable, visitor)
             }
             (Type::ProtocolInstance(protocol), nominal @ Type::NominalInstance(n))
             | (nominal @ Type::NominalInstance(n), Type::ProtocolInstance(protocol)) => {
@@ -2546,7 +2681,7 @@ impl<'db> Type<'db> {
             }
 
             (Type::PropertyInstance(left), Type::PropertyInstance(right)) => {
-                left.is_equivalent_to_impl(db, right, visitor)
+                left.is_equivalent_to_impl(db, right, inferable, visitor)
             }
 
             _ => ConstraintSet::from(false),
@@ -2569,13 +2704,20 @@ impl<'db> Type<'db> {
     /// This function aims to have no false positives, but might return wrong
     /// `false` answers in some cases.
     pub(crate) fn is_disjoint_from(self, db: &'db dyn Db, other: Type<'db>) -> bool {
-        self.when_disjoint_from(db, other).is_always_satisfied()
+        self.when_disjoint_from(db, other, InferableTypeVars::None)
+            .is_always_satisfied()
     }
 
-    fn when_disjoint_from(self, db: &'db dyn Db, other: Type<'db>) -> ConstraintSet<'db> {
+    fn when_disjoint_from(
+        self,
+        db: &'db dyn Db,
+        other: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
+    ) -> ConstraintSet<'db> {
         self.is_disjoint_from_impl(
             db,
             other,
+            inferable,
             &IsDisjointVisitor::default(),
             &HasRelationToVisitor::default(),
         )
@@ -2585,6 +2727,7 @@ impl<'db> Type<'db> {
         self,
         db: &'db dyn Db,
         other: Type<'db>,
+        inferable: InferableTypeVars<'_, 'db>,
         disjointness_visitor: &IsDisjointVisitor<'db>,
         relation_visitor: &HasRelationToVisitor<'db>,
     ) -> ConstraintSet<'db> {
@@ -2592,6 +2735,7 @@ impl<'db> Type<'db> {
             db: &'db dyn Db,
             protocol: ProtocolInstanceType<'db>,
             other: Type<'db>,
+            inferable: InferableTypeVars<'_, 'db>,
             disjointness_visitor: &IsDisjointVisitor<'db>,
             relation_visitor: &HasRelationToVisitor<'db>,
         ) -> ConstraintSet<'db> {
@@ -2599,11 +2743,12 @@ impl<'db> Type<'db> {
                 other
                     .member(db, member.name())
                     .place
-                    .ignore_possibly_unbound()
+                    .ignore_possibly_undefined()
                     .when_none_or(|attribute_type| {
                         member.has_disjoint_type_from(
                             db,
                             attribute_type,
+                            inferable,
                             disjointness_visitor,
                             relation_visitor,
                         )
@@ -2622,6 +2767,7 @@ impl<'db> Type<'db> {
                     self_alias_ty.is_disjoint_from_impl(
                         db,
                         other,
+                        inferable,
                         disjointness_visitor,
                         relation_visitor,
                     )
@@ -2634,6 +2780,7 @@ impl<'db> Type<'db> {
                     self.is_disjoint_from_impl(
                         db,
                         other_alias_ty,
+                        inferable,
                         disjointness_visitor,
                         relation_visitor,
                     )
@@ -2672,12 +2819,19 @@ impl<'db> Type<'db> {
                 match bound_typevar.typevar(db).bound_or_constraints(db) {
                     None => ConstraintSet::from(false),
                     Some(TypeVarBoundOrConstraints::UpperBound(bound)) => bound
-                        .is_disjoint_from_impl(db, other, disjointness_visitor, relation_visitor),
+                        .is_disjoint_from_impl(
+                            db,
+                            other,
+                            inferable,
+                            disjointness_visitor,
+                            relation_visitor,
+                        ),
                     Some(TypeVarBoundOrConstraints::Constraints(constraints)) => {
                         constraints.elements(db).iter().when_all(db, |constraint| {
                             constraint.is_disjoint_from_impl(
                                 db,
                                 other,
+                                inferable,
                                 disjointness_visitor,
                                 relation_visitor,
                             )
@@ -2691,7 +2845,13 @@ impl<'db> Type<'db> {
 
             (Type::Union(union), other) | (other, Type::Union(union)) => {
                 union.elements(db).iter().when_all(db, |e| {
-                    e.is_disjoint_from_impl(db, other, disjointness_visitor, relation_visitor)
+                    e.is_disjoint_from_impl(
+                        db,
+                        other,
+                        inferable,
+                        disjointness_visitor,
+                        relation_visitor,
+                    )
                 })
             }
 
@@ -2707,6 +2867,7 @@ impl<'db> Type<'db> {
                             p.is_disjoint_from_impl(
                                 db,
                                 other,
+                                inferable,
                                 disjointness_visitor,
                                 relation_visitor,
                             )
@@ -2716,6 +2877,7 @@ impl<'db> Type<'db> {
                                 p.is_disjoint_from_impl(
                                     db,
                                     self,
+                                    inferable,
                                     disjointness_visitor,
                                     relation_visitor,
                                 )
@@ -2734,6 +2896,7 @@ impl<'db> Type<'db> {
                             p.is_disjoint_from_impl(
                                 db,
                                 non_intersection,
+                                inferable,
                                 disjointness_visitor,
                                 relation_visitor,
                             )
@@ -2744,6 +2907,7 @@ impl<'db> Type<'db> {
                                 non_intersection.has_relation_to_impl(
                                     db,
                                     neg_ty,
+                                    inferable,
                                     TypeRelation::Subtyping,
                                     relation_visitor,
                                     disjointness_visitor,
@@ -2827,7 +2991,7 @@ impl<'db> Type<'db> {
 
             (Type::ProtocolInstance(left), Type::ProtocolInstance(right)) => disjointness_visitor
                 .visit((self, other), || {
-                    left.is_disjoint_from_impl(db, right, disjointness_visitor)
+                    left.is_disjoint_from_impl(db, right, inferable, disjointness_visitor)
                 }),
 
             (Type::ProtocolInstance(protocol), Type::SpecialForm(special_form))
@@ -2837,6 +3001,7 @@ impl<'db> Type<'db> {
                         db,
                         protocol,
                         special_form.instance_fallback(db),
+                        inferable,
                         disjointness_visitor,
                         relation_visitor,
                     )
@@ -2850,6 +3015,7 @@ impl<'db> Type<'db> {
                         db,
                         protocol,
                         known_instance.instance_fallback(db),
+                        inferable,
                         disjointness_visitor,
                         relation_visitor,
                     )
@@ -2913,6 +3079,7 @@ impl<'db> Type<'db> {
                     db,
                     protocol,
                     ty,
+                    inferable,
                     disjointness_visitor,
                     relation_visitor,
                 )
@@ -2930,6 +3097,7 @@ impl<'db> Type<'db> {
                         db,
                         protocol,
                         nominal,
+                        inferable,
                         disjointness_visitor,
                         relation_visitor,
                     )
@@ -2941,13 +3109,14 @@ impl<'db> Type<'db> {
                 disjointness_visitor.visit((self, other), || {
                     protocol.interface(db).members(db).when_any(db, |member| {
                         match other.member(db, member.name()).place {
-                            Place::Type(attribute_type, _) => member.has_disjoint_type_from(
+                            Place::Defined(attribute_type, _, _) => member.has_disjoint_type_from(
                                 db,
                                 attribute_type,
+                                inferable,
                                 disjointness_visitor,
                                 relation_visitor,
                             ),
-                            Place::Unbound => ConstraintSet::from(false),
+                            Place::Undefined => ConstraintSet::from(false),
                         }
                     })
                 })
@@ -2968,25 +3137,37 @@ impl<'db> Type<'db> {
                 match subclass_of_ty.subclass_of() {
                     SubclassOfInner::Dynamic(_) => ConstraintSet::from(false),
                     SubclassOfInner::Class(class_a) => ClassType::from(alias_b)
-                        .when_subclass_of(db, class_a)
+                        .when_subclass_of(db, class_a, inferable)
                         .negate(db),
                 }
             }
 
             (Type::SubclassOf(left), Type::SubclassOf(right)) => {
-                left.is_disjoint_from_impl(db, right, disjointness_visitor)
+                left.is_disjoint_from_impl(db, right, inferable, disjointness_visitor)
             }
 
             // for `type[Any]`/`type[Unknown]`/`type[Todo]`, we know the type cannot be any larger than `type`,
             // so although the type is dynamic we can still determine disjointedness in some situations
             (Type::SubclassOf(subclass_of_ty), other)
             | (other, Type::SubclassOf(subclass_of_ty)) => match subclass_of_ty.subclass_of() {
-                SubclassOfInner::Dynamic(_) => KnownClass::Type
-                    .to_instance(db)
-                    .is_disjoint_from_impl(db, other, disjointness_visitor, relation_visitor),
-                SubclassOfInner::Class(class) => class
-                    .metaclass_instance_type(db)
-                    .is_disjoint_from_impl(db, other, disjointness_visitor, relation_visitor),
+                SubclassOfInner::Dynamic(_) => {
+                    KnownClass::Type.to_instance(db).is_disjoint_from_impl(
+                        db,
+                        other,
+                        inferable,
+                        disjointness_visitor,
+                        relation_visitor,
+                    )
+                }
+                SubclassOfInner::Class(class) => {
+                    class.metaclass_instance_type(db).is_disjoint_from_impl(
+                        db,
+                        other,
+                        inferable,
+                        disjointness_visitor,
+                        relation_visitor,
+                    )
+                }
             },
 
             (Type::SpecialForm(special_form), Type::NominalInstance(instance))
@@ -3053,6 +3234,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         instance,
+                        inferable,
                         TypeRelation::Subtyping,
                         relation_visitor,
                         disjointness_visitor,
@@ -3067,7 +3249,7 @@ impl<'db> Type<'db> {
             (Type::ClassLiteral(class), instance @ Type::NominalInstance(_))
             | (instance @ Type::NominalInstance(_), Type::ClassLiteral(class)) => class
                 .metaclass_instance_type(db)
-                .when_subtype_of(db, instance)
+                .when_subtype_of(db, instance, inferable)
                 .negate(db),
             (Type::GenericAlias(alias), instance @ Type::NominalInstance(_))
             | (instance @ Type::NominalInstance(_), Type::GenericAlias(alias)) => {
@@ -3076,6 +3258,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         instance,
+                        inferable,
                         TypeRelation::Subtyping,
                         relation_visitor,
                         disjointness_visitor,
@@ -3094,12 +3277,19 @@ impl<'db> Type<'db> {
 
             (Type::BoundMethod(_), other) | (other, Type::BoundMethod(_)) => KnownClass::MethodType
                 .to_instance(db)
-                .is_disjoint_from_impl(db, other, disjointness_visitor, relation_visitor),
+                .is_disjoint_from_impl(
+                    db,
+                    other,
+                    inferable,
+                    disjointness_visitor,
+                    relation_visitor,
+                ),
 
             (Type::KnownBoundMethod(method), other) | (other, Type::KnownBoundMethod(method)) => {
                 method.class().to_instance(db).is_disjoint_from_impl(
                     db,
                     other,
+                    inferable,
                     disjointness_visitor,
                     relation_visitor,
                 )
@@ -3108,7 +3298,13 @@ impl<'db> Type<'db> {
             (Type::WrapperDescriptor(_), other) | (other, Type::WrapperDescriptor(_)) => {
                 KnownClass::WrapperDescriptorType
                     .to_instance(db)
-                    .is_disjoint_from_impl(db, other, disjointness_visitor, relation_visitor)
+                    .is_disjoint_from_impl(
+                        db,
+                        other,
+                        inferable,
+                        disjointness_visitor,
+                        relation_visitor,
+                    )
             }
 
             (Type::Callable(_) | Type::FunctionLiteral(_), Type::Callable(_))
@@ -3150,12 +3346,13 @@ impl<'db> Type<'db> {
                     MemberLookupPolicy::NO_INSTANCE_FALLBACK,
                 )
                 .place
-                .ignore_possibly_unbound()
+                .ignore_possibly_undefined()
                 .when_none_or(|dunder_call| {
                     dunder_call
                         .has_relation_to_impl(
                             db,
                             CallableType::unknown(db),
+                            inferable,
                             TypeRelation::Assignability,
                             relation_visitor,
                             disjointness_visitor,
@@ -3181,6 +3378,7 @@ impl<'db> Type<'db> {
                 other.is_disjoint_from_impl(
                     db,
                     KnownClass::ModuleType.to_instance(db),
+                    inferable,
                     disjointness_visitor,
                     relation_visitor,
                 )
@@ -3188,24 +3386,37 @@ impl<'db> Type<'db> {
 
             (Type::NominalInstance(left), Type::NominalInstance(right)) => disjointness_visitor
                 .visit((self, other), || {
-                    left.is_disjoint_from_impl(db, right, disjointness_visitor, relation_visitor)
+                    left.is_disjoint_from_impl(
+                        db,
+                        right,
+                        inferable,
+                        disjointness_visitor,
+                        relation_visitor,
+                    )
                 }),
 
             (Type::PropertyInstance(_), other) | (other, Type::PropertyInstance(_)) => {
                 KnownClass::Property.to_instance(db).is_disjoint_from_impl(
                     db,
                     other,
+                    inferable,
                     disjointness_visitor,
                     relation_visitor,
                 )
             }
 
             (Type::BoundSuper(_), Type::BoundSuper(_)) => {
-                self.when_equivalent_to(db, other).negate(db)
+                self.when_equivalent_to(db, other, inferable).negate(db)
             }
-            (Type::BoundSuper(_), other) | (other, Type::BoundSuper(_)) => KnownClass::Super
-                .to_instance(db)
-                .is_disjoint_from_impl(db, other, disjointness_visitor, relation_visitor),
+            (Type::BoundSuper(_), other) | (other, Type::BoundSuper(_)) => {
+                KnownClass::Super.to_instance(db).is_disjoint_from_impl(
+                    db,
+                    other,
+                    inferable,
+                    disjointness_visitor,
+                    relation_visitor,
+                )
+            }
         }
     }
 
@@ -3457,7 +3668,7 @@ impl<'db> Type<'db> {
                     ),
                     (Some(KnownClass::FunctionType), "__set__" | "__delete__") => {
                         // Hard code this knowledge, as we look up `__set__` and `__delete__` on `FunctionType` often.
-                        Some(Place::Unbound.into())
+                        Some(Place::Undefined.into())
                     }
                     (Some(KnownClass::Property), "__get__") => Some(
                         Place::bound(Type::WrapperDescriptor(
@@ -3510,7 +3721,7 @@ impl<'db> Type<'db> {
             // MRO of the class `object`.
             Type::NominalInstance(instance) if instance.has_known_class(db, KnownClass::Type) => {
                 if policy.mro_no_object_fallback() {
-                    Some(Place::Unbound.into())
+                    Some(Place::Undefined.into())
                 } else {
                     KnownClass::Object
                         .to_class_literal(db)
@@ -3603,12 +3814,12 @@ impl<'db> Type<'db> {
             // Here, monotonicity is guaranteed by pre-unioning the type of the previous iteration into the current result.
             let previous_cycle_value = self.class_member_with_policy(db, name.clone(), policy);
 
-            let ty = if let Some(previous_ty) = previous_cycle_value.place.ignore_possibly_unbound()
-            {
-                UnionType::from_elements(db, [ty, previous_ty])
-            } else {
-                ty
-            };
+            let ty =
+                if let Some(previous_ty) = previous_cycle_value.place.ignore_possibly_undefined() {
+                    UnionType::from_elements(db, [ty, previous_ty])
+                } else {
+                    ty
+                };
 
             let div = Type::divergent(DivergentType::new(
                 db,
@@ -3694,7 +3905,7 @@ impl<'db> Type<'db> {
                     of type variable {} in inferable position",
                     self.display(db)
                 );
-                Place::Unbound.into()
+                Place::Undefined.into()
             }
 
             Type::IntLiteral(_) => KnownClass::Int.to_instance(db).instance_member(db, name),
@@ -3714,7 +3925,7 @@ impl<'db> Type<'db> {
                 .to_instance(db)
                 .instance_member(db, name),
 
-            Type::SpecialForm(_) | Type::KnownInstance(_) => Place::Unbound.into(),
+            Type::SpecialForm(_) | Type::KnownInstance(_) => Place::Undefined.into(),
 
             Type::PropertyInstance(_) => KnownClass::Property
                 .to_instance(db)
@@ -3732,10 +3943,10 @@ impl<'db> Type<'db> {
             // required, as `instance_member` is only called for instance-like types through `member`,
             // but we might want to add this in the future.
             Type::ClassLiteral(_) | Type::GenericAlias(_) | Type::SubclassOf(_) => {
-                Place::Unbound.into()
+                Place::Undefined.into()
             }
 
-            Type::TypedDict(_) => Place::Unbound.into(),
+            Type::TypedDict(_) => Place::Undefined.into(),
 
             Type::TypeAlias(alias) => alias.value_type(db).instance_member(db, name),
         }
@@ -3748,9 +3959,9 @@ impl<'db> Type<'db> {
     fn static_member(&self, db: &'db dyn Db, name: &str) -> Place<'db> {
         if let Type::ModuleLiteral(module) = self {
             module.static_member(db, name).place
-        } else if let place @ Place::Type(_, _) = self.class_member(db, name.into()).place {
+        } else if let place @ Place::Defined(_, _, _) = self.class_member(db, name.into()).place {
             place
-        } else if let Some(place @ Place::Type(_, _)) =
+        } else if let Some(place @ Place::Defined(_, _, _)) =
             self.find_name_in_mro(db, name).map(|inner| inner.place)
         {
             place
@@ -3803,11 +4014,11 @@ impl<'db> Type<'db> {
 
         let descr_get = self.class_member(db, "__get__".into()).place;
 
-        if let Place::Type(descr_get, descr_get_boundness) = descr_get {
+        if let Place::Defined(descr_get, _, descr_get_boundness) = descr_get {
             let return_ty = descr_get
                 .try_call(db, &CallArguments::positional([self, instance, owner]))
                 .map(|bindings| {
-                    if descr_get_boundness == Boundness::Bound {
+                    if descr_get_boundness == Definedness::AlwaysDefined {
                         bindings.return_type(db)
                     } else {
                         UnionType::from_elements(db, [bindings.return_type(db), self])
@@ -3846,19 +4057,20 @@ impl<'db> Type<'db> {
             //
             // The same is true for `Never`.
             PlaceAndQualifiers {
-                place: Place::Type(Type::Dynamic(_) | Type::Never, _),
+                place: Place::Defined(Type::Dynamic(_) | Type::Never, _, _),
                 qualifiers: _,
             } => (attribute, AttributeKind::DataDescriptor),
 
             PlaceAndQualifiers {
-                place: Place::Type(Type::Union(union), boundness),
+                place: Place::Defined(Type::Union(union), origin, boundness),
                 qualifiers,
             } => (
                 union
                     .map_with_boundness(db, |elem| {
-                        Place::Type(
+                        Place::Defined(
                             elem.try_call_dunder_get(db, instance, owner)
                                 .map_or(*elem, |(ty, _)| ty),
+                            origin,
                             boundness,
                         )
                     })
@@ -3875,14 +4087,15 @@ impl<'db> Type<'db> {
             ),
 
             PlaceAndQualifiers {
-                place: Place::Type(Type::Intersection(intersection), boundness),
+                place: Place::Defined(Type::Intersection(intersection), origin, boundness),
                 qualifiers,
             } => (
                 intersection
                     .map_with_boundness(db, |elem| {
-                        Place::Type(
+                        Place::Defined(
                             elem.try_call_dunder_get(db, instance, owner)
                                 .map_or(*elem, |(ty, _)| ty),
+                            origin,
                             boundness,
                         )
                     })
@@ -3892,13 +4105,16 @@ impl<'db> Type<'db> {
             ),
 
             PlaceAndQualifiers {
-                place: Place::Type(attribute_ty, boundness),
+                place: Place::Defined(attribute_ty, origin, boundness),
                 qualifiers: _,
             } => {
                 if let Some((return_ty, attribute_kind)) =
                     attribute_ty.try_call_dunder_get(db, instance, owner)
                 {
-                    (Place::Type(return_ty, boundness).into(), attribute_kind)
+                    (
+                        Place::Defined(return_ty, origin, boundness).into(),
+                        attribute_kind,
+                    )
                 } else {
                     (attribute, AttributeKind::NormalOrNonDataDescriptor)
                 }
@@ -3937,11 +4153,11 @@ impl<'db> Type<'db> {
                 .iter_positive(db)
                 .any(|ty| ty.is_data_descriptor_impl(db, any_of_union)),
             _ => {
-                !self.class_member(db, "__set__".into()).place.is_unbound()
+                !self.class_member(db, "__set__".into()).place.is_undefined()
                     || !self
                         .class_member(db, "__delete__".into())
                         .place
-                        .is_unbound()
+                        .is_undefined()
             }
         }
     }
@@ -3989,25 +4205,28 @@ impl<'db> Type<'db> {
         match (meta_attr, meta_attr_kind, fallback) {
             // The fallback type is unbound, so we can just return `meta_attr` unconditionally,
             // no matter if it's data descriptor, a non-data descriptor, or a normal attribute.
-            (meta_attr @ Place::Type(_, _), _, Place::Unbound) => {
+            (meta_attr @ Place::Defined(_, _, _), _, Place::Undefined) => {
                 meta_attr.with_qualifiers(meta_attr_qualifiers)
             }
 
             // `meta_attr` is the return type of a data descriptor and definitely bound, so we
             // return it.
-            (meta_attr @ Place::Type(_, Boundness::Bound), AttributeKind::DataDescriptor, _) => {
-                meta_attr.with_qualifiers(meta_attr_qualifiers)
-            }
+            (
+                meta_attr @ Place::Defined(_, _, Definedness::AlwaysDefined),
+                AttributeKind::DataDescriptor,
+                _,
+            ) => meta_attr.with_qualifiers(meta_attr_qualifiers),
 
             // `meta_attr` is the return type of a data descriptor, but the attribute on the
             // meta-type is possibly-unbound. This means that we "fall through" to the next
             // stage of the descriptor protocol and union with the fallback type.
             (
-                Place::Type(meta_attr_ty, Boundness::PossiblyUnbound),
+                Place::Defined(meta_attr_ty, meta_origin, Definedness::PossiblyUndefined),
                 AttributeKind::DataDescriptor,
-                Place::Type(fallback_ty, fallback_boundness),
-            ) => Place::Type(
+                Place::Defined(fallback_ty, fallback_origin, fallback_boundness),
+            ) => Place::Defined(
                 UnionType::from_elements(db, [meta_attr_ty, fallback_ty]),
+                meta_origin.merge(fallback_origin),
                 fallback_boundness,
             )
             .with_qualifiers(meta_attr_qualifiers.union(fallback_qualifiers)),
@@ -4021,9 +4240,9 @@ impl<'db> Type<'db> {
             // would require us to statically infer if an instance attribute is always set, which
             // is something we currently don't attempt to do.
             (
-                Place::Type(_, _),
+                Place::Defined(_, _, _),
                 AttributeKind::NormalOrNonDataDescriptor,
-                fallback @ Place::Type(_, Boundness::Bound),
+                fallback @ Place::Defined(_, _, Definedness::AlwaysDefined),
             ) if policy == InstanceFallbackShadowsNonDataDescriptor::Yes => {
                 fallback.with_qualifiers(fallback_qualifiers)
             }
@@ -4032,17 +4251,18 @@ impl<'db> Type<'db> {
             // unbound or the policy argument is `No`. In both cases, the `fallback` type does
             // not completely shadow the non-data descriptor, so we build a union of the two.
             (
-                Place::Type(meta_attr_ty, meta_attr_boundness),
+                Place::Defined(meta_attr_ty, meta_origin, meta_attr_boundness),
                 AttributeKind::NormalOrNonDataDescriptor,
-                Place::Type(fallback_ty, fallback_boundness),
-            ) => Place::Type(
+                Place::Defined(fallback_ty, fallback_origin, fallback_boundness),
+            ) => Place::Defined(
                 UnionType::from_elements(db, [meta_attr_ty, fallback_ty]),
+                meta_origin.merge(fallback_origin),
                 meta_attr_boundness.max(fallback_boundness),
             )
             .with_qualifiers(meta_attr_qualifiers.union(fallback_qualifiers)),
 
             // If the attribute is not found on the meta-type, we simply return the fallback.
-            (Place::Unbound, _, fallback) => fallback.with_qualifiers(fallback_qualifiers),
+            (Place::Undefined, _, fallback) => fallback.with_qualifiers(fallback_qualifiers),
         }
     }
 
@@ -4205,7 +4425,7 @@ impl<'db> Type<'db> {
             Type::ModuleLiteral(module) => module.static_member(db, name_str),
 
             // If a protocol does not include a member and the policy disables falling back to
-            // `object`, we return `Place::Unbound` here. This short-circuits attribute lookup
+            // `object`, we return `Place::Undefined` here. This short-circuits attribute lookup
             // before we find the "fallback to attribute access on `object`" logic later on
             // (otherwise we would infer that all synthesized protocols have `__getattribute__`
             // methods, and therefore that all synthesized protocols have all possible attributes.)
@@ -4218,13 +4438,13 @@ impl<'db> Type<'db> {
             }) if policy.mro_no_object_fallback()
                 && !protocol.interface().includes_member(db, name_str) =>
             {
-                Place::Unbound.into()
+                Place::Undefined.into()
             }
 
             _ if policy.no_instance_fallback() => self.invoke_descriptor_protocol(
                 db,
                 name_str,
-                Place::Unbound.into(),
+                Place::Undefined.into(),
                 InstanceFallbackShadowsNonDataDescriptor::No,
                 policy,
             ),
@@ -4254,7 +4474,7 @@ impl<'db> Type<'db> {
             {
                 enum_metadata(db, enum_literal.enum_class(db))
                     .and_then(|metadata| metadata.members.get(enum_literal.name(db)))
-                    .map_or_else(|| Place::Unbound, Place::bound)
+                    .map_or_else(|| Place::Undefined, Place::bound)
                     .into()
             }
 
@@ -4299,7 +4519,7 @@ impl<'db> Type<'db> {
                             .and_then(|instance| instance.known_class(db)),
                         Some(KnownClass::ModuleType | KnownClass::GenericAlias)
                     ) {
-                        return Place::Unbound.into();
+                        return Place::Undefined.into();
                     }
 
                     self.try_call_dunder(
@@ -4310,14 +4530,14 @@ impl<'db> Type<'db> {
                     )
                     .map(|outcome| Place::bound(outcome.return_type(db)))
                     // TODO: Handle call errors here.
-                    .unwrap_or(Place::Unbound)
+                    .unwrap_or(Place::Undefined)
                     .into()
                 };
 
                 let custom_getattribute_result = || {
                     // Avoid cycles when looking up `__getattribute__`
                     if "__getattribute__" == name.as_str() {
-                        return Place::Unbound.into();
+                        return Place::Undefined.into();
                     }
 
                     // Typeshed has a `__getattribute__` method defined on `builtins.object` so we
@@ -4331,29 +4551,29 @@ impl<'db> Type<'db> {
                     )
                     .map(|outcome| Place::bound(outcome.return_type(db)))
                     // TODO: Handle call errors here.
-                    .unwrap_or(Place::Unbound)
+                    .unwrap_or(Place::Undefined)
                     .into()
                 };
 
                 if result.is_class_var() && self.is_typed_dict() {
                     // `ClassVar`s on `TypedDictFallback` can not be accessed on inhabitants of `SomeTypedDict`.
                     // They can only be accessed on `SomeTypedDict` directly.
-                    return Place::Unbound.into();
+                    return Place::Undefined.into();
                 }
 
                 match result {
                     member @ PlaceAndQualifiers {
-                        place: Place::Type(_, Boundness::Bound),
+                        place: Place::Defined(_, _, Definedness::AlwaysDefined),
                         qualifiers: _,
                     } => member,
                     member @ PlaceAndQualifiers {
-                        place: Place::Type(_, Boundness::PossiblyUnbound),
+                        place: Place::Defined(_, _, Definedness::PossiblyUndefined),
                         qualifiers: _,
                     } => member
                         .or_fall_back_to(db, custom_getattribute_result)
                         .or_fall_back_to(db, custom_getattr_result),
                     PlaceAndQualifiers {
-                        place: Place::Unbound,
+                        place: Place::Undefined,
                         qualifiers: _,
                     } => custom_getattribute_result().or_fall_back_to(db, custom_getattr_result),
                 }
@@ -4378,14 +4598,11 @@ impl<'db> Type<'db> {
                 } {
                     if let Some(metadata) = enum_metadata(db, enum_class) {
                         if let Some(resolved_name) = metadata.resolve_member(&name) {
-                            return Place::Type(
-                                Type::EnumLiteral(EnumLiteralType::new(
-                                    db,
-                                    enum_class,
-                                    resolved_name,
-                                )),
-                                Boundness::Bound,
-                            )
+                            return Place::bound(Type::EnumLiteral(EnumLiteralType::new(
+                                db,
+                                enum_class,
+                                resolved_name,
+                            )))
                             .into();
                         }
                     }
@@ -4426,12 +4643,12 @@ impl<'db> Type<'db> {
             // Here, monotonicity is guaranteed by pre-unioning the type of the previous iteration into the current result.
             let previous_cycle_value = self.member_lookup_with_policy(db, name.clone(), policy);
 
-            let ty = if let Some(previous_ty) = previous_cycle_value.place.ignore_possibly_unbound()
-            {
-                UnionType::from_elements(db, [ty, previous_ty])
-            } else {
-                ty
-            };
+            let ty =
+                if let Some(previous_ty) = previous_cycle_value.place.ignore_possibly_undefined() {
+                    UnionType::from_elements(db, [ty, previous_ty])
+                } else {
+                    ty
+                };
 
             let div = Type::divergent(DivergentType::new(
                 db,
@@ -5414,15 +5631,15 @@ impl<'db> Type<'db> {
                     )
                     .place
                 {
-                    Place::Type(dunder_callable, boundness) => {
+                    Place::Defined(dunder_callable, _, boundness) => {
                         let mut bindings = dunder_callable.bindings(db);
                         bindings.replace_callable_type(dunder_callable, self);
-                        if boundness == Boundness::PossiblyUnbound {
+                        if boundness == Definedness::PossiblyUndefined {
                             bindings.set_dunder_call_is_possibly_unbound();
                         }
                         bindings
                     }
-                    Place::Unbound => CallableBinding::not_callable(self).into(),
+                    Place::Undefined => CallableBinding::not_callable(self).into(),
                 }
             }
 
@@ -5548,17 +5765,17 @@ impl<'db> Type<'db> {
             )
             .place
         {
-            Place::Type(dunder_callable, boundness) => {
+            Place::Defined(dunder_callable, _, boundness) => {
                 let bindings = dunder_callable
                     .bindings(db)
                     .match_parameters(db, argument_types)
                     .check_types(db, argument_types, &tcx)?;
-                if boundness == Boundness::PossiblyUnbound {
+                if boundness == Definedness::PossiblyUndefined {
                     return Err(CallDunderError::PossiblyUnbound(Box::new(bindings)));
                 }
                 Ok(bindings)
             }
-            Place::Unbound => Err(CallDunderError::MethodNotAvailable),
+            Place::Undefined => Err(CallDunderError::MethodNotAvailable),
         }
     }
 
@@ -6063,16 +6280,16 @@ impl<'db> Type<'db> {
         let new_method = self_type.lookup_dunder_new(db, ());
         let new_call_outcome = new_method.and_then(|new_method| {
             match new_method.place.try_call_dunder_get(db, self_type) {
-                Place::Type(new_method, boundness) => {
+                Place::Defined(new_method, _, boundness) => {
                     let result =
                         new_method.try_call(db, argument_types.with_self(Some(self_type)).as_ref());
-                    if boundness == Boundness::PossiblyUnbound {
+                    if boundness == Definedness::PossiblyUndefined {
                         Some(Err(DunderNewCallError::PossiblyUnbound(result.err())))
                     } else {
                         Some(result.map_err(DunderNewCallError::CallError))
                     }
                 }
-                Place::Unbound => None,
+                Place::Undefined => None,
             }
         });
 
@@ -6092,7 +6309,7 @@ impl<'db> Type<'db> {
                         | MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK,
                 )
                 .place
-                .is_unbound()
+                .is_undefined()
         {
             Some(init_ty.try_call_dunder(db, "__init__", argument_types, tcx))
         } else {
@@ -7906,18 +8123,23 @@ impl TypeQualifiers {
 #[derive(Clone, Debug, Copy, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct TypeAndQualifiers<'db> {
     inner: Type<'db>,
+    origin: TypeOrigin,
     qualifiers: TypeQualifiers,
 }
 
 impl<'db> TypeAndQualifiers<'db> {
-    pub(crate) fn new(inner: Type<'db>, qualifiers: TypeQualifiers) -> Self {
-        Self { inner, qualifiers }
+    pub(crate) fn new(inner: Type<'db>, origin: TypeOrigin, qualifiers: TypeQualifiers) -> Self {
+        Self {
+            inner,
+            origin,
+            qualifiers,
+        }
     }
 
-    /// Constructor that creates a [`TypeAndQualifiers`] instance with type `Unknown` and no qualifiers.
-    pub(crate) fn unknown() -> Self {
+    pub(crate) fn declared(inner: Type<'db>) -> Self {
         Self {
-            inner: Type::unknown(),
+            inner,
+            origin: TypeOrigin::Declared,
             qualifiers: TypeQualifiers::empty(),
         }
     }
@@ -7925,6 +8147,10 @@ impl<'db> TypeAndQualifiers<'db> {
     /// Forget about type qualifiers and only return the inner type.
     pub(crate) fn inner_type(&self) -> Type<'db> {
         self.inner
+    }
+
+    pub(crate) fn origin(&self) -> TypeOrigin {
+        self.origin
     }
 
     /// Insert/add an additional type qualifier.
@@ -7935,15 +8161,6 @@ impl<'db> TypeAndQualifiers<'db> {
     /// Return the set of type qualifiers.
     pub(crate) fn qualifiers(&self) -> TypeQualifiers {
         self.qualifiers
-    }
-}
-
-impl<'db> From<Type<'db>> for TypeAndQualifiers<'db> {
-    fn from(inner: Type<'db>) -> Self {
-        Self {
-            inner,
-            qualifiers: TypeQualifiers::empty(),
-        }
     }
 }
 
@@ -8092,7 +8309,7 @@ impl<'db> InvalidTypeExpression<'db> {
         let Some(module_member_with_same_name) = ty
             .member(db, module_name_final_part)
             .place
-            .ignore_possibly_unbound()
+            .ignore_possibly_undefined()
         else {
             return;
         };
@@ -10290,7 +10507,7 @@ impl<'db> BoundMethodType<'db> {
             .nth(1)
             .and_then(class_base::ClassBase::into_class)?;
         let base_member = base.class_member(db, name, MemberLookupPolicy::default());
-        if let Place::Type(Type::FunctionLiteral(base_func), _) = base_member.place {
+        if let Place::Defined(Type::FunctionLiteral(base_func), _, _) = base_member.place {
             if let [signature] = base_func.signature(db).overloads.as_slice() {
                 let unspecialized_return_ty = signature.return_ty.unwrap_or_else(|| {
                     let base_method_ty =
@@ -10340,6 +10557,7 @@ impl<'db> BoundMethodType<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        inferable: InferableTypeVars<'_, 'db>,
         relation: TypeRelation,
         relation_visitor: &HasRelationToVisitor<'db>,
         disjointness_visitor: &IsDisjointVisitor<'db>,
@@ -10349,11 +10567,19 @@ impl<'db> BoundMethodType<'db> {
         // differently), and of the bound self parameter (taking care that parameters, including a
         // bound self parameter, are contravariant.)
         self.function(db)
-            .has_relation_to_impl(db, other.function(db), relation, relation_visitor)
+            .has_relation_to_impl(
+                db,
+                other.function(db),
+                inferable,
+                relation,
+                relation_visitor,
+                disjointness_visitor,
+            )
             .and(db, || {
                 other.self_instance(db).has_relation_to_impl(
                     db,
                     self.self_instance(db),
+                    inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
@@ -10365,14 +10591,18 @@ impl<'db> BoundMethodType<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         self.function(db)
-            .is_equivalent_to_impl(db, other.function(db), visitor)
+            .is_equivalent_to_impl(db, other.function(db), inferable, visitor)
             .and(db, || {
-                other
-                    .self_instance(db)
-                    .is_equivalent_to_impl(db, self.self_instance(db), visitor)
+                other.self_instance(db).is_equivalent_to_impl(
+                    db,
+                    self.self_instance(db),
+                    inferable,
+                    visitor,
+                )
             })
     }
 }
@@ -10506,6 +10736,7 @@ impl<'db> CallableType<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        inferable: InferableTypeVars<'_, 'db>,
         relation: TypeRelation,
         relation_visitor: &HasRelationToVisitor<'db>,
         disjointness_visitor: &IsDisjointVisitor<'db>,
@@ -10516,6 +10747,7 @@ impl<'db> CallableType<'db> {
         self.signatures(db).has_relation_to_impl(
             db,
             other.signatures(db),
+            inferable,
             relation,
             relation_visitor,
             disjointness_visitor,
@@ -10529,6 +10761,7 @@ impl<'db> CallableType<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         if self == other {
@@ -10537,7 +10770,7 @@ impl<'db> CallableType<'db> {
 
         ConstraintSet::from(self.is_function_like(db) == other.is_function_like(db)).and(db, || {
             self.signatures(db)
-                .is_equivalent_to_impl(db, other.signatures(db), visitor)
+                .is_equivalent_to_impl(db, other.signatures(db), inferable, visitor)
         })
     }
 }
@@ -10598,19 +10831,35 @@ impl<'db> KnownBoundMethodType<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        inferable: InferableTypeVars<'_, 'db>,
         relation: TypeRelation,
-        visitor: &HasRelationToVisitor<'db>,
+        relation_visitor: &HasRelationToVisitor<'db>,
+        disjointness_visitor: &IsDisjointVisitor<'db>,
     ) -> ConstraintSet<'db> {
         match (self, other) {
             (
                 KnownBoundMethodType::FunctionTypeDunderGet(self_function),
                 KnownBoundMethodType::FunctionTypeDunderGet(other_function),
-            ) => self_function.has_relation_to_impl(db, other_function, relation, visitor),
+            ) => self_function.has_relation_to_impl(
+                db,
+                other_function,
+                inferable,
+                relation,
+                relation_visitor,
+                disjointness_visitor,
+            ),
 
             (
                 KnownBoundMethodType::FunctionTypeDunderCall(self_function),
                 KnownBoundMethodType::FunctionTypeDunderCall(other_function),
-            ) => self_function.has_relation_to_impl(db, other_function, relation, visitor),
+            ) => self_function.has_relation_to_impl(
+                db,
+                other_function,
+                inferable,
+                relation,
+                relation_visitor,
+                disjointness_visitor,
+            ),
 
             (
                 KnownBoundMethodType::PropertyDunderGet(self_property),
@@ -10619,7 +10868,7 @@ impl<'db> KnownBoundMethodType<'db> {
             | (
                 KnownBoundMethodType::PropertyDunderSet(self_property),
                 KnownBoundMethodType::PropertyDunderSet(other_property),
-            ) => self_property.when_equivalent_to(db, other_property),
+            ) => self_property.when_equivalent_to(db, other_property, inferable),
 
             (KnownBoundMethodType::StrStartswith(_), KnownBoundMethodType::StrStartswith(_)) => {
                 ConstraintSet::from(self == other)
@@ -10650,18 +10899,19 @@ impl<'db> KnownBoundMethodType<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         match (self, other) {
             (
                 KnownBoundMethodType::FunctionTypeDunderGet(self_function),
                 KnownBoundMethodType::FunctionTypeDunderGet(other_function),
-            ) => self_function.is_equivalent_to_impl(db, other_function, visitor),
+            ) => self_function.is_equivalent_to_impl(db, other_function, inferable, visitor),
 
             (
                 KnownBoundMethodType::FunctionTypeDunderCall(self_function),
                 KnownBoundMethodType::FunctionTypeDunderCall(other_function),
-            ) => self_function.is_equivalent_to_impl(db, other_function, visitor),
+            ) => self_function.is_equivalent_to_impl(db, other_function, inferable, visitor),
 
             (
                 KnownBoundMethodType::PropertyDunderGet(self_property),
@@ -10670,7 +10920,7 @@ impl<'db> KnownBoundMethodType<'db> {
             | (
                 KnownBoundMethodType::PropertyDunderSet(self_property),
                 KnownBoundMethodType::PropertyDunderSet(other_property),
-            ) => self_property.is_equivalent_to_impl(db, other_property, visitor),
+            ) => self_property.is_equivalent_to_impl(db, other_property, inferable, visitor),
 
             (KnownBoundMethodType::StrStartswith(_), KnownBoundMethodType::StrStartswith(_)) => {
                 ConstraintSet::from(self == other)
@@ -10995,18 +11245,18 @@ impl<'db> ModuleLiteralType<'db> {
         // if it exists. First, we need to look up the `__getattr__` function in the module's scope.
         if let Some(file) = self.module(db).file(db) {
             let getattr_symbol = imported_symbol(db, file, "__getattr__", None);
-            if let Place::Type(getattr_type, boundness) = getattr_symbol.place {
+            if let Place::Defined(getattr_type, origin, boundness) = getattr_symbol.place {
                 // If we found a __getattr__ function, try to call it with the name argument
                 if let Ok(outcome) = getattr_type.try_call(
                     db,
                     &CallArguments::positional([Type::string_literal(db, name)]),
                 ) {
-                    return Place::Type(outcome.return_type(db), boundness).into();
+                    return Place::Defined(outcome.return_type(db), origin, boundness).into();
                 }
             }
         }
 
-        Place::Unbound.into()
+        Place::Undefined.into()
     }
 
     fn static_member(self, db: &'db dyn Db, name: &str) -> PlaceAndQualifiers<'db> {
@@ -11041,7 +11291,7 @@ impl<'db> ModuleLiteralType<'db> {
             .unwrap_or_default();
 
         // If the normal lookup failed, try to call the module's `__getattr__` function
-        if place_and_qualifiers.place.is_unbound() {
+        if place_and_qualifiers.place.is_undefined() {
             return self.try_module_getattr(db, name);
         }
 
@@ -11474,14 +11724,16 @@ impl<'db> UnionType<'db> {
 
         let mut all_unbound = true;
         let mut possibly_unbound = false;
+        let mut origin = TypeOrigin::Declared;
         for ty in self.elements(db) {
             let ty_member = transform_fn(ty);
             match ty_member {
-                Place::Unbound => {
+                Place::Undefined => {
                     possibly_unbound = true;
                 }
-                Place::Type(ty_member, member_boundness) => {
-                    if member_boundness == Boundness::PossiblyUnbound {
+                Place::Defined(ty_member, member_origin, member_boundness) => {
+                    origin = origin.merge(member_origin);
+                    if member_boundness == Definedness::PossiblyUndefined {
                         possibly_unbound = true;
                     }
 
@@ -11492,14 +11744,15 @@ impl<'db> UnionType<'db> {
         }
 
         if all_unbound {
-            Place::Unbound
+            Place::Undefined
         } else {
-            Place::Type(
+            Place::Defined(
                 builder.build(),
+                origin,
                 if possibly_unbound {
-                    Boundness::PossiblyUnbound
+                    Definedness::PossiblyUndefined
                 } else {
-                    Boundness::Bound
+                    Definedness::AlwaysDefined
                 },
             )
         }
@@ -11515,6 +11768,7 @@ impl<'db> UnionType<'db> {
 
         let mut all_unbound = true;
         let mut possibly_unbound = false;
+        let mut origin = TypeOrigin::Declared;
         for ty in self.elements(db) {
             let PlaceAndQualifiers {
                 place: ty_member,
@@ -11522,11 +11776,12 @@ impl<'db> UnionType<'db> {
             } = transform_fn(ty);
             qualifiers |= new_qualifiers;
             match ty_member {
-                Place::Unbound => {
+                Place::Undefined => {
                     possibly_unbound = true;
                 }
-                Place::Type(ty_member, member_boundness) => {
-                    if member_boundness == Boundness::PossiblyUnbound {
+                Place::Defined(ty_member, member_origin, member_boundness) => {
+                    origin = origin.merge(member_origin);
+                    if member_boundness == Definedness::PossiblyUndefined {
                         possibly_unbound = true;
                     }
 
@@ -11537,14 +11792,15 @@ impl<'db> UnionType<'db> {
         }
         PlaceAndQualifiers {
             place: if all_unbound {
-                Place::Unbound
+                Place::Undefined
             } else {
-                Place::Type(
+                Place::Defined(
                     builder.build(),
+                    origin,
                     if possibly_unbound {
-                        Boundness::PossiblyUnbound
+                        Definedness::PossiblyUndefined
                     } else {
-                        Boundness::Bound
+                        Definedness::AlwaysDefined
                     },
                 )
             },
@@ -11598,6 +11854,7 @@ impl<'db> UnionType<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        _inferable: InferableTypeVars<'_, 'db>,
         _visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         if self == other {
@@ -11722,6 +11979,7 @@ impl<'db> IntersectionType<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        _inferable: InferableTypeVars<'_, 'db>,
         _visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
         if self == other {
@@ -11787,13 +12045,15 @@ impl<'db> IntersectionType<'db> {
 
         let mut all_unbound = true;
         let mut any_definitely_bound = false;
+        let mut origin = TypeOrigin::Declared;
         for ty in self.positive_elements_or_object(db) {
             let ty_member = transform_fn(&ty);
             match ty_member {
-                Place::Unbound => {}
-                Place::Type(ty_member, member_boundness) => {
+                Place::Undefined => {}
+                Place::Defined(ty_member, member_origin, member_boundness) => {
+                    origin = origin.merge(member_origin);
                     all_unbound = false;
-                    if member_boundness == Boundness::Bound {
+                    if member_boundness == Definedness::AlwaysDefined {
                         any_definitely_bound = true;
                     }
 
@@ -11803,14 +12063,15 @@ impl<'db> IntersectionType<'db> {
         }
 
         if all_unbound {
-            Place::Unbound
+            Place::Undefined
         } else {
-            Place::Type(
+            Place::Defined(
                 builder.build(),
+                origin,
                 if any_definitely_bound {
-                    Boundness::Bound
+                    Definedness::AlwaysDefined
                 } else {
-                    Boundness::PossiblyUnbound
+                    Definedness::PossiblyUndefined
                 },
             )
         }
@@ -11826,6 +12087,7 @@ impl<'db> IntersectionType<'db> {
 
         let mut all_unbound = true;
         let mut any_definitely_bound = false;
+        let mut origin = TypeOrigin::Declared;
         for ty in self.positive_elements_or_object(db) {
             let PlaceAndQualifiers {
                 place: member,
@@ -11833,10 +12095,11 @@ impl<'db> IntersectionType<'db> {
             } = transform_fn(&ty);
             qualifiers |= new_qualifiers;
             match member {
-                Place::Unbound => {}
-                Place::Type(ty_member, member_boundness) => {
+                Place::Undefined => {}
+                Place::Defined(ty_member, member_origin, member_boundness) => {
+                    origin = origin.merge(member_origin);
                     all_unbound = false;
-                    if member_boundness == Boundness::Bound {
+                    if member_boundness == Definedness::AlwaysDefined {
                         any_definitely_bound = true;
                     }
 
@@ -11847,14 +12110,15 @@ impl<'db> IntersectionType<'db> {
 
         PlaceAndQualifiers {
             place: if all_unbound {
-                Place::Unbound
+                Place::Undefined
             } else {
-                Place::Type(
+                Place::Defined(
                     builder.build(),
+                    origin,
                     if any_definitely_bound {
-                        Boundness::Bound
+                        Definedness::AlwaysDefined
                     } else {
-                        Boundness::PossiblyUnbound
+                        Definedness::PossiblyUndefined
                     },
                 )
             },
