@@ -977,12 +977,16 @@ impl<'db> Bindings<'db> {
                             let kw_only =
                                 overload.parameter_type_by_name("kw_only").unwrap_or(None);
 
-                            let default_ty = match (default, default_factory) {
-                                (Some(default_ty), _) => default_ty,
-                                (_, Some(default_factory_ty)) => default_factory_ty
-                                    .try_call(db, &CallArguments::none())
-                                    .map_or(Type::unknown(), |binding| binding.return_type(db)),
-                                _ => Type::unknown(),
+                            // `dataclasses.field` and field-specifier functions of commonly used
+                            // libraries like `pydantic`, `attrs`, and `SQLAlchemy` all return
+                            // the default type for the field (or `Any`) instead of an actual `Field`
+                            // instance, even if this is not what happens at runtime (see also below).
+                            // We still make use of this fact and pretend that all field specifiers
+                            // return the type of the default value:
+                            let default_ty = if default.is_some() || default_factory.is_some() {
+                                Some(overload.return_ty)
+                            } else {
+                                None
                             };
 
                             let init = init
@@ -1106,10 +1110,14 @@ impl<'db> Bindings<'db> {
                                 // iterable (it could be a Liskov-uncompliant subtype of the `Iterable` class that sets
                                 // `__iter__ = None`, for example). That would be badly written Python code, but we still
                                 // need to be able to handle it without crashing.
-                                overload.set_return_type(Type::tuple(TupleType::new(
-                                    db,
-                                    &argument.iterate(db),
-                                )));
+                                let return_type = if let Type::Union(union) = argument {
+                                    union.map(db, |element| {
+                                        Type::tuple(TupleType::new(db, &element.iterate(db)))
+                                    })
+                                } else {
+                                    Type::tuple(TupleType::new(db, &argument.iterate(db)))
+                                };
+                                overload.set_return_type(return_type);
                             }
                         }
 
@@ -2309,6 +2317,12 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument: Argument<'a>,
         argument_type: Option<Type<'db>>,
     ) -> Result<(), ()> {
+        // TODO: `Type::iterate` internally handles unions, but in a lossy way.
+        // It might be superior here to manually map over the union and call `try_iterate`
+        // on each element, similar to the way that `unpacker.rs` does in the `unpack_inner` method.
+        // It might be a bit of a refactor, though.
+        // See <https://github.com/astral-sh/ruff/pull/20377#issuecomment-3401380305>
+        // for more details. --Alex
         let tuple = argument_type.map(|ty| ty.iterate(db));
         let (mut argument_types, length, variable_element) = match tuple.as_ref() {
             Some(tuple) => (
