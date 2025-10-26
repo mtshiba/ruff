@@ -454,7 +454,8 @@ fn dependency_implicit_instance_attribute() -> anyhow::Result<()> {
         "/src/main.py",
         r#"
         from mod import C
-        x = C().attr
+        # multiple targets ensures RHS is a standalone expression, relied on by this test
+        x = y = C().attr
         "#,
     )?;
 
@@ -543,7 +544,8 @@ fn dependency_own_instance_member() -> anyhow::Result<()> {
         "/src/main.py",
         r#"
         from mod import C
-        x = C().attr
+        # multiple targets ensures RHS is a standalone expression, relied on by this test
+        x = y = C().attr
         "#,
     )?;
 
@@ -637,7 +639,8 @@ fn dependency_implicit_class_member() -> anyhow::Result<()> {
         r#"
         from mod import C
         C.method()
-        x = C().class_attr
+        # multiple targets ensures RHS is a standalone expression, relied on by this test
+        x = y = C().class_attr
         "#,
     )?;
 
@@ -721,7 +724,8 @@ fn call_type_doesnt_rerun_when_only_callee_changed() -> anyhow::Result<()> {
         r#"
         from foo import foo
 
-        a = foo()
+        # multiple targets ensures RHS is a standalone expression, relied on by this test
+        a = b = foo()
         "#,
     )?;
 

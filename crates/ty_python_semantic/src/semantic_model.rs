@@ -11,7 +11,7 @@ use crate::module_resolver::{KnownModule, Module, list_modules, resolve_module};
 use crate::semantic_index::definition::Definition;
 use crate::semantic_index::scope::FileScopeId;
 use crate::semantic_index::semantic_index;
-use crate::types::ide_support::all_declarations_and_bindings;
+use crate::types::ide_support::{Member, all_declarations_and_bindings, all_members};
 use crate::types::{Type, binding_type, infer_scope_expression_type};
 
 pub struct SemanticModel<'db> {
@@ -193,7 +193,7 @@ impl<'db> SemanticModel<'db> {
         let builtin = module.is_known(self.db, KnownModule::Builtins);
 
         let mut completions = vec![];
-        for crate::types::Member { name, ty } in crate::types::all_members(self.db, ty) {
+        for Member { name, ty } in all_members(self.db, ty) {
             completions.push(Completion {
                 name,
                 ty: Some(ty),
@@ -226,7 +226,7 @@ impl<'db> SemanticModel<'db> {
     /// Returns completions for symbols available in a `object.<CURSOR>` context.
     pub fn attribute_completions(&self, node: &ast::ExprAttribute) -> Vec<Completion<'db>> {
         let ty = node.value.inferred_type(self);
-        crate::types::all_members(self.db, ty)
+        all_members(self.db, ty)
             .into_iter()
             .map(|member| Completion {
                 name: member.name,
