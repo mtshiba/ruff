@@ -10272,7 +10272,7 @@ impl<'db> BoundMethodType<'db> {
         }
         let Some(class_ty) = self
             .class_definition(db)
-            .and_then(|class| binding_type(db, class).into_class_literal())
+            .and_then(|class| binding_type(db, class).as_class_literal())
         else {
             return false;
         };
