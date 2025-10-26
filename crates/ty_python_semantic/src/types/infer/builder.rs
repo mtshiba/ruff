@@ -545,7 +545,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // Filter out class literals that result from imports
             if let DefinitionKind::Class(class) = definition.kind(self.db()) {
                 ty.inner_type()
-                    .into_class_literal()
+                    .as_class_literal()
                     .map(|class_literal| (class_literal, class.node(self.module())))
             } else {
                 None
@@ -953,7 +953,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 if !matches!(definition.kind(self.db()), DefinitionKind::Function(_)) {
                     return None;
                 }
-                let function = ty.inner_type().into_function_literal()?;
+                let function = ty.inner_type().as_function_literal()?;
                 if function.has_known_decorator(self.db(), FunctionDecorators::OVERLOAD) {
                     Some(definition.place(self.db()))
                 } else {
@@ -2221,21 +2221,37 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .map(|bindings| bindings.return_type(self.db()))
             {
                 Ok(return_ty) => {
+                    fn into_function_like_callable<'d>(
+                        db: &'d dyn Db,
+                        ty: Type<'d>,
+                    ) -> Option<Type<'d>> {
+                        match ty {
+                            Type::Callable(callable) => Some(Type::Callable(CallableType::new(
+                                db,
+                                callable.signatures(db),
+                                true,
+                            ))),
+                            Type::Union(union) => union
+                                .try_map(db, |element| into_function_like_callable(db, *element)),
+                            // Intersections are currently not handled here because that would require
+                            // the decorator to be explicitly annotated as returning an intersection.
+                            _ => None,
+                        }
+                    }
+
                     let is_input_function_like = inferred_ty
-                        .into_callable(self.db())
-                        .and_then(Type::unwrap_as_callable_type)
+                        .try_upcast_to_callable(self.db())
+                        .and_then(Type::as_callable)
                         .is_some_and(|callable| callable.is_function_like(self.db()));
+
                     if is_input_function_like
-                        && let Some(callable_type) = return_ty.unwrap_as_callable_type()
+                        && let Some(return_ty_function_like) =
+                            into_function_like_callable(self.db(), return_ty)
                     {
                         // When a method on a class is decorated with a function that returns a `Callable`, assume that
                         // the returned callable is also function-like. See "Decorating a method with a `Callable`-typed
                         // decorator" in `callables_as_descriptors.md` for the extended explanation.
-                        Type::Callable(CallableType::new(
-                            self.db(),
-                            callable_type.signatures(self.db()),
-                            true,
-                        ))
+                        return_ty_function_like
                     } else {
                         return_ty
                     }
@@ -2568,7 +2584,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         for decorator in decorator_list {
             let decorator_ty = self.infer_decorator(decorator);
             if decorator_ty
-                .into_function_literal()
+                .as_function_literal()
                 .is_some_and(|function| function.is_known(self.db(), KnownFunction::Dataclass))
             {
                 dataclass_params = Some(DataclassParams::default());
@@ -3364,8 +3380,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             let assigned_d = assigned_ty.display(db);
                             let value_d = value_ty.display(db);
 
-                            if let Some(typed_dict) = value_ty.into_typed_dict() {
-                                if let Some(key) = slice_ty.into_string_literal() {
+                            if let Some(typed_dict) = value_ty.as_typed_dict() {
+                                if let Some(key) = slice_ty.as_string_literal() {
                                     let key = key.value(self.db());
                                     validate_typed_dict_key_assignment(
                                         &self.context,
@@ -4079,7 +4095,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     );
 
                     let typevar_class = callable_type
-                        .into_class_literal()
+                        .as_class_literal()
                         .and_then(|cls| cls.known(self.db()))
                         .filter(|cls| {
                             matches!(cls, KnownClass::TypeVar | KnownClass::ExtensionsTypeVar)
@@ -4301,10 +4317,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
         };
 
-        let Some(name_param) = name_param_ty
-            .into_string_literal()
-            .map(|name| name.value(db))
-        else {
+        let Some(name_param) = name_param_ty.as_string_literal().map(|name| name.value(db)) else {
             return error(
                 &self.context,
                 "The first argument to `TypeVar` must be a string literal.",
@@ -5064,7 +5077,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Avoid looking up attributes on a module if a module imports from itself
         // (e.g. `from parent import submodule` inside the `parent` module).
         let import_is_self_referential = module_ty
-            .into_module_literal()
+            .as_module_literal()
             .is_some_and(|module| Some(self.file()) == module.module(self.db()).file(self.db()));
 
         // First try loading the requested attribute from the module.
@@ -5893,7 +5906,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } = dict;
 
         // Validate `TypedDict` dictionary literal assignments.
-        if let Some(typed_dict) = tcx.annotation.and_then(Type::into_typed_dict)
+        if let Some(typed_dict) = tcx.annotation.and_then(Type::as_typed_dict)
             && let Some(ty) = self.infer_typed_dict_expression(dict, typed_dict)
         {
             return ty;
@@ -6618,10 +6631,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_all_argument_types(arguments, &mut call_arguments, &bindings);
 
         // Validate `TypedDict` constructor calls after argument type inference
-        if let Some(class_literal) = callable_type.into_class_literal() {
+        if let Some(class_literal) = callable_type.as_class_literal() {
             if class_literal.is_typed_dict(self.db()) {
                 let typed_dict_type = Type::typed_dict(ClassType::NonGeneric(class_literal));
-                if let Some(typed_dict) = typed_dict_type.into_typed_dict() {
+                if let Some(typed_dict) = typed_dict_type.as_typed_dict() {
                     validate_typed_dict_constructor(
                         &self.context,
                         typed_dict,
@@ -7965,6 +7978,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 Some(Type::KnownInstance(KnownInstanceType::ConstraintSet(
                     TrackedConstraintSet::new(self.db(), result),
                 )))
+            }
+
+            // Special-case `X | Y` with `X` and `Y` instances of `type` to produce a `types.UnionType` instance, in order to
+            // overwrite the typeshed return type for `type.__or__`, which would result in `types.UnionType | X`. We currently
+            // do this to avoid false positives when a legacy type alias like `IntOrStr = int | str` is later used in a type
+            // expression, because `types.UnionType` will result in a `@Todo` type, while `types.UnionType | <class 'int'>` does
+            // not.
+            //
+            // TODO: Remove this special case once we add support for legacy type aliases.
+            (
+                Type::ClassLiteral(..) | Type::SubclassOf(..) | Type::GenericAlias(..),
+                Type::ClassLiteral(..) | Type::SubclassOf(..) | Type::GenericAlias(..),
+                ast::Operator::BitOr,
+            ) if Program::get(self.db()).python_version(self.db()) >= PythonVersion::PY310 => {
+                Some(KnownClass::UnionType.to_instance(self.db()))
             }
 
             // We've handled all of the special cases that we support for literals, so we need to
@@ -9482,7 +9510,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
                     }
                     CallErrorKind::BindingError => {
-                        if let Some(typed_dict) = value_ty.into_typed_dict() {
+                        if let Some(typed_dict) = value_ty.as_typed_dict() {
                             let slice_node = subscript.slice.as_ref();
 
                             report_invalid_key_on_typed_dict(
@@ -9589,7 +9617,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // TODO: properly handle old-style generics; get rid of this temporary hack
             if !value_ty
-                .into_class_literal()
+                .as_class_literal()
                 .is_some_and(|class| class.iter_mro(db, None).contains(&ClassBase::Generic))
             {
                 report_non_subscriptable(context, value_node.into(), value_ty, "__class_getitem__");

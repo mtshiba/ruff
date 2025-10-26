@@ -1099,39 +1099,39 @@ impl<'db> Type<'db> {
         matches!(self, Type::TypeVar(_))
     }
 
-    pub(crate) const fn into_type_var(self) -> Option<BoundTypeVarInstance<'db>> {
+    pub(crate) const fn as_typevar(self) -> Option<BoundTypeVarInstance<'db>> {
         match self {
             Type::TypeVar(bound_typevar) => Some(bound_typevar),
             _ => None,
         }
     }
 
-    pub(crate) fn has_type_var(self, db: &'db dyn Db) -> bool {
+    pub(crate) fn has_typevar(self, db: &'db dyn Db) -> bool {
         any_over_type(db, self, &|ty| matches!(ty, Type::TypeVar(_)), false)
     }
 
-    pub(crate) const fn into_class_literal(self) -> Option<ClassLiteral<'db>> {
+    pub(crate) const fn as_class_literal(self) -> Option<ClassLiteral<'db>> {
         match self {
             Type::ClassLiteral(class_type) => Some(class_type),
             _ => None,
         }
     }
 
-    pub(crate) const fn into_type_alias(self) -> Option<TypeAliasType<'db>> {
+    pub(crate) const fn as_type_alias(self) -> Option<TypeAliasType<'db>> {
         match self {
             Type::KnownInstance(KnownInstanceType::TypeAliasType(type_alias)) => Some(type_alias),
             _ => None,
         }
     }
 
-    pub(crate) const fn into_dynamic(self) -> Option<DynamicType<'db>> {
+    pub(crate) const fn as_dynamic(self) -> Option<DynamicType<'db>> {
         match self {
             Type::Dynamic(dynamic_type) => Some(dynamic_type),
             _ => None,
         }
     }
 
-    pub(crate) const fn unwrap_as_callable_type(self) -> Option<CallableType<'db>> {
+    pub(crate) const fn as_callable(self) -> Option<CallableType<'db>> {
         match self {
             Type::Callable(callable_type) => Some(callable_type),
             _ => None,
@@ -1139,11 +1139,10 @@ impl<'db> Type<'db> {
     }
 
     pub(crate) const fn expect_dynamic(self) -> DynamicType<'db> {
-        self.into_dynamic()
-            .expect("Expected a Type::Dynamic variant")
+        self.as_dynamic().expect("Expected a Type::Dynamic variant")
     }
 
-    pub(crate) const fn into_protocol_instance(self) -> Option<ProtocolInstanceType<'db>> {
+    pub(crate) const fn as_protocol_instance(self) -> Option<ProtocolInstanceType<'db>> {
         match self {
             Type::ProtocolInstance(instance) => Some(instance),
             _ => None,
@@ -1152,7 +1151,7 @@ impl<'db> Type<'db> {
 
     #[track_caller]
     pub(crate) fn expect_class_literal(self) -> ClassLiteral<'db> {
-        self.into_class_literal()
+        self.as_class_literal()
             .expect("Expected a Type::ClassLiteral variant")
     }
 
@@ -1165,7 +1164,7 @@ impl<'db> Type<'db> {
         matches!(self, Type::ClassLiteral(..))
     }
 
-    pub(crate) fn into_enum_literal(self) -> Option<EnumLiteralType<'db>> {
+    pub(crate) fn as_enum_literal(self) -> Option<EnumLiteralType<'db>> {
         match self {
             Type::EnumLiteral(enum_literal) => Some(enum_literal),
             _ => None,
@@ -1175,7 +1174,7 @@ impl<'db> Type<'db> {
     #[cfg(test)]
     #[track_caller]
     pub(crate) fn expect_enum_literal(self) -> EnumLiteralType<'db> {
-        self.into_enum_literal()
+        self.as_enum_literal()
             .expect("Expected a Type::EnumLiteral variant")
     }
 
@@ -1183,7 +1182,7 @@ impl<'db> Type<'db> {
         matches!(self, Type::TypedDict(..))
     }
 
-    pub(crate) fn into_typed_dict(self) -> Option<TypedDictType<'db>> {
+    pub(crate) fn as_typed_dict(self) -> Option<TypedDictType<'db>> {
         match self {
             Type::TypedDict(typed_dict) => Some(typed_dict),
             _ => None,
@@ -1217,14 +1216,14 @@ impl<'db> Type<'db> {
         ))
     }
 
-    pub(crate) const fn into_module_literal(self) -> Option<ModuleLiteralType<'db>> {
+    pub(crate) const fn as_module_literal(self) -> Option<ModuleLiteralType<'db>> {
         match self {
             Type::ModuleLiteral(module) => Some(module),
             _ => None,
         }
     }
 
-    pub(crate) const fn into_union(self) -> Option<UnionType<'db>> {
+    pub(crate) const fn as_union(self) -> Option<UnionType<'db>> {
         match self {
             Type::Union(union_type) => Some(union_type),
             _ => None,
@@ -1234,10 +1233,10 @@ impl<'db> Type<'db> {
     #[cfg(test)]
     #[track_caller]
     pub(crate) fn expect_union(self) -> UnionType<'db> {
-        self.into_union().expect("Expected a Type::Union variant")
+        self.as_union().expect("Expected a Type::Union variant")
     }
 
-    pub(crate) const fn into_function_literal(self) -> Option<FunctionType<'db>> {
+    pub(crate) const fn as_function_literal(self) -> Option<FunctionType<'db>> {
         match self {
             Type::FunctionLiteral(function_type) => Some(function_type),
             _ => None,
@@ -1247,7 +1246,7 @@ impl<'db> Type<'db> {
     #[cfg(test)]
     #[track_caller]
     pub(crate) fn expect_function_literal(self) -> FunctionType<'db> {
-        self.into_function_literal()
+        self.as_function_literal()
             .expect("Expected a Type::FunctionLiteral variant")
     }
 
@@ -1256,7 +1255,7 @@ impl<'db> Type<'db> {
     }
 
     pub(crate) fn is_union_of_single_valued(&self, db: &'db dyn Db) -> bool {
-        self.into_union().is_some_and(|union| {
+        self.as_union().is_some_and(|union| {
             union.elements(db).iter().all(|ty| {
                 ty.is_single_valued(db)
                     || ty.is_bool(db)
@@ -1269,7 +1268,7 @@ impl<'db> Type<'db> {
     }
 
     pub(crate) fn is_union_with_single_valued(&self, db: &'db dyn Db) -> bool {
-        self.into_union().is_some_and(|union| {
+        self.as_union().is_some_and(|union| {
             union.elements(db).iter().any(|ty| {
                 ty.is_single_valued(db)
                     || ty.is_bool(db)
@@ -1281,7 +1280,7 @@ impl<'db> Type<'db> {
             || (self.is_enum(db) && !self.overrides_equality(db))
     }
 
-    pub(crate) fn into_string_literal(self) -> Option<StringLiteralType<'db>> {
+    pub(crate) fn as_string_literal(self) -> Option<StringLiteralType<'db>> {
         match self {
             Type::StringLiteral(string_literal) => Some(string_literal),
             _ => None,
@@ -1614,7 +1613,7 @@ impl<'db> Type<'db> {
         }
     }
 
-    pub(crate) fn into_callable(self, db: &'db dyn Db) -> Option<Type<'db>> {
+    pub(crate) fn try_upcast_to_callable(self, db: &'db dyn Db) -> Option<Type<'db>> {
         match self {
             Type::Callable(_) => Some(self),
 
@@ -1637,7 +1636,7 @@ impl<'db> Type<'db> {
                     .place;
 
                 if let Place::Type(ty, Boundness::Bound) = call_symbol {
-                    ty.into_callable(db)
+                    ty.try_upcast_to_callable(db)
                 } else {
                     None
                 }
@@ -1657,13 +1656,13 @@ impl<'db> Type<'db> {
                 )),
             },
 
-            Type::Union(union) => union.try_map(db, |element| element.into_callable(db)),
+            Type::Union(union) => union.try_map(db, |element| element.try_upcast_to_callable(db)),
 
-            Type::EnumLiteral(enum_literal) => {
-                enum_literal.enum_class_instance(db).into_callable(db)
-            }
+            Type::EnumLiteral(enum_literal) => enum_literal
+                .enum_class_instance(db)
+                .try_upcast_to_callable(db),
 
-            Type::TypeAlias(alias) => alias.value_type(db).into_callable(db),
+            Type::TypeAlias(alias) => alias.value_type(db).try_upcast_to_callable(db),
 
             Type::KnownBoundMethod(method) => Some(Type::Callable(CallableType::new(
                 db,
@@ -2153,7 +2152,7 @@ impl<'db> Type<'db> {
                 }),
 
             (_, Type::Callable(_)) => relation_visitor.visit((self, target, relation), || {
-                self.into_callable(db).when_some_and(|callable| {
+                self.try_upcast_to_callable(db).when_some_and(|callable| {
                     callable.has_relation_to_impl(
                         db,
                         target,
@@ -6523,7 +6522,7 @@ impl<'db> Type<'db> {
     }
 
     /// The type `NoneType` / `None`
-    pub(crate) fn none(db: &'db dyn Db) -> Type<'db> {
+    pub fn none(db: &'db dyn Db) -> Type<'db> {
         KnownClass::NoneType.to_instance(db)
     }
 
@@ -8178,6 +8177,12 @@ pub enum TypeVarKind {
     TypingSelf,
 }
 
+impl TypeVarKind {
+    const fn is_self(self) -> bool {
+        matches!(self, Self::TypingSelf)
+    }
+}
+
 /// The identity of a type variable.
 ///
 /// This represents the core identity of a typevar, independent of its bounds or constraints. Two
@@ -8478,7 +8483,7 @@ impl<'db> TypeVarInstance<'db> {
                 TypeVarBoundOrConstraints::UpperBound(upper_bound.to_instance(db)?)
             }
             TypeVarBoundOrConstraints::Constraints(constraints) => {
-                TypeVarBoundOrConstraints::Constraints(constraints.to_instance(db)?.into_union()?)
+                TypeVarBoundOrConstraints::Constraints(constraints.to_instance(db)?.as_union()?)
             }
         };
         let identity = TypeVarIdentity::new(
@@ -8526,7 +8531,7 @@ impl<'db> TypeVarInstance<'db> {
             DefinitionKind::TypeVar(typevar) => {
                 let typevar_node = typevar.node(&module);
                 definition_expression_type(db, definition, typevar_node.bound.as_ref()?)
-                    .into_union()?
+                    .as_union()?
             }
             // legacy typevar
             DefinitionKind::Assignment(assignment) => {
@@ -11312,7 +11317,7 @@ impl<'db> TypeAliasType<'db> {
         }
     }
 
-    pub(crate) fn into_pep_695_type_alias(self) -> Option<PEP695TypeAliasType<'db>> {
+    pub(crate) fn as_pep_695_type_alias(self) -> Option<PEP695TypeAliasType<'db>> {
         match self {
             TypeAliasType::PEP695(type_alias) => Some(type_alias),
             TypeAliasType::ManualPEP695(_) => None,
@@ -11754,6 +11759,23 @@ impl<'db> IntersectionType<'db> {
         } else {
             Either::Right(self.positive(db).iter().copied())
         }
+    }
+
+    /// Map a type transformation over all positive elements of the intersection. Leave the
+    /// negative elements unchanged.
+    pub(crate) fn map_positive(
+        self,
+        db: &'db dyn Db,
+        mut transform_fn: impl FnMut(&Type<'db>) -> Type<'db>,
+    ) -> Type<'db> {
+        let mut builder = IntersectionBuilder::new(db);
+        for ty in self.positive(db) {
+            builder = builder.add_positive(transform_fn(ty));
+        }
+        for ty in self.negative(db) {
+            builder = builder.add_negative(*ty);
+        }
+        builder.build()
     }
 
     pub(crate) fn map_with_boundness(
