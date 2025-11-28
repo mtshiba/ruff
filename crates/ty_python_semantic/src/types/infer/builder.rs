@@ -1045,7 +1045,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             // Check that the overloaded function has at least two overloads
-            if let [single_overload] = overloads.as_ref() {
+            if let [single_overload] = overloads {
                 let function_node = function.node(self.db(), self.file(), self.module());
                 if let Some(builder) = self
                     .context
@@ -1165,7 +1165,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 (FunctionDecorators::OVERRIDE, "override"),
             ] {
                 if let Some(implementation) = implementation {
-                    for overload in overloads.as_ref() {
+                    for overload in overloads {
                         if !overload.has_known_decorator(self.db(), decorator) {
                             continue;
                         }
@@ -3363,9 +3363,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // TODO: `Unpack`
                     Parameters::todo()
                 } else {
-                    Parameters::new(parameter_types.iter().map(|param_type| {
-                        Parameter::positional_only(None).with_annotated_type(*param_type)
-                    }))
+                    Parameters::new(
+                        self.db(),
+                        parameter_types.iter().map(|param_type| {
+                            Parameter::positional_only(None).with_annotated_type(*param_type)
+                        }),
+                    )
                 };
 
                 Type::single_callable(self.db(), Signature::new(parameters, None))
@@ -7995,6 +7998,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .map(|param| Parameter::keyword_variadic(param.name().id.clone()));
 
             Parameters::new(
+                self.db(),
                 positional_only
                     .into_iter()
                     .chain(positional_or_keyword)
