@@ -96,7 +96,7 @@ pub(crate) fn use_def_map<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> Arc<UseD
     Arc::clone(&index.use_def_maps[scope.file_scope_id(db)])
 }
 
-/// Returns all attribute assignments (and their method scope IDs) with a symbol name matching
+/// Returns all (end-of-scope) attribute assignments (and their method scope IDs) with a symbol name matching
 /// the one given for a specific class body scope.
 ///
 /// Only call this when doing type inference on the same file as `class_body_scope`, otherwise it
@@ -114,7 +114,7 @@ pub(crate) fn attribute_assignments<'db, 's>(
         let member = place_table.member_id_by_instance_attribute_name(name)?;
         let use_def = &index.use_def_maps[function_scope_id];
         Some((
-            use_def.all_reachable_member_bindings(member),
+            use_def.end_of_scope_member_bindings(member),
             function_scope_id,
         ))
     })

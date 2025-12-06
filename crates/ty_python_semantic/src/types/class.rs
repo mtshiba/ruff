@@ -3446,6 +3446,9 @@ impl<'db> ClassLiteral<'db> {
                     is_attribute_bound = true;
                 }
 
+                // TODO: Ideally, we should just call `binding_type` in all cases.
+                // Currently, we extracts the type of the RHS expression since inference for some kinds of definitions is incomplete (e.g. classmethod, comprehension).
+                // But this is not actually accurate, as a descriptor may cause the type of the definition to deviate from the RHS expression.
                 match binding.kind(db) {
                     DefinitionKind::AnnotatedAssignment(_) => {
                         // Annotated assignments were handled above. This branch is not
@@ -3579,7 +3582,13 @@ impl<'db> ClassLiteral<'db> {
                         }
                     }
                     DefinitionKind::AugmentedAssignment(_) => {
-                        // TODO:
+                        // We found an attribute assignment like (unpacking is not allowed here):
+                        //
+                        //     self.name += <value>
+
+                        let inferred_ty = binding_type(db, binding);
+
+                        union_of_inferred_types = union_of_inferred_types.add(inferred_ty);
                     }
                     DefinitionKind::NamedExpression(_) => {
                         // A named expression whose target is an attribute is syntactically prohibited
