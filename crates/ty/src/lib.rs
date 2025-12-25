@@ -34,6 +34,7 @@ use ty_project::metadata::options::ProjectOptionsOverrides;
 use ty_project::watch::ProjectWatcher;
 use ty_project::{CollectReporter, Db, watch};
 use ty_project::{ProjectDatabase, ProjectMetadata};
+#[cfg(feature = "server")]
 use ty_server::run_server;
 
 pub fn run() -> anyhow::Result<ExitStatus> {
@@ -46,7 +47,12 @@ pub fn run() -> anyhow::Result<ExitStatus> {
     let args = Cli::parse_from(args);
 
     match args.command {
+        #[cfg(feature = "server")]
         Command::Server => run_server().map(|()| ExitStatus::Success),
+        #[cfg(not(feature = "server"))]
+        Command::Server => Err(anyhow!(
+            "`ty server` command is not available in this build. Please rebuild ty with the `server` feature enabled."
+        )),
         Command::Check(check_args) => run_check(check_args),
         Command::Version => version().map(|()| ExitStatus::Success),
         Command::GenerateShellCompletion { shell } => {
