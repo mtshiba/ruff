@@ -132,6 +132,9 @@ impl Declarations {
         reachability_constraints: &mut ReachabilityConstraintsBuilder,
         constraint: ScopedReachabilityConstraintId,
     ) {
+        if constraint == ScopedReachabilityConstraintId::ALWAYS_TRUE {
+            return;
+        }
         for declaration in &mut self.live_declarations {
             declaration.reachability_constraint = reachability_constraints
                 .add_and_constraint(declaration.reachability_constraint, constraint);
@@ -286,6 +289,9 @@ impl Bindings {
         reachability_constraints: &mut ReachabilityConstraintsBuilder,
         constraint: ScopedNarrowingConstraint,
     ) {
+        if constraint == ScopedNarrowingConstraint::ALWAYS_TRUE {
+            return;
+        }
         for binding in &mut self.live_bindings {
             binding.narrowing_constraint = reachability_constraints
                 .add_and_constraint(binding.narrowing_constraint, constraint);
@@ -298,6 +304,9 @@ impl Bindings {
         reachability_constraints: &mut ReachabilityConstraintsBuilder,
         constraint: ScopedReachabilityConstraintId,
     ) {
+        if constraint == ScopedReachabilityConstraintId::ALWAYS_TRUE {
+            return;
+        }
         for binding in &mut self.live_bindings {
             binding.reachability_constraint = reachability_constraints
                 .add_and_constraint(binding.reachability_constraint, constraint);

@@ -1201,6 +1201,10 @@ impl<'db> UseDefMapBuilder<'db> {
         &mut self,
         constraint: ScopedReachabilityConstraintId,
     ) {
+        if constraint == ScopedReachabilityConstraintId::ALWAYS_TRUE {
+            return;
+        }
+
         self.reachability = self
             .reachability_constraints
             .add_and_constraint(self.reachability, constraint);
