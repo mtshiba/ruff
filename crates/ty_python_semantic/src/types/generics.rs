@@ -1785,12 +1785,31 @@ impl<'db> SpecializationBuilder<'db> {
     pub(crate) fn mapped(
         &self,
         generic_context: GenericContext<'db>,
-        f: impl Fn(BoundTypeVarIdentity<'db>, BoundTypeVarInstance<'db>, Type<'db>) -> Type<'db>,
+        f: impl Fn(BoundTypeVarInstance<'db>, Type<'db>) -> Type<'db>,
     ) -> Self {
         let mut types = self.types.clone();
         for (identity, variable) in generic_context.variables_inner(self.db) {
             if let Some(ty) = types.get_mut(identity) {
-                *ty = f(*identity, *variable, *ty);
+                *ty = f(*variable, *ty);
+            }
+        }
+
+        Self {
+            db: self.db,
+            inferable: self.inferable,
+            types,
+        }
+    }
+
+    pub(crate) fn with_default(
+        &self,
+        generic_context: GenericContext<'db>,
+        default_ty: impl Fn(BoundTypeVarInstance<'db>) -> Type<'db>,
+    ) -> Self {
+        let mut types = self.types.clone();
+        for (identity, variable) in generic_context.variables_inner(self.db) {
+            if let Entry::Vacant(entry) = types.entry(*identity) {
+                entry.insert(default_ty(*variable));
             }
         }
 
@@ -2128,6 +2147,38 @@ impl<'db> SpecializationBuilder<'db> {
                         // Prefer an exact match first.
                         for constraint in constraints.elements(self.db) {
                             if ty == *constraint {
+                                self.add_type_mapping(bound_typevar, ty, polarity, f);
+                                return Ok(());
+                            }
+                        }
+
+                        // If `ty` is itself a constrained TypeVar, check whether each
+                        // of its constraints is equivalent to at least one constraint of
+                        // the formal TypeVar. This handles the case where two TypeVars
+                        // with identical constraint sets are used across function
+                        // boundaries.
+                        //
+                        // We require equivalence rather than assignability to maintain
+                        // soundness: constrained TypeVars allow narrowing via
+                        // `isinstance` checks inside the function body, so a constraint
+                        // that is a strict subtype (e.g. `bool` vs `int`) would allow
+                        // the callee to return a widened type that violates the caller's
+                        // constraint.
+                        if let Type::TypeVar(actual_typevar) = ty
+                            && let Some(actual_constraints) =
+                                actual_typevar.typevar(self.db).constraints(self.db)
+                        {
+                            let all_satisfied =
+                                actual_constraints.iter().all(|actual_constraint| {
+                                    constraints
+                                        .elements(self.db)
+                                        .iter()
+                                        .any(|formal_constraint| {
+                                            actual_constraint
+                                                .is_equivalent_to(self.db, *formal_constraint)
+                                        })
+                                });
+                            if all_satisfied {
                                 self.add_type_mapping(bound_typevar, ty, polarity, f);
                                 return Ok(());
                             }

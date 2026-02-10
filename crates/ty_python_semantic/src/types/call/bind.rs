@@ -38,7 +38,7 @@ use crate::types::function::{
     OverloadLiteral,
 };
 use crate::types::generics::{
-    InferableTypeVars, Specialization, SpecializationBuilder, SpecializationError,
+    GenericContext, InferableTypeVars, Specialization, SpecializationBuilder, SpecializationError,
 };
 use crate::types::signatures::{Parameter, ParameterForm, ParameterKind, Parameters};
 use crate::types::tuple::{TupleLength, TupleSpec, TupleType};
@@ -68,6 +68,12 @@ pub(crate) struct Bindings<'db> {
     /// The type of the instance being constructed, if this signature is for a constructor.
     constructor_instance_type: Option<Type<'db>>,
 
+    /// Whether implicit `__new__` calls may be missing in constructor bindings.
+    implicit_dunder_new_is_possibly_unbound: bool,
+
+    /// Whether implicit `__init__` calls may be missing in constructor bindings.
+    implicit_dunder_init_is_possibly_unbound: bool,
+
     /// By using `SmallVec`, we avoid an extra heap allocation for the common case of a non-union
     /// type.
     elements: SmallVec<[CallableBinding<'db>; 1]>,
@@ -83,16 +89,26 @@ impl<'db> Bindings<'db> {
     where
         I: IntoIterator<Item = Bindings<'db>>,
     {
-        let elements: SmallVec<_> = elements
-            .into_iter()
-            .flat_map(|s| s.elements.into_iter())
-            .collect();
+        let mut implicit_dunder_new_is_possibly_unbound = false;
+        let mut implicit_dunder_init_is_possibly_unbound = false;
+        let mut elements_acc = SmallVec::new();
+
+        for set in elements {
+            implicit_dunder_new_is_possibly_unbound |= set.implicit_dunder_new_is_possibly_unbound;
+            implicit_dunder_init_is_possibly_unbound |=
+                set.implicit_dunder_init_is_possibly_unbound;
+            elements_acc.extend(set.elements);
+        }
+
+        let elements = elements_acc;
         assert!(!elements.is_empty());
         Self {
             callable_type,
             elements,
             argument_forms: ArgumentForms::new(0),
             constructor_instance_type: None,
+            implicit_dunder_new_is_possibly_unbound,
+            implicit_dunder_init_is_possibly_unbound,
         }
     }
 
@@ -121,14 +137,50 @@ impl<'db> Bindings<'db> {
         self
     }
 
+    pub(crate) fn with_generic_context(
+        mut self,
+        db: &'db dyn Db,
+        generic_context: Option<GenericContext<'db>>,
+    ) -> Self {
+        let Some(generic_context) = generic_context else {
+            return self;
+        };
+        for binding in &mut self.elements {
+            for overload in &mut binding.overloads {
+                overload.signature.generic_context = GenericContext::merge_optional(
+                    db,
+                    overload.signature.generic_context,
+                    Some(generic_context),
+                );
+            }
+        }
+        self
+    }
+
     pub(crate) fn set_dunder_call_is_possibly_unbound(&mut self) {
         for binding in &mut self.elements {
             binding.dunder_call_is_possibly_unbound = true;
         }
     }
 
+    pub(crate) fn set_implicit_dunder_new_is_possibly_unbound(&mut self) {
+        self.implicit_dunder_new_is_possibly_unbound = true;
+    }
+
+    pub(crate) fn set_implicit_dunder_init_is_possibly_unbound(&mut self) {
+        self.implicit_dunder_init_is_possibly_unbound = true;
+    }
+
     pub(crate) fn argument_forms(&self) -> &[Option<ParameterForm>] {
         &self.argument_forms.values
+    }
+
+    pub(crate) fn has_implicit_dunder_new_is_possibly_unbound(&self) -> bool {
+        self.implicit_dunder_new_is_possibly_unbound
+    }
+
+    pub(crate) fn has_implicit_dunder_init_is_possibly_unbound(&self) -> bool {
+        self.implicit_dunder_init_is_possibly_unbound
     }
 
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, CallableBinding<'db>> {
@@ -140,6 +192,8 @@ impl<'db> Bindings<'db> {
             callable_type: self.callable_type,
             argument_forms: self.argument_forms,
             constructor_instance_type: self.constructor_instance_type,
+            implicit_dunder_new_is_possibly_unbound: self.implicit_dunder_new_is_possibly_unbound,
+            implicit_dunder_init_is_possibly_unbound: self.implicit_dunder_init_is_possibly_unbound,
             elements: self.elements.into_iter().map(f).collect(),
         }
     }
@@ -273,14 +327,47 @@ impl<'db> Bindings<'db> {
         self.callable_type
     }
 
-    pub(crate) fn constructor_instance_type(&self) -> Option<Type<'db>> {
-        self.constructor_instance_type
+    // Constructor calls should combine `__new__`/`__init__` specializations instead of unioning.
+    fn constructor_return_type(&self, db: &'db dyn Db) -> Option<Type<'db>> {
+        let constructor_instance_type = self.constructor_instance_type?;
+        let Some(class_specialization) = constructor_instance_type.class_specialization(db) else {
+            return Some(constructor_instance_type);
+        };
+        let class_context = class_specialization.generic_context(db);
+
+        let mut combined: Option<Specialization<'db>> = None;
+        for binding in &self.elements {
+            // For constructors, use the first matching overload (declaration order) to avoid
+            // merging incompatible constructor specializations.
+            let Some((_, overload)) = binding.matching_overloads().next() else {
+                continue;
+            };
+            let Some(specialization) = overload.specialization else {
+                continue;
+            };
+            let Some(specialization) = specialization.restrict(db, class_context) else {
+                continue;
+            };
+            combined = Some(match combined {
+                None => specialization,
+                Some(previous) => previous.combine(db, specialization),
+            });
+        }
+
+        // If constructor inference doesn't yield a specialization, fall back to the default
+        // specialization to avoid leaking inferable typevars in the constructed instance.
+        let specialization =
+            combined.unwrap_or_else(|| class_context.default_specialization(db, None));
+        Some(constructor_instance_type.apply_specialization(db, specialization))
     }
 
     /// Returns the return type of the call. For successful calls, this is the actual return type.
     /// For calls with binding errors, this is a type that best approximates the return type. For
     /// types that are not callable, returns `Type::Unknown`.
     pub(crate) fn return_type(&self, db: &'db dyn Db) -> Type<'db> {
+        if let Some(return_ty) = self.constructor_return_type(db) {
+            return return_ty;
+        }
         if let [binding] = self.elements.as_slice() {
             return binding.return_type();
         }
@@ -1226,6 +1313,21 @@ impl<'db> Bindings<'db> {
 
                             overload.set_return_type(Type::DataclassTransformer(params));
                         }
+                        Some(KnownFunction::Unpack) => {
+                            let [Some(format), Some(_buffer)] = overload.parameter_types() else {
+                                continue;
+                            };
+
+                            let Some(format_literal) = format.as_string_literal() else {
+                                continue;
+                            };
+
+                            let return_type = parse_struct_format(db, format_literal.value(db))
+                                .map(|elements| Type::heterogeneous_tuple(db, elements.into_iter()))
+                                .unwrap_or_else(|| Type::homogeneous_tuple(db, Type::unknown()));
+
+                            overload.set_return_type(return_type);
+                        }
 
                         _ => {
                             // Ideally, either the implementation, or exactly one of the overloads
@@ -1556,6 +1658,8 @@ impl<'db> From<CallableBinding<'db>> for Bindings<'db> {
             elements: smallvec_inline![from],
             argument_forms: ArgumentForms::new(0),
             constructor_instance_type: None,
+            implicit_dunder_new_is_possibly_unbound: false,
+            implicit_dunder_init_is_possibly_unbound: false,
         }
     }
 }
@@ -1579,6 +1683,8 @@ impl<'db> From<Binding<'db>> for Bindings<'db> {
             elements: smallvec_inline![callable_binding],
             argument_forms: ArgumentForms::new(0),
             constructor_instance_type: None,
+            implicit_dunder_new_is_possibly_unbound: false,
+            implicit_dunder_init_is_possibly_unbound: false,
         }
     }
 }
@@ -1678,6 +1784,15 @@ impl<'db> CallableBinding<'db> {
             overload_call_return_type: None,
             matching_overload_before_type_checking: None,
             overloads: smallvec![],
+        }
+    }
+
+    pub(crate) fn bake_bound_type_into_overloads(&mut self, db: &'db dyn Db) {
+        let Some(bound_self) = self.bound_type.take() else {
+            return;
+        };
+        for overload in &mut self.overloads {
+            overload.signature = overload.signature.bind_self(db, Some(bound_self));
         }
     }
 
@@ -3164,6 +3279,13 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         let mut variance_in_arguments: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
             FxHashMap::default();
 
+        // Type variables for which we inferred a declared type based on a partially specialized
+        // type from an outer generic context. For these type variables, we may infer types that
+        // are not assignable to the concrete subset of the declared type, as they may be assignable
+        // to a wider declared type after specialization.
+        let mut partially_specialized_declared_type: FxHashSet<BoundTypeVarIdentity<'_>> =
+            FxHashSet::default();
+
         // Attempt to to solve the specialization while preferring the declared type of non-covariant
         // type parameters from generic classes.
         let preferred_type_mappings = return_with_tcx
@@ -3172,12 +3294,27 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     .class_specialization(self.db)?;
 
                 builder
-                    .infer_reverse_map(tcx, return_ty, |(_, variance, inferred_ty)| {
+                    .infer_reverse_map(tcx, return_ty, |(identity, variance, inferred_ty)| {
                         // Avoid unnecessarily widening the return type based on a covariant
                         // type parameter from the type context, as it can lead to argument
                         // assignability errors if the type variable is constrained by a narrower
                         // parameter type.
                         if variance.is_covariant() {
+                            return None;
+                        }
+
+                        // Avoid inferring a preferred type based on partially specialized type context
+                        // from an outer generic call. If the type context is a union, we try to keep
+                        // any concrete elements.
+                        let inferred_ty = inferred_ty.filter_union(self.db, |ty| {
+                            if ty.has_unspecialized_type_var(self.db) {
+                                partially_specialized_declared_type.insert(identity);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        if inferred_ty.has_unspecialized_type_var(self.db) {
                             return None;
                         }
 
@@ -3193,6 +3330,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         let assignable_to_declared_type = self.infer_argument_types(
             &mut builder,
             &preferred_type_mappings,
+            &partially_specialized_declared_type,
             &mut variance_in_arguments,
             &mut specialization_errors,
         );
@@ -3209,6 +3347,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             self.infer_argument_types(
                 &mut builder,
                 &FxHashMap::default(),
+                &FxHashSet::default(),
                 &mut variance_in_arguments,
                 &mut specialization_errors,
             );
@@ -3217,7 +3356,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         self.errors.extend(specialization_errors);
 
         // Attempt to promote any literal types assigned to the specialization.
-        let maybe_promote = |identity, typevar, ty: Type<'db>| {
+        let maybe_promote = |typevar, ty: Type<'db>| {
             let return_ty = self.constructor_instance_type.unwrap_or(self.return_ty);
 
             let mut combined_tcx = TypeContext::default();
@@ -3253,7 +3392,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             // If the type variable is a non-covariant position in any argument, then we avoid
             // promotion, respecting any literals in the parameter type.
             if variance_in_arguments
-                .get(&identity)
+                .get(&typevar.identity(self.db))
                 .is_some_and(|variance| !variance.is_covariant())
             {
                 return ty;
@@ -3274,6 +3413,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         &mut self,
         builder: &mut SpecializationBuilder<'db>,
         preferred_type_mappings: &FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
+        partially_specialized_declared_type: &FxHashSet<BoundTypeVarIdentity<'_>>,
         variance_in_arguments: &mut FxHashMap<BoundTypeVarIdentity<'db>, TypeVarVariance>,
         specialization_errors: &mut Vec<BindingError<'db>>,
     ) -> bool {
@@ -3297,7 +3437,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                                 return None;
                             }
 
-                            assignable_to_declared_type = false;
+                            // If this is a partially specialized type, the type we infer may still
+                            // be assignable to it once fully specialized.
+                            if !partially_specialized_declared_type.contains(&identity) {
+                                assignable_to_declared_type = false;
+                            }
                         }
 
                         variance_in_arguments
@@ -3514,10 +3658,19 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             return false;
         }
 
-        let sub_arguments = if let Some(argument_index) = argument_index {
-            self.arguments.start_from(argument_index)
+        let (sub_arguments, error_offset) = if let Some(argument_index) = argument_index {
+            let num_synthetic_args = self
+                .arguments
+                .iter()
+                .filter(|(arg, _)| matches!(arg, Argument::Synthetic))
+                .count();
+
+            (
+                self.arguments.start_from(argument_index),
+                Some(argument_index - num_synthetic_args),
+            )
         } else {
-            CallArguments::none()
+            (CallArguments::none(), None)
         };
 
         // Create Bindings with all overloads and perform full overload resolution
@@ -3541,22 +3694,38 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 if let [binding] = callable_binding.overloads() {
                     // This is not an overloaded function, so we can propagate its errors to the
                     // outer bindings.
-                    self.errors.extend(binding.errors.iter().cloned());
+                    self.errors.extend(
+                        binding
+                            .errors
+                            .iter()
+                            .cloned()
+                            .map(|err| err.maybe_apply_argument_index_offset(error_offset)),
+                    );
                 } else {
                     let index = callable_binding
                         .matching_overload_before_type_checking
                         .unwrap_or(0);
                     // TODO: We should also update the specialization for the `ParamSpec` to reflect
                     // the matching overload here.
-                    self.errors
-                        .extend(callable_binding.overloads()[index].errors.iter().cloned());
+                    self.errors.extend(
+                        callable_binding.overloads()[index]
+                            .errors
+                            .iter()
+                            .cloned()
+                            .map(|err| err.maybe_apply_argument_index_offset(error_offset)),
+                    );
                 }
             }
             MatchingOverloadIndex::Single(index) => {
                 // TODO: We should also update the specialization for the `ParamSpec` to reflect the
                 // matching overload here.
-                self.errors
-                    .extend(callable_binding.overloads()[index].errors.iter().cloned());
+                self.errors.extend(
+                    callable_binding.overloads()[index]
+                        .errors
+                        .iter()
+                        .cloned()
+                        .map(|err| err.maybe_apply_argument_index_offset(error_offset)),
+                );
             }
             MatchingOverloadIndex::Multiple(_) => {
                 if !matches!(
@@ -3570,7 +3739,8 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                             .unwrap()
                             .errors
                             .iter()
-                            .cloned(),
+                            .cloned()
+                            .map(|err| err.maybe_apply_argument_index_offset(error_offset)),
                     );
                 }
             }
@@ -3811,7 +3981,10 @@ impl<'db> Binding<'db> {
         for (keywords_index, keywords_type) in keywords_arguments {
             matcher.match_keyword_variadic(db, keywords_index, keywords_type);
         }
-        self.return_ty = self.signature.return_ty;
+        // For constructor calls, return the constructed instance type (not `__init__`'s `None`).
+        self.return_ty = self
+            .constructor_instance_type
+            .unwrap_or(self.signature.return_ty);
         self.parameter_tys = vec![None; parameters.len()].into_boxed_slice();
         self.variadic_argument_matched_to_variadic_parameter =
             matcher.variadic_argument_matched_to_variadic_parameter;
@@ -3856,10 +4029,6 @@ impl<'db> Binding<'db> {
 
     pub(crate) fn return_type(&self) -> Type<'db> {
         self.return_ty
-    }
-
-    pub(crate) fn specialization(&self) -> Option<Specialization<'db>> {
-        self.specialization
     }
 
     /// Returns the bound types for each parameter, in parameter source order, or `None` if no
@@ -4264,6 +4433,52 @@ pub(crate) enum BindingError<'db> {
     CalledTopCallable(Type<'db>),
     /// The `@dataclass` decorator was applied to an invalid target.
     InvalidDataclassApplication(InvalidDataclassTarget),
+}
+
+impl BindingError<'_> {
+    pub(crate) fn maybe_apply_argument_index_offset(mut self, offset: Option<usize>) -> Self {
+        if let Some(offset) = offset {
+            self.apply_argument_index_offset(offset);
+        }
+        self
+    }
+
+    /// Applies the given offset to the argument indices in this error, if any.
+    ///
+    /// This is mainly used to adjust error argument indices for errors that were generated in a
+    /// sub-call for a `ParamSpec`, where the argument indices are relative to the sub-call's
+    /// argument list rather than the original call's argument list. The `offset` should be the
+    /// number of arguments in the original call that were matched before the `ParamSpec` component.
+    pub(crate) fn apply_argument_index_offset(&mut self, offset: usize) {
+        match self {
+            BindingError::InvalidArgumentType { argument_index, .. }
+            | BindingError::InvalidKeyType { argument_index, .. }
+            | BindingError::UnknownArgument { argument_index, .. }
+            | BindingError::PositionalOnlyParameterAsKwarg { argument_index, .. }
+            | BindingError::ParameterAlreadyAssigned { argument_index, .. }
+            | BindingError::SpecializationError { argument_index, .. } => {
+                if let Some(argument_index) = argument_index {
+                    *argument_index += offset;
+                }
+            }
+
+            BindingError::TooManyPositionalArguments {
+                first_excess_argument_index,
+                ..
+            } => {
+                if let Some(first_excess_argument_index) = first_excess_argument_index {
+                    *first_excess_argument_index += offset;
+                }
+            }
+
+            BindingError::CalledTopCallable(..)
+            | BindingError::InternalCallError(..)
+            | BindingError::InvalidDataclassApplication(..)
+            | BindingError::MissingArguments { .. }
+            | BindingError::UnmatchedOverload
+            | BindingError::PropertyHasNoSetter(..) => {}
+        }
+    }
 }
 
 /// The target of an invalid `@dataclass` application.
@@ -4959,4 +5174,62 @@ fn asynccontextmanager_return_type<'db>(db: &'db dyn Db, func_ty: Type<'db>) -> 
         CallableSignature::single(new_signature),
         CallableTypeKind::FunctionLike,
     )))
+}
+
+/// Maximum repetition count for struct format specifiers.
+/// Larger counts fall back to `tuple[Unknown, ...]`.
+const STRUCT_FORMAT_MAX_REPETITION: usize = 32;
+
+/// Parse a `struct` module format string and return the element types.
+///
+/// Returns `None` if the format contains unsupported specifiers or
+/// repetition counts exceed the limit, indicating a fallback to `tuple[Unknown, ...]`.
+fn parse_struct_format<'db>(db: &'db dyn Db, format_string: &str) -> Option<Vec<Type<'db>>> {
+    // Strip the byte order/size/alignment prefix
+    let format = format_string.trim_start_matches(['@', '=', '<', '>', '!']);
+    let mut chars = format.chars().peekable();
+    let mut elements = Vec::new();
+
+    while chars.peek().is_some() {
+        // Skip whitespace between format specifiers
+        while chars.next_if(char::is_ascii_whitespace).is_some() {}
+
+        // Parse optional repeat count (defaults to 1)
+        let mut count: usize = 1;
+        if let Some(digit) = chars.next_if(char::is_ascii_digit) {
+            count = digit.to_digit(10).unwrap() as usize;
+            while let Some(digit) = chars.next_if(char::is_ascii_digit) {
+                count = count
+                    .saturating_mul(10)
+                    .saturating_add(digit.to_digit(10).unwrap() as usize);
+            }
+        }
+
+        let Some(specifier) = chars.next() else {
+            break;
+        };
+
+        // Map specifier to (type, repeat_count). For 's'/'p', count is byte length, not repetition.
+        let (ty, repeat) = match specifier {
+            'x' => continue, // Pad byte: no value produced
+            's' | 'p' => (KnownClass::Bytes.to_instance(db), 1),
+            'c' => (KnownClass::Bytes.to_instance(db), count),
+            'b' | 'B' | 'h' | 'H' | 'i' | 'I' | 'l' | 'L' | 'q' | 'Q' | 'n' | 'N' | 'P' => {
+                (KnownClass::Int.to_instance(db), count)
+            }
+            '?' => (KnownClass::Bool.to_instance(db), count),
+            'e' | 'f' | 'd' => (KnownClass::Float.to_instance(db), count),
+            'F' | 'D' if Program::get(db).python_version(db) >= PythonVersion::PY314 => {
+                (KnownClass::Complex.to_instance(db), count)
+            }
+            _ => return None,
+        };
+
+        if repeat > STRUCT_FORMAT_MAX_REPETITION {
+            return None;
+        }
+        elements.extend(std::iter::repeat_n(ty, repeat));
+    }
+
+    Some(elements)
 }

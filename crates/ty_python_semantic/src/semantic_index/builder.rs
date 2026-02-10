@@ -1249,6 +1249,13 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         // nodes are evaluated in the inner scope.
         let value = self.add_standalone_expression(&generator.iter);
         self.visit_expr(&generator.iter);
+
+        // Clear the assignment stack before entering the comprehension scope.
+        // If the comprehension appears inside an assignment target (e.g., error-recovered
+        // `arr[::[x for *b in y for (b: _` is parsed as `StmtAnnAssign`), the outer
+        // assignment context must not leak into the inner scope.
+        let saved_assignments = std::mem::take(&mut self.current_assignments);
+
         self.push_scope(scope);
 
         self.add_unpackable_assignment(
@@ -1286,6 +1293,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
         visit_outer_elt(self);
         self.pop_scope();
+
+        self.current_assignments = saved_assignments;
     }
 
     fn declare_parameters(&mut self, parameters: &'ast ast::Parameters) {
