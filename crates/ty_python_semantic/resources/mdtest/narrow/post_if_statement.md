@@ -182,8 +182,7 @@ def _(x: int | None):
             return
         reveal_type(x)  # revealed: int
 
-    # TODO: should be `int` (the else-branch of `1 + 1 == 2` is unreachable)
-    reveal_type(x)  # revealed: int | None
+    reveal_type(x)  # revealed: int
 ```
 
 This also works when the always-true condition is nested inside a narrowing branch:
@@ -194,9 +193,7 @@ def _(val: int | None):
         if 1 + 1 == 2:
             return
 
-    # TODO: should be `int` (the inner always-true branch makes the outer
-    # if-branch terminal)
-    reveal_type(val)  # revealed: int | None
+    reveal_type(val)  # revealed: int
 ```
 
 ## Narrowing from `assert` should not affect reassigned variables
