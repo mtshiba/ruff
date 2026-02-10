@@ -791,10 +791,24 @@ impl ReachabilityConstraints {
         base_ty: Type<'db>,
         place: ScopedPlaceId,
     ) -> Type<'db> {
-        self.narrow_by_constraint_inner(db, predicates, id, base_ty, place, None)
+        let mut memo = FxHashMap::default();
+        let mut narrowing_constraint_memo = FxHashMap::default();
+        let mut truthiness_memo = FxHashMap::default();
+        self.narrow_by_constraint_inner(
+            db,
+            predicates,
+            id,
+            base_ty,
+            place,
+            None,
+            &mut memo,
+            &mut narrowing_constraint_memo,
+            &mut truthiness_memo,
+        )
     }
 
     /// Inner recursive helper that accumulates narrowing constraints along each TDD path.
+    #[allow(clippy::too_many_arguments)]
     fn narrow_by_constraint_inner<'db>(
         &self,
         db: &'db dyn Db,
@@ -803,8 +817,22 @@ impl ReachabilityConstraints {
         base_ty: Type<'db>,
         place: ScopedPlaceId,
         accumulated: Option<NarrowingConstraint<'db>>,
+        memo: &mut FxHashMap<
+            (
+                ScopedReachabilityConstraintId,
+                Option<NarrowingConstraint<'db>>,
+            ),
+            Type<'db>,
+        >,
+        narrowing_constraint_memo: &mut FxHashMap<Predicate<'db>, Option<NarrowingConstraint<'db>>>,
+        truthiness_memo: &mut FxHashMap<Predicate<'db>, Truthiness>,
     ) -> Type<'db> {
-        match id {
+        let key = (id, accumulated.clone());
+        if let Some(cached) = memo.get(&key).copied() {
+            return cached;
+        }
+
+        let narrowed = match id {
             ALWAYS_TRUE | AMBIGUOUS => {
                 // Apply all accumulated narrowing constraints to the base type
                 match accumulated {
@@ -820,7 +848,12 @@ impl ReachabilityConstraints {
                 let predicate = predicates[node.atom];
 
                 // Check if this predicate narrows the variable we're interested in.
-                let pos_constraint = infer_narrowing_constraint(db, predicate, place);
+                let pos_constraint = Self::infer_narrowing_constraint_cached(
+                    db,
+                    predicate,
+                    place,
+                    narrowing_constraint_memo,
+                );
 
                 if pos_constraint.is_none() {
                     // This predicate doesn't narrow our variable (e.g., it's a
@@ -831,46 +864,66 @@ impl ReachabilityConstraints {
                         node: predicate.node,
                         is_positive: !predicate.is_positive,
                     };
-                    let neg_constraint = infer_narrowing_constraint(db, neg_predicate, place);
+                    let neg_constraint = Self::infer_narrowing_constraint_cached(
+                        db,
+                        neg_predicate,
+                        place,
+                        narrowing_constraint_memo,
+                    );
 
                     if neg_constraint.is_none() {
-                        return match Self::analyze_single(db, &predicate) {
-                            Truthiness::AlwaysTrue => self.narrow_by_constraint_inner(
-                                db,
-                                predicates,
-                                node.if_true,
-                                base_ty,
-                                place,
-                                accumulated,
-                            ),
-                            Truthiness::AlwaysFalse => self.narrow_by_constraint_inner(
-                                db,
-                                predicates,
-                                node.if_false,
-                                base_ty,
-                                place,
-                                accumulated,
-                            ),
-                            Truthiness::Ambiguous => {
-                                let true_ty = self.narrow_by_constraint_inner(
+                        let narrowed =
+                            match Self::analyze_single_cached(db, predicate, truthiness_memo) {
+                                Truthiness::AlwaysTrue => self.narrow_by_constraint_inner(
                                     db,
                                     predicates,
                                     node.if_true,
                                     base_ty,
                                     place,
-                                    accumulated.clone(),
-                                );
-                                let false_ty = self.narrow_by_constraint_inner(
+                                    accumulated,
+                                    memo,
+                                    narrowing_constraint_memo,
+                                    truthiness_memo,
+                                ),
+                                Truthiness::AlwaysFalse => self.narrow_by_constraint_inner(
                                     db,
                                     predicates,
                                     node.if_false,
                                     base_ty,
                                     place,
                                     accumulated,
-                                );
-                                UnionType::from_elements(db, [true_ty, false_ty])
-                            }
-                        };
+                                    memo,
+                                    narrowing_constraint_memo,
+                                    truthiness_memo,
+                                ),
+                                Truthiness::Ambiguous => {
+                                    let true_ty = self.narrow_by_constraint_inner(
+                                        db,
+                                        predicates,
+                                        node.if_true,
+                                        base_ty,
+                                        place,
+                                        accumulated.clone(),
+                                        memo,
+                                        narrowing_constraint_memo,
+                                        truthiness_memo,
+                                    );
+                                    let false_ty = self.narrow_by_constraint_inner(
+                                        db,
+                                        predicates,
+                                        node.if_false,
+                                        base_ty,
+                                        place,
+                                        accumulated,
+                                        memo,
+                                        narrowing_constraint_memo,
+                                        truthiness_memo,
+                                    );
+                                    UnionType::from_elements(db, [true_ty, false_ty])
+                                }
+                            };
+                        memo.insert(key, narrowed);
+                        return narrowed;
                     }
                 }
 
@@ -884,6 +937,9 @@ impl ReachabilityConstraints {
                     base_ty,
                     place,
                     true_accumulated,
+                    memo,
+                    narrowing_constraint_memo,
+                    truthiness_memo,
                 );
 
                 // False branch: predicate doesn't hold → accumulate negative narrowing
@@ -891,7 +947,12 @@ impl ReachabilityConstraints {
                     node: predicate.node,
                     is_positive: !predicate.is_positive,
                 };
-                let neg_constraint = infer_narrowing_constraint(db, neg_predicate, place);
+                let neg_constraint = Self::infer_narrowing_constraint_cached(
+                    db,
+                    neg_predicate,
+                    place,
+                    narrowing_constraint_memo,
+                );
                 let false_accumulated = accumulate_constraint(db, accumulated, neg_constraint);
                 let false_ty = self.narrow_by_constraint_inner(
                     db,
@@ -900,11 +961,46 @@ impl ReachabilityConstraints {
                     base_ty,
                     place,
                     false_accumulated,
+                    memo,
+                    narrowing_constraint_memo,
+                    truthiness_memo,
                 );
 
                 UnionType::from_elements(db, [true_ty, false_ty])
             }
+        };
+
+        memo.insert(key, narrowed);
+        narrowed
+    }
+
+    fn infer_narrowing_constraint_cached<'db>(
+        db: &'db dyn Db,
+        predicate: Predicate<'db>,
+        place: ScopedPlaceId,
+        memo: &mut FxHashMap<Predicate<'db>, Option<NarrowingConstraint<'db>>>,
+    ) -> Option<NarrowingConstraint<'db>> {
+        if let Some(cached) = memo.get(&predicate) {
+            return cached.clone();
         }
+
+        let inferred = infer_narrowing_constraint(db, predicate, place);
+        memo.insert(predicate, inferred.clone());
+        inferred
+    }
+
+    fn analyze_single_cached<'db>(
+        db: &'db dyn Db,
+        predicate: Predicate<'db>,
+        memo: &mut FxHashMap<Predicate<'db>, Truthiness>,
+    ) -> Truthiness {
+        if let Some(cached) = memo.get(&predicate) {
+            return *cached;
+        }
+
+        let analyzed = Self::analyze_single(db, &predicate);
+        memo.insert(predicate, analyzed);
+        analyzed
     }
 
     /// Analyze the statically known reachability for a given constraint.
