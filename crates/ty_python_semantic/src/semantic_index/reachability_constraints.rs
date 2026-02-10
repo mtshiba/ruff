@@ -612,6 +612,7 @@ impl ReachabilityConstraintsBuilder {
             (ALWAYS_TRUE, _) | (_, ALWAYS_TRUE) => return ALWAYS_TRUE,
             (ALWAYS_FALSE, other) | (other, ALWAYS_FALSE) => return other,
             (AMBIGUOUS, AMBIGUOUS) => return AMBIGUOUS,
+            _ if a == b => return a,
             _ => {}
         }
 
@@ -678,6 +679,7 @@ impl ReachabilityConstraintsBuilder {
             (ALWAYS_FALSE, _) | (_, ALWAYS_FALSE) => return ALWAYS_FALSE,
             (ALWAYS_TRUE, other) | (other, ALWAYS_TRUE) => return other,
             (AMBIGUOUS, AMBIGUOUS) => return AMBIGUOUS,
+            _ if a == b => return a,
             _ => {}
         }
 
