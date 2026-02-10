@@ -1855,14 +1855,14 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                 if let Some(msg) = msg {
                     let post_test = self.flow_snapshot();
                     let negated_predicate = predicate.negated();
-                    self.record_narrowing_constraint(negated_predicate);
-                    self.record_reachability_constraint(negated_predicate);
+                    let predicate_id = self.record_narrowing_constraint(negated_predicate);
+                    self.record_reachability_constraint_id(predicate_id);
                     self.visit_expr(msg);
                     self.flow_restore(post_test);
                 }
 
-                self.record_narrowing_constraint(predicate);
-                self.record_reachability_constraint(predicate);
+                let predicate_id = self.record_narrowing_constraint(predicate);
+                self.record_reachability_constraint_id(predicate_id);
             }
 
             ast::Stmt::Assign(node) => {
