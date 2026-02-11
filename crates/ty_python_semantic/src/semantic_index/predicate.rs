@@ -34,7 +34,7 @@ impl ScopedPredicateId {
         self >= Self::SMALLEST_TERMINAL
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "tdd-stats")]
     pub(crate) fn as_u32(self) -> u32 {
         self.0
     }
