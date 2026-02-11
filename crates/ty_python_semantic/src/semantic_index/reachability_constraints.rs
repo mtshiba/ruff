@@ -794,7 +794,6 @@ impl ReachabilityConstraints {
         place: ScopedPlaceId,
     ) -> Type<'db> {
         let mut memo = FxHashMap::default();
-        let mut narrowing_constraint_memo = FxHashMap::default();
         let mut truthiness_memo = FxHashMap::default();
         self.narrow_by_constraint_inner(
             db,
@@ -804,7 +803,6 @@ impl ReachabilityConstraints {
             place,
             None,
             &mut memo,
-            &mut narrowing_constraint_memo,
             &mut truthiness_memo,
         )
     }
@@ -826,7 +824,6 @@ impl ReachabilityConstraints {
             ),
             Type<'db>,
         >,
-        narrowing_constraint_memo: &mut FxHashMap<Predicate<'db>, Option<NarrowingConstraint<'db>>>,
         truthiness_memo: &mut FxHashMap<Predicate<'db>, Truthiness>,
     ) -> Type<'db> {
         let key = (id, accumulated.clone());
@@ -850,12 +847,7 @@ impl ReachabilityConstraints {
                 let predicate = predicates[node.atom];
 
                 // Check if this predicate narrows the variable we're interested in.
-                let pos_constraint = Self::infer_narrowing_constraint_cached(
-                    db,
-                    predicate,
-                    place,
-                    narrowing_constraint_memo,
-                );
+                let pos_constraint = infer_narrowing_constraint(db, predicate, place);
 
                 if pos_constraint.is_none() {
                     // This predicate doesn't narrow our variable (e.g., it's a
@@ -866,12 +858,7 @@ impl ReachabilityConstraints {
                         node: predicate.node,
                         is_positive: !predicate.is_positive,
                     };
-                    let neg_constraint = Self::infer_narrowing_constraint_cached(
-                        db,
-                        neg_predicate,
-                        place,
-                        narrowing_constraint_memo,
-                    );
+                    let neg_constraint = infer_narrowing_constraint(db, neg_predicate, place);
 
                     if neg_constraint.is_none() {
                         let narrowed =
@@ -884,7 +871,6 @@ impl ReachabilityConstraints {
                                     place,
                                     accumulated,
                                     memo,
-                                    narrowing_constraint_memo,
                                     truthiness_memo,
                                 ),
                                 Truthiness::AlwaysFalse => self.narrow_by_constraint_inner(
@@ -895,7 +881,6 @@ impl ReachabilityConstraints {
                                     place,
                                     accumulated,
                                     memo,
-                                    narrowing_constraint_memo,
                                     truthiness_memo,
                                 ),
                                 Truthiness::Ambiguous => {
@@ -907,7 +892,6 @@ impl ReachabilityConstraints {
                                         place,
                                         accumulated.clone(),
                                         memo,
-                                        narrowing_constraint_memo,
                                         truthiness_memo,
                                     );
                                     let false_ty = self.narrow_by_constraint_inner(
@@ -918,7 +902,6 @@ impl ReachabilityConstraints {
                                         place,
                                         accumulated,
                                         memo,
-                                        narrowing_constraint_memo,
                                         truthiness_memo,
                                     );
                                     UnionType::from_elements(db, [true_ty, false_ty])
@@ -940,7 +923,6 @@ impl ReachabilityConstraints {
                     place,
                     true_accumulated,
                     memo,
-                    narrowing_constraint_memo,
                     truthiness_memo,
                 );
 
@@ -949,12 +931,7 @@ impl ReachabilityConstraints {
                     node: predicate.node,
                     is_positive: !predicate.is_positive,
                 };
-                let neg_constraint = Self::infer_narrowing_constraint_cached(
-                    db,
-                    neg_predicate,
-                    place,
-                    narrowing_constraint_memo,
-                );
+                let neg_constraint = infer_narrowing_constraint(db, neg_predicate, place);
                 let false_accumulated = accumulate_constraint(db, accumulated, neg_constraint);
                 let false_ty = self.narrow_by_constraint_inner(
                     db,
@@ -964,7 +941,6 @@ impl ReachabilityConstraints {
                     place,
                     false_accumulated,
                     memo,
-                    narrowing_constraint_memo,
                     truthiness_memo,
                 );
 
@@ -974,21 +950,6 @@ impl ReachabilityConstraints {
 
         memo.insert(key, narrowed);
         narrowed
-    }
-
-    fn infer_narrowing_constraint_cached<'db>(
-        db: &'db dyn Db,
-        predicate: Predicate<'db>,
-        place: ScopedPlaceId,
-        memo: &mut FxHashMap<Predicate<'db>, Option<NarrowingConstraint<'db>>>,
-    ) -> Option<NarrowingConstraint<'db>> {
-        if let Some(cached) = memo.get(&predicate) {
-            return cached.clone();
-        }
-
-        let inferred = infer_narrowing_constraint(db, predicate, place);
-        memo.insert(predicate, inferred.clone());
-        inferred
     }
 
     fn analyze_single_cached<'db>(
