@@ -32,127 +32,210 @@ Using single-threaded execution as ground truth, we identified:
 | Multi #4 | 17,504 | 129 |
 | Multi #5 | 17,452 | 92 |
 
-## Root Cause Analysis
+## Detailed Flaky Diagnostic Classification
 
-### Pattern 1: `call_highest_priority` decorator (primary cause, ~195 flaky locations)
+### Group A: Matrix `unsupported-operator` (59 locations, all correct in single-threaded)
 
-The `call_highest_priority` decorator in sympy wraps binary operators (`__add__`, `__sub__`,
-`__mul__`, `__pow__`, etc.) with a function that may dispatch to a different method based on
-`_op_priority`:
-
+**Python code pattern:**
 ```python
-def binary_op_wrapper(self: T1, other: T2) -> T3:
-    if hasattr(other, '_op_priority'):
-        if other._op_priority > self._op_priority:
-            f = getattr(other, method_name, None)
-            if f is not None:
-                return f(self)  # returns T2's method return type
-    return func(self, other)  # returns T3
+m + m  # where m: MutableDenseMatrix (or MatrixBase, Self, etc.)
 ```
 
-ty infers the return type as a union of both branches. In a cycle (e.g., `MatrixBase.__mul__`
-calling `self._new(...)` which calls back into matrix operations), the cycle recovery combines
-types from different iterations. The type `T2'return@call_highest_priority | T1'return@call_highest_priority`
-leaks into the inferred type of matrix operations.
+**Expected type:** `MutableDenseMatrix.__add__` is defined via `MatrixBase.__add__`, which is
+decorated with `@call_highest_priority('__radd__')`. ty should recognize this operator.
 
-**Example:** `(B**2).rank()` where `B` is a `MatrixBase`:
-- Single-threaded / some multi-threaded runs: `B**2` has type `MatrixBase` → no error
-- Other multi-threaded runs: `B**2` has type `MatrixBase | MatrixExpr | Unknown` →
-  error because `MatrixExpr` has no `rank` attribute
+**Actual behavior (single-threaded):** ty reports `unsupported-operator` because the
+`@call_highest_priority` decorator wraps `__add__` in `binary_op_wrapper`, and ty's analysis of
+the wrapper body fails to produce a valid `__add__` signature. The result type is `Unknown`.
 
-The specific diagnostics affected:
+This is a **pre-existing bug** unrelated to non-determinism: `MutableDenseMatrix + MutableDenseMatrix`
+always reports `unsupported-operator` in single-threaded mode. The flakiness is that in some
+multi-threaded runs this error **disappears**, because cycle recovery provides a different
+(accidentally more permissive) type for the operator.
 
-```
-error[invalid-return-type]: expected `Self@_eval_pow_by_cayley`, found
-    `Self@_eval_pow_by_cayley | T2'return@call_highest_priority | T1'return@call_highest_priority | Unknown`
+**Why it disappears in some multi-threaded runs:** When a cycle is detected via a different entry
+point, the `is_redundant_with` check (relation.rs:301, `cycle_initial=true`) causes some union
+simplifications to return `true` (i.e., "this type is redundant") when they would normally return
+`false`. This can cause the type checker to see a simpler type for the decorated method, which
+happens to pass the operator check.
 
-error[unresolved-attribute]: Attribute `rank` is not defined on `MatrixExpr`
-    in union `MatrixBase | MatrixExpr | Unknown`
+### Group B: `call_highest_priority` type leaking (8 locations, all correct in single-threaded)
 
-error[unsupported-operator]: Unsupported `-` operation
-    (operands: `MatrixBase` and `MatrixBase | Expr | Unknown`)
-
-error[unresolved-attribute]: Object of type
-    `T2'return@call_highest_priority | T1'return@call_highest_priority` has no attribute `pow`
-```
-
-### Pattern 2: `sympify` overload resolution (secondary cause, ~36 false-positive locations)
-
-`sympify` has multiple overloads:
+**Python code pattern:**
 ```python
-def sympify(a: int, ...) -> Integer: ...
-def sympify(a: float, ...) -> Float: ...
-def sympify(a: Expr | complex, ...) -> Expr: ...
-def sympify(a: Tbasic, ...) -> Tbasic: ...
-def sympify(a: Any, ...) -> Basic: ...
+# matrixbase.py:2957 - _eval_pow_by_cayley returns Self, but cycle introduces wider type
+def _eval_pow_by_cayley(self, exp: int) -> Self:
+    ...
+    return ans  # ty infers: Self | T2'return@call_highest_priority | T1'return@call_highest_priority | Unknown
+
+# matrixbase.py:3310 - __rsub__ uses operator that leaks wrapper types
+def __rsub__(self, a: MatrixBase) -> MatrixBase:
+    return (-self) + a  # Both operands: MatrixBase, but operator has leaked types
+
+# eigen.py:1202 - subtraction result has leaked type without .pow attribute
+mat_cache[(val, pow)] = (mat - val*M.eye(M.rows)).pow(pow)  # T2'return | T1'return has no .pow
 ```
 
-When called as `map(sympify, (n, k))`, the inferred return type depends on the inferred types
-of `n` and `k`. In some multi-threaded runs, the argument types are wider (due to cycle recovery
-effects upstream), causing ty to union together return types from multiple overloads, producing
-`Basic | int | float | complex | Any` instead of just `Basic`.
+**Expected type:** The return type of decorated methods should be the annotated type (e.g., `Self`,
+`MatrixBase`), not the union with decorator TypeVar artifacts.
 
-This causes false-positive errors like:
+**Root cause in ty:** When `call_highest_priority` wraps a method, ty infers the return type of
+`binary_op_wrapper` as a union of both branches:
+1. `func(self, other)` → `T3` (the declared return type)
+2. `f(self)` where `f = getattr(other, method_name, None)` → `T1'return@call_highest_priority`
+
+These TypeVar-like types should be resolved to concrete types but remain unresolved because:
+- `T1` and `T2` in the decorator are bound at `call_highest_priority`'s scope
+- The `@wraps(func)` annotation tells ty to preserve the original signature, but ty still
+  analyzes the body of `binary_op_wrapper` and unions both return paths
+- In a cycle, `Type::cycle_recover` (types.rs:950) accumulates these intermediate types:
+  ```rust
+  UnionType::from_elements_cycle_recovery(db, [previous, self])
+  ```
+
+### Group C: Matrix `__pow__` wider union (4 locations, all correct in single-threaded)
+
+**Python code pattern:**
+```python
+B = A - Matrix.eye(4) * I
+assert (B**2).rank() == 2   # error: MatrixExpr has no attribute rank
 ```
-error[unresolved-attribute]: Attribute `is_nonnegative` is not defined on `int`, `float`, `complex`
-    in union `Basic | int | float | complex | Any`
+
+**Expected type:** `B**2` should return `MatrixBase | MatrixExpr` (per `MatrixBase.__pow__`
+annotation). `MatrixExpr` does lack `.rank()`, so this is a **correct diagnostic** that
+sometimes disappears.
+
+**Why it disappears:** Same mechanism as Group A — cycle recovery via a different entry point
+causes `is_redundant_with` to return `true` for some union elements, simplifying the type and
+accidentally suppressing the error.
+
+### Group D: Matrix other operators (9 locations, all correct in single-threaded)
+
+Same root cause as Group A but with types like `MatrixBase`, `Unknown | MatrixBase`, etc.
+instead of `MutableDenseMatrix`.
+
+### Group E: `sympify` overload union (36 locations, all FALSE POSITIVES)
+
+**Python code pattern:**
+```python
+# In Application.__new__ (function.py:300):
+args = list(map(sympify, args))      # args: *args of __new__, type Unknown
+cls.eval(*args)                       # calls e.g. binomial.eval(n, k)
+
+# In binomial.eval (factorials.py:966-968):
+def eval(cls, n, k):                  # n, k come from map(sympify, args)
+    n, k = map(sympify, (n, k))       # sympify called again
+    n_nonneg = n.is_nonnegative       # ERROR if n has type int|float|complex
 ```
 
-### Pattern 3: Union element ordering (cosmetic, ~7 locations)
+**Expected type for `map(sympify, (n, k))`:**
+- When `n`, `k` have type `Unknown`: all sympify overloads match → return `Basic | int | float | complex | Any`
+- When `n`, `k` have type `Basic` (from the first `map(sympify, args)` in `__new__`): only
+  the `sympify(a: Tbasic) -> Tbasic` and `sympify(a: Any) -> Basic` overloads match → return `Basic`
 
-The same diagnostics appear but with different union element ordering:
-```
-run1: union `Basic | int | float | complex | Any`
-run2: union `Any | Basic | int | float | complex`
-```
+**Single-threaded result:** `n` has type `Basic` → `sympify(n)` returns `Basic` → `n.is_nonnegative` is valid.
 
-This is purely cosmetic and does not affect correctness, but breaks baseline comparisons.
+**Some multi-threaded results:** `n` has type `Basic | int | float | complex | Any` →
+`n.is_nonnegative` errors because `int`, `float`, `complex` don't have `is_nonnegative`.
 
-## Mechanism
+**Root cause in ty — the cycle and `is_redundant_with`:**
 
-The non-determinism occurs because:
+The cycle is: `Application.__new__` → `cls.eval(*args)` → eval body creates new instances →
+`Application.__new__` again.
 
-1. Salsa (the incremental computation framework) executes queries in parallel across threads
-2. When a **cycle** is detected, the entry point depends on which thread reaches the cycle first
-3. The `cycle_initial` value is `Type::divergent(id)`, and the cycle recovery function
-   (`Type::cycle_recover`) unions together the previous and current iteration types
-4. Different cycle entry points lead to different intermediate types being unioned together
-5. Even though the fixpoint iteration should converge, the **path to convergence** differs,
-   and the union accumulates different type elements along different paths
+1. In single-threaded, the cycle always enters at `Application.__new__`. The first call to
+   `map(sympify, args)` with `Unknown` args produces `list[Basic | int | float | complex | Any]`.
+   However, `is_redundant_with` simplification during union building removes `int`, `float`,
+   `complex` (they are subtypes of or redundant with `Basic`/`Any`), yielding `list[Basic]`.
 
-Specifically, in `Type::cycle_recover` (types.rs:900-955):
+2. In multi-threaded, the cycle can enter at `eval` instead. The `n`, `k` parameters get the
+   cycle initial type `Unknown` (from `Type::divergent`). When `map(sympify, (n, k))` is called
+   with `Unknown` args, the same overload union is produced. But this time, `is_redundant_with`
+   encounters a Salsa cycle (because checking type relations requires resolving types that are
+   part of the same cycle), and returns `true` (its `cycle_initial` value) for **different**
+   pairs of types than in the single-threaded case, causing different elements to survive.
+
+**The key code:** `relation.rs:301`:
 ```rust
-UnionType::from_elements_cycle_recovery(db, [previous, self])
+#[salsa::tracked(cycle_initial=|_, _, _, _| true, heap_size=ruff_memory_usage::heap_size)]
+fn is_redundant_with_impl<'db>(db: &'db dyn Db, self_ty: Type<'db>, other: Type<'db>) -> bool {
+    self_ty.has_relation_to(db, other, InferableTypeVars::None, TypeRelation::Redundancy)
+         .is_always_satisfied(db)
+}
 ```
-This unions the previous iteration's type with the current one. If the cycle is entered from
-a different query, `previous` contains different type elements, leading to a wider union that
-may include types like `T2'return@call_highest_priority` that wouldn't appear if the cycle
-were entered from the "correct" starting point.
 
-## Affected Files in sympy
+When a cycle is detected during `is_redundant_with`, it returns `true` ("yes, this type is
+redundant"). This means:
+- If `is_redundant_with(int, Basic)` hits a cycle → returns `true` → `int` is filtered out of
+  the union → result is `Basic` (correct)
+- If `is_redundant_with(int, Basic)` does NOT hit a cycle → actually checks subtyping →
+  `int` is not a subtype of `Basic` → returns `false` → `int` stays in the union →
+  result is `Basic | int | ...` (over-wide)
 
-The flaky diagnostics concentrate in:
-- `sympy/matrices/` (37 test files + 13 source files) — matrix arithmetic operators
-- `sympy/parsing/autolev/` (10 files) — uses matrix operations
-- `sympy/polys/` (8 files) — uses `sympify`
-- `sympy/functions/combinatorial/` (7 files) — uses `sympify`
-- `sympy/tensor/` (8 files) — uses `sympify` and matrix operations
-- `sympy/physics/` (various, 15 files) — uses matrix operations
+Whether the cycle is hit depends on the execution order of concurrent queries, which varies
+between threads.
+
+### Group F: `Self@` type mismatches (3 locations, all correct in single-threaded)
+
+**Python code pattern:**
+```python
+def add(self, b: Self) -> Self:
+    return self + b   # Both operands: Self@add, unsupported operator
+```
+
+Same root cause as Group A — `__add__` is decorated, operator not recognized.
+
+### Group G: Other union-related (5 locations, all correct in single-threaded)
+
+Various matrix operation results with `Unknown` or `MatrixBase | Expr | Unknown` types.
+Same root cause as Groups A/B.
+
+## Root Cause Summary
+
+There is a single fundamental mechanism causing all non-determinism:
+
+**`is_redundant_with_impl` (relation.rs:301) has `cycle_initial=true`, and which queries
+encounter cycles depends on thread execution order.**
+
+This affects the system in two ways:
+
+1. **Union simplification varies** (Groups A-D, F-G): When building unions during cycle recovery,
+   `is_redundant_with` may or may not hit a cycle for each pair of types. The `true` cycle-initial
+   value means "this type IS redundant" — so when a cycle is hit, extra elements get filtered out,
+   producing a simpler (possibly incorrect) union. When no cycle is hit, extra elements survive,
+   producing a wider (possibly incorrect) union.
+
+2. **Overload resolution varies** (Group E): The `sympify` overload resolution produces different
+   return types because the argument types it receives vary (due to the same `is_redundant_with`
+   mechanism affecting upstream union building).
+
+## Affected Code Locations in ty
+
+| File | Lines | Role |
+|------|-------|------|
+| `types/relation.rs` | 300-317 | `is_redundant_with` with `cycle_initial=true` — **the root cause** |
+| `types/builder.rs` | 714-717 | Union builder calls `is_redundant_with` to filter elements |
+| `types.rs` | 900-955 | `Type::cycle_recover` unions previous and current iteration types |
+| `types.rs` | 12327-12339 | `from_elements_cycle_recovery` builds union during recovery |
+| `types/call/bind.rs` | 575-602 | `Bindings::return_type` unions return types of matching overloads |
+| `types/call/bind.rs` | 2774-2789 | `CallableBinding::return_type` selects first matching overload |
 
 ## Potential Fix Directions
 
-1. **Normalize union types during cycle recovery**: Sort union elements in
-   `UnionType::from_elements_cycle_recovery` to ensure deterministic ordering.
-   This fixes Pattern 3 but not Patterns 1-2.
+1. **Change `is_redundant_with` cycle initial to `false`**: Using `cycle_initial=false` means
+   "when in a cycle, assume types are NOT redundant." This is more conservative — no elements
+   get accidentally filtered — but may cause unions to be wider than necessary.
+   Trade-off: deterministic but potentially wider types.
 
-2. **Ensure cycle convergence produces the same fixpoint regardless of entry point**:
-   The fundamental issue is that `Type::cycle_recover` accumulates different union elements
-   depending on which intermediate types were computed. A possible approach:
-   - During cycle recovery, avoid accumulating intermediate decorator wrapper types
-     (like `T1'return@call_highest_priority`) that are artifacts of the computation path
-   - Or: ensure that `from_elements_cycle_recovery` simplifies unions more aggressively
-     to remove redundant/subsumed types
+2. **Normalize union types during cycle recovery**: Sort union elements in
+   `from_elements_cycle_recovery` to ensure deterministic ordering. This only fixes the
+   cosmetic ordering issue (Group E ordering) but not the presence/absence issue.
 
-3. **Improve decorator type inference**: The `call_highest_priority` decorator's return type
-   should ideally be simplified. The `T1` and `T2` type variables should be resolved to
-   concrete types rather than left as unresolved type variable references in the final type.
+3. **Decouple `is_redundant_with` from Salsa cycle detection**: Instead of using Salsa's
+   cycle detection for `is_redundant_with`, implement a separate mechanism that doesn't
+   depend on query execution order. For example, use a structural comparison that doesn't
+   trigger further type inference queries.
+
+4. **Improve decorator type inference**: Ensure that `@wraps(func)` causes ty to use the
+   wrapped function's signature directly, without analyzing the wrapper body. This would
+   fix Groups A and B by preventing `T'return@call_highest_priority` from appearing in types.
