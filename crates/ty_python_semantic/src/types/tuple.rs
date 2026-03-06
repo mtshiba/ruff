@@ -328,7 +328,7 @@ impl<'db> TupleType<'db> {
 
 fn to_class_type_cycle_initial<'db>(
     db: &'db dyn Db,
-    id: salsa::Id,
+    _id: salsa::Id,
     self_: TupleType<'db>,
 ) -> ClassType<'db> {
     let tuple_class = KnownClass::Tuple
@@ -337,7 +337,7 @@ fn to_class_type_cycle_initial<'db>(
 
     tuple_class.apply_specialization(db, |generic_context| {
         if generic_context.variables(db).len() == 1 {
-            generic_context.specialize_tuple(db, Type::divergent(id), self_)
+            generic_context.specialize_tuple(db, Type::divergent(), self_)
         } else {
             generic_context.default_specialization(db, Some(KnownClass::Tuple))
         }

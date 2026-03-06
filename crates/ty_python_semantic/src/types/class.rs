@@ -81,13 +81,13 @@ use ty_module_resolver::{KnownModule, file_to_module};
 
 fn implicit_attribute_initial<'db>(
     _db: &'db dyn Db,
-    id: salsa::Id,
+    _id: salsa::Id,
     _class_body_scope: ScopeId<'db>,
     _name: String,
     _target_method_decorator: MethodDecorator,
 ) -> Member<'db> {
     Member {
-        inner: Place::bound(Type::divergent(id)).into(),
+        inner: Place::bound(Type::divergent()).into(),
     }
 }
 
