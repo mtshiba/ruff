@@ -97,7 +97,7 @@ fn definition_cycle_initial<'db>(
     id: salsa::Id,
     definition: Definition<'db>,
 ) -> DefinitionInference<'db> {
-    DefinitionInference::cycle_initial(definition.scope(db), Type::divergent(id))
+    DefinitionInference::cycle_initial(definition.scope(db), Type::divergent())
 }
 
 /// Infer types for all deferred type expressions in a [`Definition`].
@@ -137,7 +137,7 @@ fn deferred_cycle_initial<'db>(
     id: salsa::Id,
     definition: Definition<'db>,
 ) -> DefinitionInference<'db> {
-    DefinitionInference::cycle_initial(definition.scope(db), Type::divergent(id))
+    DefinitionInference::cycle_initial(definition.scope(db), Type::divergent())
 }
 
 /// Infer all types for a [`ScopeId`], including all definitions and expressions in that scope.
@@ -184,7 +184,7 @@ pub(crate) fn infer_scope_types<'db>(
 
 #[salsa::tracked(
     returns(ref),
-    cycle_initial=|_, id, _| ScopeInference::cycle_initial(Type::divergent(id)),
+    cycle_initial=|_, id, _| ScopeInference::cycle_initial(Type::divergent()),
     cycle_fn=|db, cycle, previous: &ScopeInference<'db>, inference: ScopeInference<'db>, _| {
         inference.cycle_normalized(db, previous, cycle)
     },
@@ -260,7 +260,7 @@ fn expression_cycle_initial<'db>(
     input: InferExpression<'db>,
 ) -> ExpressionInference<'db> {
     let (expression, _) = input.into_inner(db);
-    let cycle_recovery = Type::divergent(id);
+    let cycle_recovery = Type::divergent();
     ExpressionInference::cycle_initial(expression.scope(db), cycle_recovery)
 }
 
@@ -295,7 +295,7 @@ pub(crate) fn infer_expression_type<'db>(
 }
 
 #[salsa::tracked(
-    cycle_initial=|_, id, _| Type::divergent(id),
+    cycle_initial=|_, id, _| Type::divergent(),
     cycle_fn=|db, cycle, previous: &Type<'db>, result: Type<'db>, _| {
         result.cycle_normalized(db, *previous, cycle)
     },
@@ -435,7 +435,7 @@ impl<'db> TypeContext<'db> {
 /// during this unpacking.
 #[salsa::tracked(
     returns(ref),
-    cycle_initial=|_, id, _| UnpackResult::cycle_initial(Type::divergent(id)),
+    cycle_initial=|_, id, _| UnpackResult::cycle_initial(Type::divergent()),
     cycle_fn=|db, cycle, previous: &UnpackResult<'db>, result: UnpackResult<'db>, _| {
         result.cycle_normalized(db, previous, cycle)
     },

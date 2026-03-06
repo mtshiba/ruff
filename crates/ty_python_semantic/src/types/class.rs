@@ -87,7 +87,7 @@ fn implicit_attribute_initial<'db>(
     _target_method_decorator: MethodDecorator,
 ) -> Member<'db> {
     Member {
-        inner: Place::bound(Type::divergent(id)).into(),
+        inner: Place::bound(Type::divergent()).into(),
     }
 }
 
