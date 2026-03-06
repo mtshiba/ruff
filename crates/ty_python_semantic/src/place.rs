@@ -862,6 +862,7 @@ impl<'db> From<Place<'db>> for PlaceAndQualifiers<'db> {
     cycle_fn=|db, cycle, previous: &PlaceAndQualifiers<'db>, place: PlaceAndQualifiers<'db>, _, _, _, _| {
         place.cycle_normalized(db, *previous, cycle)
     },
+    cycle_finalize=|db, value: PlaceAndQualifiers<'db>, _| value.map_type(|ty| ty.with_sorted_unions(db)),
     heap_size=ruff_memory_usage::heap_size
 )]
 pub(crate) fn place_by_id<'db>(

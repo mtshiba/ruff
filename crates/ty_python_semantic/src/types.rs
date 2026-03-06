@@ -6,7 +6,9 @@ use rustc_hash::FxHashMap;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use bitflags::bitflags;
@@ -699,6 +701,27 @@ impl<'db> DataclassParams<'db> {
             params.field_specifiers(db),
         )
     }
+}
+
+/// A deterministic total ordering for `Type` values, used exclusively to canonicalize
+/// union/intersection element order after cycle convergence. This does NOT require
+/// types to be "normalized" in the semantic sense; it just provides a stable sort key.
+fn type_deterministic_order<'db>(_db: &'db dyn Db, a: &Type<'db>, b: &Type<'db>) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    let key = |ty: &Type<'db>| -> (u64, u64) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::mem::discriminant(ty).hash(&mut hasher);
+        let disc = hasher.finish();
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        ty.hash(&mut hasher);
+        let full = hasher.finish();
+
+        (disc, full)
+    };
+    key(a).cmp(&key(b))
 }
 
 /// Representation of a type: a set of possible values at runtime.
@@ -1793,6 +1816,32 @@ impl<'db> Type<'db> {
     ///   as these are irrelevant to whether a callable type `X` is equivalent to a callable type `Y`.
     /// - Strips the types of default values from parameters in `Callable` types: only whether a parameter
     ///   *has* or *does not have* a default value is relevant to whether two `Callable` types  are equivalent.
+    /// Sort union elements in a deterministic canonical order without changing type
+    /// representations. This is lighter-weight than [`Type::normalized`] which also
+    /// transforms type representations.
+    #[must_use]
+    pub(crate) fn with_sorted_unions(self, db: &'db dyn Db) -> Self {
+        match self {
+            Type::Union(union) => {
+                let mut elements: Vec<Type<'db>> = union
+                    .elements(db)
+                    .iter()
+                    .map(|ty| ty.with_sorted_unions(db))
+                    .collect();
+                elements.sort_by(|a, b| type_deterministic_order(db, a, b));
+                if *union.elements(db) == *elements {
+                    return self;
+                }
+                Type::Union(UnionType::new(
+                    db,
+                    elements.into_boxed_slice(),
+                    union.recursively_defined(db),
+                ))
+            }
+            _ => self,
+        }
+    }
+
     /// - Converts class-based protocols into synthesized protocols
     /// - Converts class-based typeddicts into synthesized typeddicts
     /// - Converts all literal types to their promotable form
@@ -2624,6 +2673,7 @@ impl<'db> Type<'db> {
         cycle_fn=|db, cycle, previous: &PlaceAndQualifiers<'db>, member: PlaceAndQualifiers<'db>, _, _, _| {
             member.cycle_normalized(db, *previous, cycle)
         },
+        cycle_finalize=|db, value: PlaceAndQualifiers<'db>, _| value.map_type(|ty| ty.with_sorted_unions(db)),
         heap_size=ruff_memory_usage::heap_size
     )]
     fn class_member_with_policy(
@@ -3197,6 +3247,7 @@ impl<'db> Type<'db> {
         cycle_fn=|db, cycle, previous: &PlaceAndQualifiers<'db>, member: PlaceAndQualifiers<'db>, _, _, _| {
             member.cycle_normalized(db, *previous, cycle)
         },
+        cycle_finalize=|db, value: PlaceAndQualifiers<'db>, _| value.map_type(|ty| ty.with_sorted_unions(db)),
         heap_size=ruff_memory_usage::heap_size
     )]
     pub(crate) fn member_lookup_with_policy(
@@ -6290,6 +6341,7 @@ impl<'db> Type<'db> {
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, _| {
             value.cycle_normalized(db, *previous, cycle)
         },
+        cycle_finalize=|db, value: Type<'db>, _| value.with_sorted_unions(db),
         heap_size=ruff_memory_usage::heap_size
     )]
     pub(crate) fn apply_specialization(
@@ -6915,6 +6967,7 @@ impl<'db> Type<'db> {
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, ()| {
             value.cycle_normalized(db, *previous, cycle)
         },
+        cycle_finalize=|db, value: Type<'db>, _| value.with_sorted_unions(db),
         heap_size=ruff_memory_usage::heap_size
     )]
     fn expand_eagerly_(self, db: &'db dyn Db, _unit: ()) -> Type<'db> {
@@ -11974,6 +12027,7 @@ impl<'db> PEP695TypeAliasType<'db> {
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _| {
             value.cycle_normalized(db, *previous, cycle)
         },
+        cycle_finalize=|db, value: Type<'db>, _| value.with_sorted_unions(db),
         heap_size=ruff_memory_usage::heap_size
     )]
     fn raw_value_type(self, db: &'db dyn Db) -> Type<'db> {

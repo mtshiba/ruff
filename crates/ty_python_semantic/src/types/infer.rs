@@ -71,6 +71,7 @@ mod tests;
     cycle_fn=|db, cycle, previous: &DefinitionInference<'db>, inference: DefinitionInference<'db>, _| {
         inference.cycle_normalized(db, previous, cycle)
     },
+    cycle_finalize=|db, value: DefinitionInference<'db>, _| value.with_sorted_unions(db),
     heap_size=ruff_memory_usage::heap_size
 )]
 pub(crate) fn infer_definition_types<'db>(
@@ -110,6 +111,7 @@ fn definition_cycle_initial<'db>(
     cycle_fn=|db, cycle, previous: &DefinitionInference<'db>, inference: DefinitionInference<'db>, _| {
         inference.cycle_normalized(db, previous, cycle)
     },
+    cycle_finalize=|db, value: DefinitionInference<'db>, _| value.with_sorted_unions(db),
     heap_size=ruff_memory_usage::heap_size
 )]
 pub(crate) fn infer_deferred_types<'db>(
@@ -188,6 +190,7 @@ pub(crate) fn infer_scope_types<'db>(
     cycle_fn=|db, cycle, previous: &ScopeInference<'db>, inference: ScopeInference<'db>, _| {
         inference.cycle_normalized(db, previous, cycle)
     },
+    cycle_finalize=|db, value: ScopeInference<'db>, _| value.with_sorted_unions(db),
     heap_size=ruff_memory_usage::heap_size
 )]
 pub(crate) fn infer_scope_types_impl<'db>(
@@ -225,6 +228,7 @@ pub(crate) fn infer_expression_types<'db>(
     cycle_fn=|db, cycle, previous: &ExpressionInference<'db>, inference: ExpressionInference<'db>, _| {
         inference.cycle_normalized(db, previous, cycle)
     },
+    cycle_finalize=|db, value: ExpressionInference<'db>, _| value.with_sorted_unions(db),
     heap_size=ruff_memory_usage::heap_size
 )]
 pub(super) fn infer_expression_types_impl<'db>(
@@ -299,6 +303,7 @@ pub(crate) fn infer_expression_type<'db>(
     cycle_fn=|db, cycle, previous: &Type<'db>, result: Type<'db>, _| {
         result.cycle_normalized(db, *previous, cycle)
     },
+    cycle_finalize=|db, value: Type<'db>, _| value.with_sorted_unions(db),
     heap_size=ruff_memory_usage::heap_size
 )]
 fn infer_expression_type_impl<'db>(db: &'db dyn Db, input: InferExpression<'db>) -> Type<'db> {
@@ -439,6 +444,7 @@ impl<'db> TypeContext<'db> {
     cycle_fn=|db, cycle, previous: &UnpackResult<'db>, result: UnpackResult<'db>, _| {
         result.cycle_normalized(db, previous, cycle)
     },
+    cycle_finalize=|db, value: UnpackResult<'db>, _| value.with_sorted_unions(db),
     heap_size=ruff_memory_usage::heap_size
 )]
 pub(super) fn infer_unpack_types<'db>(db: &'db dyn Db, unpack: Unpack<'db>) -> UnpackResult<'db> {
@@ -571,6 +577,13 @@ impl<'db> ScopeInference<'db> {
             *ty = ty.cycle_normalized(db, previous_ty, cycle);
         }
 
+        self
+    }
+
+    fn with_sorted_unions(mut self, db: &'db dyn Db) -> ScopeInference<'db> {
+        for ty in self.expressions.values_mut() {
+            *ty = ty.with_sorted_unions(db);
+        }
         self
     }
 
@@ -709,6 +722,19 @@ impl<'db> DefinitionInference<'db> {
             }
         }
 
+        self
+    }
+
+    fn with_sorted_unions(mut self, db: &'db dyn Db) -> DefinitionInference<'db> {
+        for ty in self.expressions.values_mut() {
+            *ty = ty.with_sorted_unions(db);
+        }
+        for (_, binding_ty) in self.bindings.iter_mut() {
+            *binding_ty = binding_ty.with_sorted_unions(db);
+        }
+        for (_, declaration_ty) in self.declarations.iter_mut() {
+            *declaration_ty = declaration_ty.map_type(|ty| ty.with_sorted_unions(db));
+        }
         self
     }
 
@@ -879,5 +905,17 @@ impl<'db> ExpressionInference<'db> {
 
     fn fallback_type(&self) -> Option<Type<'db>> {
         self.extra.as_ref().and_then(|extra| extra.cycle_recovery)
+    }
+
+    fn with_sorted_unions(mut self, db: &'db dyn Db) -> ExpressionInference<'db> {
+        for ty in self.expressions.values_mut() {
+            *ty = ty.with_sorted_unions(db);
+        }
+        if let Some(extra) = self.extra.as_mut() {
+            for (_, binding_ty) in extra.bindings.iter_mut() {
+                *binding_ty = binding_ty.with_sorted_unions(db);
+            }
+        }
+        self
     }
 }

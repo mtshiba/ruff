@@ -252,4 +252,11 @@ impl<'db> UnpackResult<'db> {
 
         self
     }
+
+    pub(crate) fn with_sorted_unions(mut self, db: &'db dyn Db) -> UnpackResult<'db> {
+        for ty in self.targets.values_mut() {
+            *ty = ty.with_sorted_unions(db);
+        }
+        self
+    }
 }
