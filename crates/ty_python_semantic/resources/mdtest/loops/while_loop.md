@@ -220,7 +220,7 @@ x = "A"
 while True:
     reveal_type(x)  # revealed: Literal["A", "C", "D"]
     while True:
-        reveal_type(x)  # revealed: Literal["A", "B", "C", "D"]
+        reveal_type(x)  # revealed: Literal["A", "C", "D", "B"]
         if random():
             x = "B"
             continue
@@ -290,7 +290,7 @@ while random():
     if x == "E":
         break
     reveal_type(x)  # revealed: Literal["B", "D"]
-reveal_type(x)  # revealed: Literal["E", "A", "B", "C", "D"]
+reveal_type(x)  # revealed: Literal["A", "B", "C", "D", "E"]
 ```
 
 ### Functions and classes defined in loops count as bindings and are visible via loopback
@@ -443,7 +443,7 @@ y = 2
 while random():
     if x:
         x, y = y, x
-    reveal_type(x)  # revealed: Literal[1, 2]
+    reveal_type(x)  # revealed: Literal[2, 1]
     reveal_type(y)  # revealed: Literal[1, 2]
 ```
 

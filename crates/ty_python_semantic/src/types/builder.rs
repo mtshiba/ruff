@@ -37,7 +37,7 @@
 //! (unless exactly the same literal type), we can avoid many unnecessary redundancy checks.
 
 use crate::types::enums::{enum_member_literals, enum_metadata};
-use crate::types::type_ordering::{structural_type_ordering, union_or_intersection_elements_ordering};
+use crate::types::type_ordering::union_or_intersection_elements_ordering;
 use crate::types::{
     BytesLiteralType, ClassLiteral, EnumLiteralType, IntersectionType, KnownClass,
     LiteralValueType, LiteralValueTypeKind, NegativeIntersectionElements, StringLiteralType, Type,
@@ -754,12 +754,7 @@ impl<'db> UnionBuilder<'db> {
         self.try_build().unwrap_or(Type::Never)
     }
 
-    pub(crate) fn try_build(mut self) -> Option<Type<'db>> {
-        // Force ordering for recursively-defined unions to ensure deterministic output
-        // regardless of non-deterministic query execution order during cycle recovery.
-        if self.recursively_defined.is_yes() {
-            self.order_elements = true;
-        }
+    pub(crate) fn try_build(self) -> Option<Type<'db>> {
         let mut types = vec![];
         for element in self.elements {
             match element {
@@ -787,13 +782,7 @@ impl<'db> UnionBuilder<'db> {
             }
         }
         if self.order_elements {
-            if self.recursively_defined.is_yes() {
-                types.sort_unstable_by(|l, r| structural_type_ordering(self.db, l, r));
-            } else {
-                types.sort_unstable_by(|l, r| {
-                    union_or_intersection_elements_ordering(self.db, l, r)
-                });
-            }
+            types.sort_unstable_by(|l, r| union_or_intersection_elements_ordering(self.db, l, r));
         }
         match types.len() {
             0 => None,
