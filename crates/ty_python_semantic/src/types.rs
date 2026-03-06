@@ -1219,6 +1219,22 @@ impl<'db> Type<'db> {
         })
     }
 
+    /// Replace bare `TypeVar` occurrences with `Unknown`.
+    ///
+    /// This replaces `TypeVar` at the top level or as a union element.
+    /// `TypeVar`s inside `Callable` generic contexts are intentional and left
+    /// untouched.
+    pub(crate) fn replace_bare_typevars_with_unknown(self, db: &'db dyn Db) -> Type<'db> {
+        match self {
+            Type::TypeVar(_) => Type::unknown(),
+            Type::Union(union) => union.map(db, |elem| match elem {
+                Type::TypeVar(_) => Type::unknown(),
+                other => *other,
+            }),
+            other => other,
+        }
+    }
+
     pub(crate) const fn as_special_form(self) -> Option<SpecialFormType> {
         match self {
             Type::SpecialForm(special_form) => Some(special_form),

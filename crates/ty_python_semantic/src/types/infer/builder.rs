@@ -10414,6 +10414,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 bindings.return_type(self.db())
             });
 
+        // Replace any bare TypeVars that leaked from the decorator's generic context.
+        // During cycle recovery, intermediate iterations may produce types containing
+        // unresolved TypeVars (e.g. `T'return@call_highest_priority`) that get merged
+        // into the final result via `cycle_normalized`'s union. By replacing them with
+        // `Unknown` here, we prevent these TypeVars from leaking into user-visible types.
+        let return_ty = return_ty.replace_bare_typevars_with_unknown(self.db());
+
         // When a method on a class is decorated with a function that returns a
         // `Callable`, assume that the returned callable is also function-like (or
         // classmethod-like or staticmethod-like). See "Decorating a method with

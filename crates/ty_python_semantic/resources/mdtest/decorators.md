@@ -365,3 +365,54 @@ class Baz: ...
 # TODO: the revealed type should ideally be `type[int]` (the decorator's return type)
 reveal_type(Baz)  # revealed: <class 'Baz'>
 ```
+
+## Generic decorator returning a callable
+
+A generic decorator factory should not leak its TypeVars into the decorated function's type. The
+TypeVars should either be resolved from the decorated function's signature or replaced with
+`Unknown`.
+
+```py
+from typing import Callable, TypeVar
+
+T1 = TypeVar("T1")
+T2 = TypeVar("T2")
+T3 = TypeVar("T3")
+
+def decorator_factory(name: str) -> Callable[[Callable[[T1, T2], T3]], Callable[[T1, T2], T3]]:
+    def decorator(func: Callable[[T1, T2], T3]) -> Callable[[T1, T2], T3]:
+        return func
+    return decorator
+
+class Foo:
+    @decorator_factory("other")
+    def method(self, other: int) -> str:
+        return ""
+
+# The TypeVars should be resolved, not leaked as T1, T2, T3:
+reveal_type(Foo().method)  # revealed: (int, /) -> str
+```
+
+Even when the decorated function has no type annotations, the TypeVars from the decorator should not
+leak:
+
+```py
+from typing import Callable, TypeVar
+
+T1 = TypeVar("T1")
+T2 = TypeVar("T2")
+T3 = TypeVar("T3")
+
+def decorator_factory(name: str) -> Callable[[Callable[[T1, T2], T3]], Callable[[T1, T2], T3]]:
+    def decorator(func: Callable[[T1, T2], T3]) -> Callable[[T1, T2], T3]:
+        return func
+    return decorator
+
+class Bar:
+    @decorator_factory("other")
+    def method(self, other):
+        return 1
+
+# TypeVars should be resolved to Unknown for untyped parameters, not leaked:
+reveal_type(Bar().method)  # revealed: (Unknown, /) -> Unknown
+```
