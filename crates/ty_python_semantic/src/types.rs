@@ -1219,16 +1219,24 @@ impl<'db> Type<'db> {
         })
     }
 
-    /// Replace bare `TypeVar` occurrences with `Unknown`.
+    /// Replace bare `TypeVar` occurrences that belong to the given generic context
+    /// with `Unknown`.
     ///
-    /// This replaces `TypeVar` at the top level or as a union element.
-    /// `TypeVar`s inside `Callable` generic contexts are intentional and left
-    /// untouched.
-    pub(crate) fn replace_bare_typevars_with_unknown(self, db: &'db dyn Db) -> Type<'db> {
+    /// This replaces `TypeVar` at the top level or as a union element, but only if
+    /// the `TypeVar` is bound in the specified generic context. `TypeVar`s from other
+    /// contexts (e.g., `Self` from a class) are preserved.
+    pub(crate) fn replace_typevars_in_generic_context_with_unknown(
+        self,
+        db: &'db dyn Db,
+        context: GenericContext<'db>,
+    ) -> Type<'db> {
+        let is_from_context = |tv: BoundTypeVarInstance<'db>| -> bool {
+            context.binds_typevar(db, tv.typevar(db)).is_some()
+        };
         match self {
-            Type::TypeVar(_) => Type::unknown(),
+            Type::TypeVar(tv) if is_from_context(tv) => Type::unknown(),
             Type::Union(union) => union.map(db, |elem| match elem {
-                Type::TypeVar(_) => Type::unknown(),
+                Type::TypeVar(tv) if is_from_context(*tv) => Type::unknown(),
                 other => *other,
             }),
             other => other,

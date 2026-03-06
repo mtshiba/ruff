@@ -10406,20 +10406,30 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         let call_arguments = CallArguments::positional([decorated_ty]);
-        let return_ty = decorator_ty
-            .try_call(self.db(), &call_arguments)
-            .map(|bindings| bindings.return_type(self.db()))
-            .unwrap_or_else(|CallError(_, bindings)| {
-                bindings.report_diagnostics(&self.context, decorator_node.into());
-                bindings.return_type(self.db())
-            });
+        let (return_ty, decorator_generic_context) =
+            match decorator_ty.try_call(self.db(), &call_arguments) {
+                Ok(bindings) => {
+                    let ctx = Self::decorator_generic_context(self.db(), &bindings);
+                    (bindings.return_type(self.db()), ctx)
+                }
+                Err(CallError(_, bindings)) => {
+                    bindings.report_diagnostics(&self.context, decorator_node.into());
+                    let ctx = Self::decorator_generic_context(self.db(), &bindings);
+                    (bindings.return_type(self.db()), ctx)
+                }
+            };
 
-        // Replace any bare TypeVars that leaked from the decorator's generic context.
+        // Replace bare TypeVars that leaked from the decorator's generic context.
         // During cycle recovery, intermediate iterations may produce types containing
         // unresolved TypeVars (e.g. `T'return@call_highest_priority`) that get merged
-        // into the final result via `cycle_normalized`'s union. By replacing them with
-        // `Unknown` here, we prevent these TypeVars from leaking into user-visible types.
-        let return_ty = return_ty.replace_bare_typevars_with_unknown(self.db());
+        // into the final result via `cycle_normalized`'s union. By replacing only
+        // TypeVars bound in the decorator's generic context, we avoid accidentally
+        // erasing legitimate TypeVars like `Self` from the return type.
+        let return_ty = if let Some(ctx) = decorator_generic_context {
+            return_ty.replace_typevars_in_generic_context_with_unknown(self.db(), ctx)
+        } else {
+            return_ty
+        };
 
         // When a method on a class is decorated with a function that returns a
         // `Callable`, assume that the returned callable is also function-like (or
@@ -10429,6 +10439,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         propagatable_kind
             .and_then(|kind| propagate_callable_kind(self.db(), return_ty, kind))
             .unwrap_or(return_ty)
+    }
+
+    /// Extract the decorator's generic context from its call bindings.
+    ///
+    /// If the decorator is a generic callable, returns the generic context that was
+    /// used for specialization. This allows us to identify which `TypeVar`s belong to
+    /// the decorator and should be replaced if they leak into the return type.
+    fn decorator_generic_context(
+        db: &'db dyn Db,
+        bindings: &Bindings<'db>,
+    ) -> Option<GenericContext<'db>> {
+        bindings
+            .iter_flat()
+            .flat_map(CallableBinding::matching_overloads)
+            .find_map(|(_, binding)| binding.specialization().map(|s| s.generic_context(db)))
     }
 
     /// Infer the argument types for a single binding.
