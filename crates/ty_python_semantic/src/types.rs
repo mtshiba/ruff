@@ -834,8 +834,8 @@ impl<'db> Type<'db> {
         Self::Dynamic(DynamicType::Unknown)
     }
 
-    pub(crate) fn divergent() -> Self {
-        Self::Dynamic(DynamicType::Divergent(DivergentType))
+    pub(crate) fn divergent(id: salsa::Id) -> Self {
+        Self::Dynamic(DynamicType::Divergent(DivergentType { id }))
     }
 
     pub(crate) const fn is_divergent(&self) -> bool {
@@ -934,10 +934,14 @@ impl<'db> Type<'db> {
                 // current cycle, if the most-recent type does not. This cannot cause an
                 // oscillation, since Divergent is only introduced at the start of fixpoint
                 // iteration.
-                let has_divergent_type = |ty| {
-                    any_over_type(db, ty, false, |nested_ty| nested_ty.is_divergent())
+                let has_divergent_type_in_cycle = |ty| {
+                    any_over_type(db, ty, false, |nested_ty| {
+                        nested_ty
+                            .as_divergent()
+                            .is_some_and(|DivergentType { id }| cycle.head_ids().contains(&id))
+                    })
                 };
-                if has_divergent_type(previous) && !has_divergent_type(self) {
+                if has_divergent_type_in_cycle(previous) && !has_divergent_type_in_cycle(self) {
                     self
                 } else {
                     // The current type is unioned to the previous type. Unioning in the reverse order can cause the fixed-point iterations to converge slowly or even fail.
@@ -1894,10 +1898,11 @@ impl<'db> Type<'db> {
     /// If this continues, the query will not converge, so this method is called in the cycle recovery function.
     /// Then `tuple[tuple[Divergent, Literal[1]], Literal[1]]` is replaced with `tuple[Divergent, Literal[1]]` and the query converges.
     #[must_use]
-    pub(crate) fn recursive_type_normalized(self, db: &'db dyn Db, _cycle: &salsa::Cycle) -> Self {
-        let div = Type::divergent();
-        self.recursive_type_normalized_impl(db, div, false)
-            .unwrap_or(div)
+    pub(crate) fn recursive_type_normalized(self, db: &'db dyn Db, cycle: &salsa::Cycle) -> Self {
+        cycle.head_ids().fold(self, |ty, id| {
+            ty.recursive_type_normalized_impl(db, Type::divergent(id), false)
+                .unwrap_or(Type::divergent(id))
+        })
     }
 
     /// Normalizes types including divergent types (recursive types), which is necessary for convergence of fixed-point iteration.
@@ -2615,7 +2620,7 @@ impl<'db> Type<'db> {
     }
 
     #[salsa::tracked(
-        cycle_initial=|_, id, _, _, _| Place::bound(Type::divergent()).into(),
+        cycle_initial=|_, id, _, _, _| Place::bound(Type::divergent(id)).into(),
         cycle_fn=|db, cycle, previous: &PlaceAndQualifiers<'db>, member: PlaceAndQualifiers<'db>, _, _, _| {
             member.cycle_normalized(db, *previous, cycle)
         },
@@ -3188,7 +3193,7 @@ impl<'db> Type<'db> {
     /// Similar to [`Type::member`], but allows the caller to specify what policy should be used
     /// when looking up attributes. See [`MemberLookupPolicy`] for more information.
     #[salsa::tracked(
-        cycle_initial=|_, id, _, _, _| Place::bound(Type::divergent()).into(),
+        cycle_initial=|_, id, _, _, _| Place::bound(Type::divergent(id)).into(),
         cycle_fn=|db, cycle, previous: &PlaceAndQualifiers<'db>, member: PlaceAndQualifiers<'db>, _, _, _| {
             member.cycle_normalized(db, *previous, cycle)
         },
@@ -6281,7 +6286,7 @@ impl<'db> Type<'db> {
     /// different operation that is performed explicitly (via a subscript operation), or implicitly
     /// via a call to the generic object.
     #[salsa::tracked(
-        cycle_initial=|_, id, _, _| Type::divergent(),
+        cycle_initial=|_, id, _, _| Type::divergent(id),
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, _| {
             value.cycle_normalized(db, *previous, cycle)
         },
@@ -6906,7 +6911,7 @@ impl<'db> Type<'db> {
 
     #[allow(clippy::used_underscore_binding)]
     #[salsa::tracked(
-        cycle_initial=|_, id, _, ()| Type::divergent(),
+        cycle_initial=|_, id, _, ()| Type::divergent(id),
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, ()| {
             value.cycle_normalized(db, *previous, cycle)
         },
@@ -7768,7 +7773,10 @@ impl<'db> KnownInstanceType<'db> {
 /// Otherwise, type inference cannot converge properly.
 /// For detailed properties of this type, see the unit test at the end of the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::Update)]
-pub struct DivergentType;
+pub struct DivergentType {
+    /// The query ID that caused the cycle.
+    id: salsa::Id,
+}
 
 // The Salsa heap is tracked separately.
 impl get_size2::GetSize for DivergentType {}
@@ -8717,7 +8725,7 @@ impl<'db> TypeVarInstance<'db> {
 
     /// Returns the "unchecked" default type of a type variable instance.
     /// `lazy_default` checks if the default type is not self-referential.
-    #[salsa::tracked(cycle_initial=|_, id, _| Some(Type::divergent()), cycle_fn=lazy_default_cycle_recover, heap_size=ruff_memory_usage::heap_size)]
+    #[salsa::tracked(cycle_initial=|_, id, _| Some(Type::divergent(id)), cycle_fn=lazy_default_cycle_recover, heap_size=ruff_memory_usage::heap_size)]
     fn lazy_default_unchecked(self, db: &'db dyn Db) -> Option<Type<'db>> {
         fn convert_type_to_paramspec_value<'db>(db: &'db dyn Db, ty: Type<'db>) -> Type<'db> {
             let parameters = match ty {
@@ -11962,7 +11970,7 @@ impl<'db> PEP695TypeAliasType<'db> {
     /// The RHS type of a PEP-695 style type alias with *no* specialization applied.
     /// Returns `Divergent` if the type alias is defined cyclically.
     #[salsa::tracked(
-        cycle_initial=|_, id, _| Type::divergent(),
+        cycle_initial=|_, id, _| Type::divergent(id),
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _| {
             value.cycle_normalized(db, *previous, cycle)
         },
@@ -13496,7 +13504,7 @@ pub(crate) mod tests {
     #[test]
     fn divergent_type() {
         let db = setup_db();
-        let div = Type::divergent();
+        let div = Type::divergent(salsa::plumbing::Id::from_bits(1));
 
         // The `Divergent` type must not be eliminated in union with other dynamic types,
         // as this would prevent detection of divergent type inference using `Divergent`.
