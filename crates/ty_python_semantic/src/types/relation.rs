@@ -298,7 +298,11 @@ impl<'db> Type<'db> {
     ///
     /// See [`TypeRelation::Redundancy`] for more details.
     pub(super) fn is_redundant_with(self, db: &'db dyn Db, other: Type<'db>) -> bool {
-        #[salsa::tracked(cycle_initial=|_, _, _, _| false, heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(
+            cycle_initial=|_, _, _, _| false,
+            cycle_fn=|_db, _cycle, prev: &bool, current: bool, _, _| *prev || current,
+            heap_size=ruff_memory_usage::heap_size,
+        )]
         fn is_redundant_with_impl<'db>(
             db: &'db dyn Db,
             self_ty: Type<'db>,
