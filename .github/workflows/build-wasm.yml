@@ -44,8 +44,12 @@ jobs:
         with:
           version: v0.13.1
       - uses: jetli/wasm-bindgen-action@20b33e20595891ab1a0ed73145d8a21fc96e7c29 # v0.2.0
+      - name: "Install wasm-opt"
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq binaryen
       - name: "Run wasm-pack build"
         run: wasm-pack build --target ${{ matrix.target }} crates/ruff_wasm
+      - name: "Optimize wasm binary size"
+        run: wasm-opt -Oz crates/ruff_wasm/pkg/ruff_wasm_bg.wasm -o crates/ruff_wasm/pkg/ruff_wasm_bg.wasm
       - name: "Rename generated package"
         run: | # Replace the package name w/ jq
           jq '.name="@astral-sh/ruff-wasm-${{ matrix.target }}"' crates/ruff_wasm/pkg/package.json > /tmp/package.json
