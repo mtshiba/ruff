@@ -6,7 +6,7 @@
   "scripts": {
     "prebuild": "npm run build:wasm",
     "build": "vite build",
-    "build:wasm": "wasm-pack build ../../crates/ty_wasm --target web --out-dir ../../playground/ty/ty_wasm && wasm-opt -Oz ../../playground/ty/ty_wasm/ty_wasm_bg.wasm -o ../../playground/ty/ty_wasm/ty_wasm_bg.wasm",
+    "build:wasm": "cargo build --profile minimal-size --target wasm32-unknown-unknown --lib -p ty_wasm && wasm-bindgen --target web --out-dir ../../playground/ty/ty_wasm ../../target/wasm32-unknown-unknown/minimal-size/ty_wasm.wasm && wasm-opt -Oz ../../playground/ty/ty_wasm/ty_wasm_bg.wasm -o ../../playground/ty/ty_wasm/ty_wasm_bg.wasm",
     "dev:wasm": "wasm-pack build ../../crates/ty_wasm --dev --target web --out-dir ../../playground/ty/ty_wasm",
     "predev:build": "npm run dev:wasm",
     "dev:build": "vite build",

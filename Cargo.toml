@@ -302,6 +302,7 @@ codegen-units = 1
 inherits = "release"
 opt-level = "z"
 codegen-units = 1
+strip = true
 
 [profile.dev.package.insta]
 opt-level = 3
