@@ -1,8 +1,12 @@
+#[cfg(feature = "watch")]
 pub use project_watcher::ProjectWatcher;
 use ruff_db::system::{SystemPath, SystemPathBuf, SystemVirtualPathBuf};
+#[cfg(feature = "watch")]
 pub use watcher::{EventHandler, Watcher, directory_watcher};
 
+#[cfg(feature = "watch")]
 mod project_watcher;
+#[cfg(feature = "watch")]
 mod watcher;
 
 /// Classification of a file system change event.

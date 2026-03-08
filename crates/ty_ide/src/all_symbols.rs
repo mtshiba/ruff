@@ -37,53 +37,36 @@ pub fn all_symbols<'db>(
         let results = &results;
         let query = &query;
 
-        rayon::scope(move |s| {
-            // For each file, extract symbols and add them to results
-            for module in modules {
-                let db = db.dyn_clone();
-                let Some(file) = module.file(&*db) else {
-                    continue;
-                };
-
-                // Note that this will always consider namespace
-                // packages to be "not firsty party." This isn't
-                // necessarily correct, and we can probably improve
-                // on this in response to user feedback. (At time
-                // of writing, 2026-02-13, we don't really handle
-                // namespace packages in auto-import anyway.)
+        // Pre-filter modules to identify eligible ones before processing.
+        let eligible: Vec<_> = modules
+            .into_iter()
+            .filter_map(|module| {
+                let file = module.file(&*db)?;
                 let is_non_first_party = module
                     .search_path(&*db)
                     .is_none_or(|sp| !sp.is_first_party());
-
-                // By convention, modules starting with an underscore
-                // are generally considered unexported. However, we
-                // should consider first party modules fair game.
-                //
-                // Note that we apply this recursively. e.g.,
-                // `numpy._core.multiarray` is considered private
-                // because it's a child of `_core`.
-                if is_non_first_party && module.name(&*db).components().any(|c| c.starts_with('_'))
+                if is_non_first_party
+                    && module
+                        .name(&*db)
+                        .components()
+                        .any(|c| c.starts_with('_'))
                 {
-                    continue;
+                    return None;
                 }
-
-                // Test modules in third-party packages are almost never
-                // useful to import. We filter out:
-                // - Modules where a non-root component is "test" or "tests"
-                //   (e.g., `numpy.tests.test_core`)
-                // - Modules named "conftest" (pytest configuration)
-                //
-                // Note: We intentionally keep top-level "testing" modules
-                // like `pandas.testing` since those provide utilities meant
-                // for external use.
                 if is_non_first_party && is_test_module(module.name(&*db)) {
-                    continue;
+                    return None;
                 }
-                // TODO: also make it available in `TYPE_CHECKING` blocks
-                // (we'd need https://github.com/astral-sh/ty/issues/1553 to do this well)
                 if !is_typing_extensions_available && module.name(&*db) == &typing_extensions {
-                    continue;
+                    return None;
                 }
+                Some((module, file, is_non_first_party))
+            })
+            .collect();
+
+        #[cfg(feature = "rayon")]
+        rayon::scope(move |s| {
+            for (module, file, is_non_first_party) in eligible {
+                let db = db.dyn_clone();
                 s.spawn(move |_| {
                     let symbols_for_file_span = tracing::debug_span!(
                         parent: all_symbols_span,
@@ -97,8 +80,6 @@ pub fn all_symbols<'db>(
                         symbols.push(AllSymbolInfo::from_module(&*db, module, file));
                     }
                     for (_, symbol) in symbols_for_file_global_only(&*db, file).search(query) {
-                        // Test functions (starting with `test_`) in third-party
-                        // packages are almost never useful to import.
                         if is_non_first_party && symbol.name.starts_with("test_") {
                             continue;
                         }
@@ -113,6 +94,33 @@ pub fn all_symbols<'db>(
                 });
             }
         });
+
+        #[cfg(not(feature = "rayon"))]
+        for (module, file, is_non_first_party) in eligible {
+            let symbols_for_file_span = tracing::debug_span!(
+                parent: all_symbols_span,
+                "symbols_for_file_global_only",
+                path = %file.path(&*db),
+            );
+            let _entered = symbols_for_file_span.entered();
+
+            let mut symbols = vec![];
+            if query.is_match_symbol_name(module.name(&*db)) {
+                symbols.push(AllSymbolInfo::from_module(&*db, module, file));
+            }
+            for (_, symbol) in symbols_for_file_global_only(&*db, file).search(query) {
+                if is_non_first_party && symbol.name.starts_with("test_") {
+                    continue;
+                }
+                symbols.push(AllSymbolInfo::from_non_module_symbol(
+                    &*db,
+                    symbol.to_owned(),
+                    module,
+                    file,
+                ));
+            }
+            results.lock().unwrap().extend(symbols);
+        }
     }
     merge::merge(db, results.into_inner().unwrap())
 }

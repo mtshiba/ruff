@@ -25,26 +25,31 @@ pub fn workspace_symbols(db: &dyn Db, query: &str) -> Vec<WorkspaceSymbolInfo> {
         let query = &query;
         let workspace_symbols_span = &workspace_symbols_span;
 
-        rayon::scope(move |s| {
-            // For each file, extract symbols and add them to results
-            for file in files.iter() {
-                let db = db.dyn_clone();
-                s.spawn(move |_| {
-                    let symbols_for_file_span = tracing::debug_span!(parent: workspace_symbols_span, "symbols_for_file", ?file);
-                    let _entered = symbols_for_file_span.entered();
+        let process_file = |db: &dyn Db, file: File| {
+            let symbols_for_file_span =
+                tracing::debug_span!(parent: workspace_symbols_span, "symbols_for_file", ?file);
+            let _entered = symbols_for_file_span.entered();
 
-                    for (_, symbol) in symbols_for_file(&*db, *file).search(query) {
-                        // It seems like we could do better here than
-                        // locking `results` for every single symbol,
-                        // but this works pretty well as it is.
-                        results.lock().unwrap().push(WorkspaceSymbolInfo {
-                            symbol: symbol.to_owned(),
-                            file: *file,
-                        });
-                    }
+            for (_, symbol) in symbols_for_file(db, file).search(query) {
+                results.lock().unwrap().push(WorkspaceSymbolInfo {
+                    symbol: symbol.to_owned(),
+                    file,
                 });
             }
+        };
+
+        #[cfg(feature = "rayon")]
+        rayon::scope(move |s| {
+            for file in files.iter() {
+                let db = db.dyn_clone();
+                s.spawn(move |_| process_file(&*db, *file));
+            }
         });
+
+        #[cfg(not(feature = "rayon"))]
+        for file in files.iter() {
+            process_file(&*db, *file);
+        }
     }
 
     results.into_inner().unwrap()

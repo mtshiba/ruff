@@ -294,43 +294,45 @@ impl Project {
             let db = db.clone();
             let project_span = &project_span;
 
+            let check_single_file = |db: &ProjectDatabase, file: File, reporter: &dyn ProgressReporter| {
+                let check_file_span =
+                    tracing::debug_span!(parent: project_span, "check_file", ?file);
+                let _entered = check_file_span.entered();
+
+                match check_file_impl(db, file) {
+                    Ok(diagnostics) => {
+                        reporter.report_checked_file(db, file, diagnostics);
+
+                        // This is outside `check_file_impl` to avoid that opening or closing
+                        // a file invalidates the `check_file_impl` query of every file!
+                        if !open_files.contains(&file) {
+                            let parsed = parsed_module(db, file);
+                            parsed.clear();
+                        }
+                    }
+                    Err(io_error) => {
+                        reporter.report_checked_file(
+                            db,
+                            file,
+                            std::slice::from_ref(io_error),
+                        );
+                    }
+                }
+            };
+
+            #[cfg(feature = "rayon")]
             rayon::scope(move |scope| {
                 for file in &files {
                     let db = db.clone();
                     let reporter = &*reporter;
-                    scope.spawn(move |_| {
-                        let check_file_span =
-                            tracing::debug_span!(parent: project_span, "check_file", ?file);
-                        let _entered = check_file_span.entered();
-
-                        match check_file_impl(&db, file) {
-                            Ok(diagnostics) => {
-                                reporter.report_checked_file(&db, file, diagnostics);
-
-                                // This is outside `check_file_impl` to avoid that opening or closing
-                                // a file invalidates the `check_file_impl` query of every file!
-                                if !open_files.contains(&file) {
-                                    // The module has already been parsed by `check_file_impl`.
-                                    // We only retrieve it here so that we can call `clear` on it.
-                                    let parsed = parsed_module(&db, file);
-
-                                    // Drop the AST now that we are done checking this file. It is not currently open,
-                                    // so it is unlikely to be accessed again soon. If any queries need to access the AST
-                                    // from across files, it will be re-parsed.
-                                    parsed.clear();
-                                }
-                            }
-                            Err(io_error) => {
-                                reporter.report_checked_file(
-                                    &db,
-                                    file,
-                                    std::slice::from_ref(io_error),
-                                );
-                            }
-                        }
-                    });
+                    scope.spawn(move |_| check_single_file(&db, file, reporter));
                 }
             });
+
+            #[cfg(not(feature = "rayon"))]
+            for file in &files {
+                check_single_file(&db, file, &*reporter);
+            }
         };
 
         tracing::debug!(

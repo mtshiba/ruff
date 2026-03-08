@@ -30,13 +30,13 @@ ty_vendored = { workspace = true }
 anyhow = { workspace = true }
 camino = { workspace = true }
 colored = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam = { workspace = true, optional = true }
 get-size2 = { workspace = true, features = ["ordermap"] }
 globset = { workspace = true }
-notify = { workspace = true }
+notify = { workspace = true, optional = true }
 ordermap = { workspace = true, features = ["serde"] }
 pep440_rs = { workspace = true, features = ["version-ranges"] }
-rayon = { workspace = true }
+rayon = { workspace = true, optional = true }
 regex = { workspace = true }
 regex-automata = { workspace = true }
 rustc-hash = { workspace = true }
@@ -56,7 +56,8 @@ ruff_python_trivia = { workspace = true }
 insta = { workspace = true, features = ["redactions", "ron"] }
 
 [features]
-default = ["zstd"]
+default = ["zstd", "watch", "rayon"]
+watch = ["dep:notify", "dep:crossbeam"]
 deflate = ["ty_vendored/deflate"]
 schemars = [
     "dep:schemars",
