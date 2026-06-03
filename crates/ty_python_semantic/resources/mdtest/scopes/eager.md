@@ -288,6 +288,32 @@ def _():
         x = 2
 ```
 
+The same rule applies to member bindings. A nested function should not treat a member assignment in
+the enclosing class body as a visible binding, even when the member root has the same name:
+
+```py
+class MemberGlobal:
+    y: int = 1
+
+class MemberLocal:
+    y: str = "local"
+
+member_target = MemberGlobal()
+
+def _():
+    class A:
+        member_target = MemberLocal()
+        member_target.y = "class"
+
+        def f():
+            reveal_type(member_target.y)  # revealed: int
+
+        # TODO: should be `int`. The comprehension should skip class-body member bindings just as
+        # the nested function does, but we currently include the synthetic nested binding from the
+        # class body.
+        [reveal_type(member_target.y) for _ in [1]]  # revealed: Literal["class"]
+```
+
 ### Eager scope within a lazy scope
 
 The list comprehension is an eager scope, and it is enclosed within a function definition, which is

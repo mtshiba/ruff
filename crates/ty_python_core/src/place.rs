@@ -246,6 +246,12 @@ impl PlaceTable {
         }
     }
 
+    /// Returns `true` if any existing parent of `place_expr` is bound in this scope.
+    pub fn has_bound_parent<'a>(&'a self, place_expr: impl Into<PlaceExprRef<'a>>) -> bool {
+        self.parents(place_expr)
+            .any(|parent_id| self.place(parent_id).is_bound())
+    }
+
     pub fn member_id_by_instance_attribute_name(&self, name: &str) -> Option<ScopedMemberId> {
         self.members.place_id_by_instance_attribute_name(name)
     }

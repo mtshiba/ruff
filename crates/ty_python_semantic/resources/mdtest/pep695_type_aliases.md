@@ -154,6 +154,20 @@ def _(flag: bool):
             reveal_type(x)  # revealed: int | str
 ```
 
+Type aliases defined in a class body can reference names from the immediately enclosing class
+namespace:
+
+```py
+class ClassNamespace:
+    type Alias = Value
+
+    class Value:
+        pass
+
+def _(x: ClassNamespace.Alias):
+    reveal_type(x)  # revealed: Value
+```
+
 ## Generic type aliases
 
 ```py
