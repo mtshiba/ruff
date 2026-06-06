@@ -299,7 +299,8 @@ impl<'db> Type<'db> {
             | Type::TypeForm(_)
             | Type::TypedDict(_)
             | Type::TypeAlias(_)
-            | Type::NewTypeInstance(_) => false,
+            | Type::NewTypeInstance(_)
+            | Type::Recursive(_) => false,
         }
     }
 
@@ -419,7 +420,7 @@ impl<'db> Type<'db> {
     /// Returns whether constraint-set assignability is known to be unconditionally satisfied
     /// before constructing the relation checker.
     fn is_trivially_constraint_set_assignable_to(self, db: &'db dyn Db, target: Type<'db>) -> bool {
-        if self.materialized_divergent_fallback().is_none() && self == target {
+        if self == target {
             return true;
         }
 
@@ -432,14 +433,8 @@ impl<'db> Type<'db> {
         match (self, target) {
             (Type::Never | Type::Dynamic(_), _) | (_, Type::Dynamic(_)) => true,
             (_, Type::NominalInstance(target)) if target.is_object() => true,
-            (_, Type::Union(union)) => {
-                self.materialized_divergent_fallback().is_none()
-                    && union.elements(db).contains(&self)
-            }
-            (Type::Intersection(intersection), _) => {
-                target.materialized_divergent_fallback().is_none()
-                    && intersection.positive(db).contains(&target)
-            }
+            (_, Type::Union(union)) => union.elements(db).contains(&self),
+            (Type::Intersection(intersection), _) => intersection.positive(db).contains(&target),
             _ => false,
         }
     }
@@ -943,12 +938,12 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         source: Type<'db>,
         target: Type<'db>,
     ) -> ConstraintSet<'db, 'c> {
-        if let Some(source) = source.materialized_divergent_fallback() {
-            return self.check_type_pair(db, source, target);
+        if let Type::Recursive(recursive) = source {
+            return self.check_type_pair(db, recursive.unfold(db), target);
         }
 
-        if let Some(target) = target.materialized_divergent_fallback() {
-            return self.check_type_pair(db, source, target);
+        if let Type::Recursive(recursive) = target {
+            return self.check_type_pair(db, source, recursive.unfold(db));
         }
 
         // Subtyping implies assignability, so if subtyping is reflexive and the two types are
@@ -1017,17 +1012,24 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             // It is a subtype of all other types.
             (Type::Never, _) => self.always(),
 
+            (Type::Recursive(recursive), _) => {
+                self.check_type_pair(db, recursive.unfold(db), target)
+            }
+            (_, Type::Recursive(recursive)) => {
+                self.check_type_pair(db, source, recursive.unfold(db))
+            }
+            (Type::Divergent(_), _) | (_, Type::Divergent(_)) => {
+                debug_assert!(
+                    false,
+                    "bare `Divergent` should only appear under `Recursive`"
+                );
+                self.never()
+            }
+
             (Type::TypeVar(source_typevar), Type::TypeVar(target_typevar))
                 if source_typevar.is_same_typevar_as(db, target_typevar) =>
             {
                 self.always()
-            }
-
-            // In some specific situations, `Any`/`Unknown`/`@Todo` can be simplified out of unions and intersections,
-            // but this is not true for divergent types (and moving this case any lower down appears to cause
-            // "too many cycle iterations" panics).
-            (Type::Divergent(_), _) | (_, Type::Divergent(_)) => {
-                ConstraintSet::from_bool(self.constraints, self.relation.is_assignability())
             }
 
             (Type::TypeAlias(source_alias), _) => self.with_recursion_guard(source, target, || {
@@ -2396,12 +2398,12 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
         left: Type<'db>,
         right: Type<'db>,
     ) -> ConstraintSet<'db, 'c> {
-        if let Some(left) = left.materialized_divergent_fallback() {
-            return self.check_type_pair(db, left, right);
+        if let Type::Recursive(recursive) = left {
+            return self.check_type_pair(db, recursive.unfold(db), right);
         }
 
-        if let Some(right) = right.materialized_divergent_fallback() {
-            return self.check_type_pair(db, left, right);
+        if let Type::Recursive(recursive) = right {
+            return self.check_type_pair(db, left, recursive.unfold(db));
         }
 
         match (left, right) {
@@ -3087,6 +3089,10 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                     .check_type_pair(db, dict_str_any, other)
                     .negate(db, self.constraints)
             }
+            (Type::Recursive(recursive), _) => {
+                self.check_type_pair(db, recursive.unfold(db), right)
+            }
+            (_, Type::Recursive(recursive)) => self.check_type_pair(db, left, recursive.unfold(db)),
         }
     }
 

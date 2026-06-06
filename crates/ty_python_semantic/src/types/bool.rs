@@ -319,6 +319,11 @@ impl<'db> Type<'db> {
                     .value_type(db)
                     .try_bool_impl(db, allow_short_circuit, visitor)
             })?,
+            Type::Recursive(recursive) => {
+                recursive
+                    .unfold(db)
+                    .try_bool_impl(db, allow_short_circuit, visitor)?
+            }
             Type::NewTypeInstance(newtype) => {
                 newtype
                     .concrete_base_type(db)

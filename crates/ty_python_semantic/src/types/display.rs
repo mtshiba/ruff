@@ -948,6 +948,10 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'db> {
                 write!(f.with_type(self.ty), "{dynamic}")
             }
             Type::Divergent(_) => f.with_type(self.ty).write_str("Divergent"),
+            Type::Recursive(recursive) => recursive
+                .body(self.db)
+                .display_with(self.db, self.settings.clone())
+                .fmt_detailed(f),
             Type::Never => f.with_type(self.ty).write_str("Never"),
             Type::NominalInstance(instance) => {
                 let class = instance.class(self.db);
@@ -2935,22 +2939,27 @@ struct DisplayMaybeParenthesizedType<'db> {
 
 impl<'db> FmtDetailed<'db> for DisplayMaybeParenthesizedType<'db> {
     fn fmt_detailed(&self, f: &mut TypeWriter<'_, '_, 'db>) -> fmt::Result {
-        let write_parentheses = |f: &mut TypeWriter<'_, '_, 'db>| {
+        let write_parentheses = |ty: Type<'db>, f: &mut TypeWriter<'_, '_, 'db>| {
             f.set_invalid_type_annotation();
             f.write_char('(')?;
-            self.ty
-                .display_with(self.db, self.settings.clone())
+            ty.display_with(self.db, self.settings.clone())
                 .fmt_detailed(f)?;
             f.write_char(')')
         };
         match self.ty {
-            ty if should_parenthesize_callable_type(ty, self.db) => write_parentheses(f),
+            Type::Recursive(recursive) => DisplayMaybeParenthesizedType {
+                ty: recursive.body(self.db),
+                db: self.db,
+                settings: self.settings.clone(),
+            }
+            .fmt_detailed(f),
+            ty if should_parenthesize_callable_type(ty, self.db) => write_parentheses(ty, f),
             Type::KnownBoundMethod(_)
             | Type::FunctionLiteral(_)
             | Type::BoundMethod(_)
-            | Type::Union(_) => write_parentheses(f),
+            | Type::Union(_) => write_parentheses(self.ty, f),
             Type::Intersection(intersection) if !intersection.has_one_element(self.db) => {
-                write_parentheses(f)
+                write_parentheses(self.ty, f)
             }
             _ => self
                 .ty

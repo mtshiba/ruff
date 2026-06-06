@@ -1536,12 +1536,6 @@ impl<'db> InnerIntersectionBuilder<'db> {
             return;
         }
 
-        if let Some(negated_divergent) = new_negative.negated_divergent() {
-            *self = Self::default();
-            self.positive.insert(negated_divergent);
-            return;
-        }
-
         let contains_bool = || {
             self.positive
                 .iter()

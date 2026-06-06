@@ -473,8 +473,8 @@ fn typed_dict_subscript<'db>(
     typed_dict: TypedDictType<'db>,
     slice_ty: Type<'db>,
 ) -> Result<Type<'db>, SubscriptError<'db>> {
-    if let Some(fallback) = slice_ty.materialized_divergent_fallback() {
-        return typed_dict_subscript(db, typed_dict, fallback);
+    if let Type::Recursive(recursive) = slice_ty {
+        return typed_dict_subscript(db, typed_dict, recursive.unfold(db));
     }
 
     if slice_ty.is_dynamic() {
@@ -517,18 +517,31 @@ impl<'db> Type<'db> {
         slice_ty: Type<'db>,
         expr_context: ast::ExprContext,
     ) -> Result<Type<'db>, SubscriptError<'db>> {
-        if let Some(fallback) = self.materialized_divergent_fallback() {
-            return fallback.subscript(db, slice_ty, expr_context);
+        if let Type::Recursive(recursive) = self {
+            return recursive.unfold(db).subscript(db, slice_ty, expr_context);
         }
 
-        if let Some(fallback) = slice_ty.materialized_divergent_fallback() {
-            return self.subscript(db, fallback, expr_context);
+        if let Type::Recursive(recursive) = slice_ty {
+            return self.subscript(db, recursive.unfold(db), expr_context);
         }
 
         let value_ty = self;
 
         let inferred = match (value_ty, slice_ty) {
-            (Type::Dynamic(_) | Type::Divergent(_) | Type::Never, _) => Some(Ok(value_ty)),
+            (Type::Dynamic(_) | Type::Never, _) => Some(Ok(value_ty)),
+            (Type::Divergent(_), _) => {
+                debug_assert!(
+                    false,
+                    "bare `Divergent` should only appear under `Recursive`"
+                );
+                Some(Ok(value_ty))
+            }
+            (Type::Recursive(recursive), _) => {
+                Some(recursive.unfold(db).subscript(db, slice_ty, expr_context))
+            }
+            (_, Type::Recursive(recursive)) => {
+                Some(value_ty.subscript(db, recursive.unfold(db), expr_context))
+            }
 
             (Type::TypeAlias(alias), _) => {
                 Some(alias.value_type(db).subscript(db, slice_ty, expr_context))

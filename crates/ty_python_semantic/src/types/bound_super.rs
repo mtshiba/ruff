@@ -603,6 +603,9 @@ impl<'db> BoundSuperType<'db> {
             Type::Never => SuperOwnerKind::Dynamic(DynamicType::Unknown),
             Type::Dynamic(dynamic) => SuperOwnerKind::Dynamic(dynamic),
             Type::Divergent(divergent) => SuperOwnerKind::Divergent(divergent),
+            Type::Recursive(recursive) => {
+                return Self::build(db, pivot_class_type, recursive.unfold(db));
+            }
             Type::ClassLiteral(class) => SuperOwnerKind::Resolved(Self::resolve_class_super_owner(
                 db,
                 pivot_class,

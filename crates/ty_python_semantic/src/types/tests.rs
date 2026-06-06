@@ -278,6 +278,26 @@ fn divergent_type() {
 }
 
 #[test]
+fn recursive_type_normalization_folds_same_marker_recursive_subterm() {
+    let db = setup_db();
+    let marker = DivergentType::new(salsa::plumbing::Id::from_bits(1));
+    let div = Type::Divergent(marker);
+    let list_div = KnownClass::List.to_specialized_instance(&db, &[div]);
+    let recursive = Type::Recursive(RecursiveType::new(&db, marker, list_div));
+    // Exercise a `Recursive` binder nested inside a nominal container.
+    let nested_recursive = KnownClass::List.to_specialized_instance(&db, &[recursive]);
+
+    assert_eq!(
+        nested_recursive.recursive_type_normalized_impl(&db, div, false),
+        Some(list_div)
+    );
+    assert_eq!(
+        nested_recursive.recursive_type_normalized_impl(&db, div, true),
+        None
+    );
+}
+
+#[test]
 fn type_alias_variance() {
     use crate::db::tests::TestDb;
     use crate::place::global_symbol;

@@ -77,8 +77,10 @@ impl<'db> Type<'db> {
         policy: UpcastPolicy,
         context: CallableUpcastContext<'db>,
     ) -> Option<CallableTypes<'db>> {
-        if let Some(fallback) = self.materialized_divergent_fallback() {
-            return fallback.try_upcast_to_callable_with_policy_and_context(db, policy, context);
+        if let Type::Recursive(recursive) = self {
+            return Type::Recursive(recursive)
+                .unfold_recursive(db)
+                .try_upcast_to_callable_with_policy_and_context(db, policy, context);
         }
 
         match self {
@@ -92,6 +94,9 @@ impl<'db> Type<'db> {
                 db,
                 Signature::dynamic(self),
             ))),
+            Type::Recursive(recursive) => recursive
+                .unfold(db)
+                .try_upcast_to_callable_with_policy_and_context(db, policy, context),
 
             Type::FunctionLiteral(function_literal)
                 if context.is_recursive_reference(db, function_literal) =>

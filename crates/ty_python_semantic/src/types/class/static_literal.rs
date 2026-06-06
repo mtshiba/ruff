@@ -2174,8 +2174,8 @@ impl<'db> StaticClassLiteral<'db> {
 
     #[salsa::tracked(
         cycle_fn=implicit_attribute_cycle_recover,
-        cycle_initial=|_, id, _, _, _| Member {
-            inner: Place::bound(Type::divergent(id)).into(),
+        cycle_initial=|db, id, _, _, _| Member {
+            inner: Place::bound(Type::recursive_initial(db, id)).into(),
         },
         heap_size=ruff_memory_usage::heap_size,
     )]
@@ -3077,10 +3077,10 @@ fn explicit_bases_cycle_initial<'db>(
 ) -> Box<[Type<'db>]> {
     let module = parsed_module(db, literal.file(db)).load(db);
     let class_stmt = literal.node(db, &module);
-    // Try to produce a list of `Divergent` types of the right length. However, if one or more of
+    // Try to produce a list of recursive cycle initials of the right length. However, if one or more of
     // the bases is a starred expression, we don't know how many entries that will eventually
     // expand to.
-    vec![Type::divergent(id); class_stmt.bases().len()].into_boxed_slice()
+    vec![Type::recursive_initial(db, id); class_stmt.bases().len()].into_boxed_slice()
 }
 
 fn explicit_bases_cycle_fn<'db>(

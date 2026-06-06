@@ -2514,7 +2514,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             attr_ty
         };
 
+        if let Type::Recursive(recursive) = object_ty {
+            return self.validate_attribute_assignment(
+                target,
+                recursive.unfold(db),
+                attribute,
+                infer_value_ty,
+                emit_diagnostics,
+            );
+        }
+
         match object_ty {
+            Type::Recursive(recursive) => self.validate_attribute_assignment(
+                target,
+                recursive.unfold(db),
+                attribute,
+                infer_value_ty,
+                emit_diagnostics,
+            ),
             Type::Union(union) => {
                 let mut infer_value_ty = MultiInferenceGuard::new(infer_value_ty);
 
@@ -2638,7 +2655,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 false
             }
 
-            Type::Dynamic(..) | Type::Divergent(_) | Type::Never => {
+            Type::Dynamic(..) | Type::Never => {
+                infer_value_ty(self, TypeContext::default());
+                true
+            }
+            Type::Divergent(_) => {
+                debug_assert!(
+                    false,
+                    "bare `Divergent` should only appear under `Recursive`"
+                );
                 infer_value_ty(self, TypeContext::default());
                 true
             }
@@ -3213,7 +3238,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> bool {
         let db = self.db();
 
+        if let Type::Recursive(recursive) = object_ty {
+            return self.validate_attribute_deletion(
+                target,
+                recursive.unfold(db),
+                attribute,
+                emit_diagnostics,
+            );
+        }
+
         match object_ty {
+            Type::Recursive(recursive) => self.validate_attribute_deletion(
+                target,
+                recursive.unfold(db),
+                attribute,
+                emit_diagnostics,
+            ),
             Type::Union(union) => {
                 for element_ty in union.elements(db) {
                     if !self.validate_attribute_deletion(
@@ -3446,6 +3486,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 | Type::TypeForm(_)
                 | Type::TypedDict(_)
                 | Type::NewTypeInstance(_) => object_ty.instance_member(db, attribute),
+                Type::Recursive(recursive) => recursive.unfold(db).instance_member(db, attribute),
                 Type::ClassLiteral(..) | Type::GenericAlias(..) | Type::SubclassOf(..) => {
                     object_ty.class_object_member(db, attribute, MemberLookupPolicy::default())
                 }
@@ -5214,6 +5255,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }),
                 Type::TypeAlias(alias) => {
                     propagate_callable_kind(db, alias.value_type(db), kind, provenance)
+                }
+                Type::Recursive(recursive) => {
+                    propagate_callable_kind(db, recursive.unfold(db), kind, provenance)
                 }
                 // Intersections are currently not handled here because that would require
                 // the decorator to be explicitly annotated as returning an intersection.
@@ -9895,6 +9939,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             (ast::UnaryOp::Invert | ast::UnaryOp::UAdd | ast::UnaryOp::USub, Type::Dynamic(_))
             | (_, Type::Divergent(_)) => operand_type,
             (_, Type::Never) => Type::Never,
+
+            (_, Type::Recursive(recursive)) => {
+                self.infer_unary_expression_type(op, recursive.unfold(self.db()), unary)
+            }
 
             (_, Type::TypeAlias(alias)) => {
                 self.infer_unary_expression_type(op, alias.value_type(self.db()), unary)

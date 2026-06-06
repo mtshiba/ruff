@@ -164,6 +164,7 @@ impl<'db> AllMembers<'db> {
 
     fn extend_with_type(&mut self, db: &'db dyn Db, ty: Type<'db>) {
         match ty {
+            Type::Recursive(recursive) => self.extend_with_type(db, recursive.unfold(db)),
             Type::Union(union) => {
                 fn is_dynamic(db: &dyn Db, ty: Type<'_>) -> bool {
                     // We don't need to use recursion here because

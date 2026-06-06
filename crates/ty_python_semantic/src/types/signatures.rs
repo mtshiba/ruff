@@ -149,7 +149,7 @@ impl<'db> CallableSignature<'db> {
     pub(crate) fn cycle_initial(db: &'db dyn Db, id: salsa::Id) -> Self {
         Self::single(Signature::new(
             Parameters::bottom(),
-            Type::divergent(id).bottom_materialization(db),
+            Type::recursive_initial(db, id),
         ))
     }
 
@@ -160,7 +160,7 @@ impl<'db> CallableSignature<'db> {
                 if signature.generic_context.is_none()
                     && signature.definition.is_none()
                     && signature.parameters == Parameters::bottom()
-                    && signature.return_ty.is_divergent()
+                    && matches!(signature.return_ty, Type::Divergent(_) | Type::Recursive(_))
         )
     }
 
