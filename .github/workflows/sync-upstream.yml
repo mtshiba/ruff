@@ -1,0 +1,30 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Run daily at 03:23 JST (18:23 UTC).
+    - cron: "23 18 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: main
+      - name: Merge upstream main
+        run: |
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/astral-sh/ruff.git
+          git fetch upstream main
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
