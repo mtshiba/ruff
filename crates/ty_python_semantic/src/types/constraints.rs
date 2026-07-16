@@ -111,7 +111,7 @@ use crate::types::visitor::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BoundTypeVarInstance, IntersectionType, Type, TypeContext,
-    TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance, UnionType,
+    TypeMapping, TypePair, TypeVarBoundOrConstraints, TypeVarVariance, UnionType,
 };
 use crate::{Db, FxIndexMap, FxIndexSet, FxOrderSet};
 
@@ -273,6 +273,16 @@ impl<'db> OwnedConstraintSet<'db> {
         }
     }
 
+    /// Returns `true` if this constraint set's root is the `always` terminal.
+    ///
+    /// This is only a cheap sufficient check. A nonterminal constraint set can also be always
+    /// satisfied, so `false` does not prove that the set is not always satisfied. Call
+    /// [`ConstraintSet::is_always_satisfied`] through [`Self::query`] when false negatives are not
+    /// acceptable.
+    pub(crate) fn is_trivially_always_satisfied(&self) -> bool {
+        self.node == ALWAYS_TRUE
+    }
+
     /// Loads this constraint set into a new builder, invokes a callback with that builder, and
     /// returns the result.
     ///
@@ -291,6 +301,16 @@ impl<'db> OwnedConstraintSet<'db> {
         };
         let set = ConstraintSet::from_node(&builder, self.node);
         f(&builder, set)
+    }
+
+    pub(crate) fn types(&self) -> impl Iterator<Item = Type<'db>> + '_ {
+        self.inner.iter().flat_map(|inner| {
+            inner.constraints.iter().flat_map(|constraint| {
+                std::iter::once(Type::TypeVar(constraint.typevar))
+                    .chain(constraint.bounds.lower)
+                    .chain(constraint.bounds.upper)
+            })
+        })
     }
 }
 
@@ -582,7 +602,6 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
     }
 
     /// Applies a type mapping to every constraint in this constraint set.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by a stacked follow-up"))]
     pub(crate) fn apply_type_mapping_impl(
         self,
         db: &'db dyn Db,
@@ -657,13 +676,19 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
                     Constraint::new_node_with_bounds(db, builder, typevar, lower, upper)
                 } else {
                     let lower_holds = lower.map_or(ALWAYS_TRUE, |lower| {
-                        lower
-                            .when_constraint_set_assignable_to(db, subject, builder)
+                        builder
+                            .load(
+                                db,
+                                &lower.when_constraint_set_assignable_to_owned(db, subject),
+                            )
                             .node
                     });
                     let upper_holds = upper.map_or(ALWAYS_TRUE, |upper| {
-                        subject
-                            .when_constraint_set_assignable_to(db, upper, builder)
+                        builder
+                            .load(
+                                db,
+                                &subject.when_constraint_set_assignable_to_owned(db, upper),
+                            )
                             .node
                     });
                     lower_holds.and_with_offset(builder, upper_holds)
@@ -1031,6 +1056,27 @@ impl<'db> ConstraintSetBuilder<'db> {
             .inner
             .as_ref()
             .expect("storage-free owned constraint sets must have terminal roots");
+
+        if inner.nodes.len() == 1 {
+            let old_interior = inner.nodes[inner.retained_node_index(other.node)];
+            let old_constraint =
+                inner.constraints[inner.retained_constraint_index(old_interior.constraint)];
+            let condition = Constraint::new_node_with_bounds(
+                db,
+                self,
+                old_constraint.typevar,
+                old_constraint.bounds.lower,
+                old_constraint.bounds.upper,
+            )
+            .with_adjusted_source_order(self, old_interior.source_order.saturating_sub(1));
+            let node = condition.ite_uncertain(
+                self,
+                old_interior.if_true,
+                old_interior.if_uncertain,
+                old_interior.if_false,
+            );
+            return ConstraintSet::from_node(self, node);
+        }
 
         // Load all of the constraints into the this builder first, to maximize the chance that the
         // constraints and typevars will appear in the same order. (This is important because many
@@ -3648,16 +3694,13 @@ impl<'db> Type<'db> {
 
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _, _| true,
+    cycle_initial = |_, _, _| true,
     heap_size = get_size2::GetSize::get_heap_size
 )]
-fn is_possibly_constraint_set_assignable<'db>(
-    db: &'db dyn Db,
-    source: Type<'db>,
-    target: Type<'db>,
-) -> bool {
-    source
-        .when_constraint_set_assignable_to_owned(db, target)
+fn is_possibly_constraint_set_assignable<'db>(db: &'db dyn Db, types: TypePair<'db>) -> bool {
+    types
+        .first(db)
+        .when_constraint_set_assignable_to_owned(db, types.second(db))
         .query(|_builder, when| !when.is_never_satisfied(db))
 }
 
@@ -3908,7 +3951,10 @@ impl<'db> PathBounds<'db> {
                         }
                     }
 
-                    if !is_possibly_constraint_set_assignable(db, lower, declared_upper) {
+                    if !is_possibly_constraint_set_assignable(
+                        db,
+                        TypePair::new(db, lower, declared_upper),
+                    ) {
                         // This path does not satisfy the typevar's declared upper bound, and is
                         // therefore not a valid specialization.
                         return Err(());

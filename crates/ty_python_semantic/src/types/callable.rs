@@ -1,4 +1,3 @@
-use ruff_python_ast::name::Name;
 use rustc_hash::FxHashSet;
 use smallvec::{SmallVec, smallvec_inline};
 
@@ -114,7 +113,7 @@ impl<'db> Type<'db> {
                 let call_symbol = self
                     .member_lookup_with_policy(
                         db,
-                        Name::new_static("__call__"),
+                        "__call__",
                         MemberLookupPolicy::NO_INSTANCE_FALLBACK,
                     )
                     .place;
@@ -592,9 +591,19 @@ impl<'db> CallableType<'db> {
     }
 
     pub(crate) fn apply_self(self, db: &'db dyn Db, self_type: Type<'db>) -> CallableType<'db> {
+        self.apply_self_with_receiver(db, self_type, self_type)
+    }
+
+    pub(crate) fn apply_self_with_receiver(
+        self,
+        db: &'db dyn Db,
+        receiver_type: Type<'db>,
+        self_type: Type<'db>,
+    ) -> CallableType<'db> {
         CallableType::new(
             db,
-            self.signatures(db).apply_self(db, self_type),
+            self.signatures(db)
+                .apply_self_with_receiver(db, receiver_type, self_type),
             self.kind(db),
             self.provenance(db),
         )
