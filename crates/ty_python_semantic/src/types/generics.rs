@@ -438,15 +438,24 @@ impl<'db> GenericContext<'db> {
         db: &'db dyn Db,
         binding_context: Option<BindingContext<'db>>,
     ) -> Self {
-        Self::from_typevar_instances(
-            db,
-            self.variables(db).filter(|bound_typevar| {
-                !(bound_typevar.typevar(db).is_self(db)
-                    && binding_context.is_none_or(|binding_context| {
-                        bound_typevar.binding_context(db) == binding_context
-                    }))
-            }),
-        )
+        #[salsa::tracked(returns(copy), heap_size=ruff_memory_usage::heap_size)]
+        fn remove_self_inner<'db>(
+            db: &'db dyn Db,
+            generic_context: GenericContext<'db>,
+            binding_context: Option<BindingContext<'db>>,
+        ) -> GenericContext<'db> {
+            GenericContext::from_typevar_instances(
+                db,
+                generic_context.variables(db).filter(|bound_typevar| {
+                    !(bound_typevar.typevar(db).is_self(db)
+                        && binding_context.is_none_or(|binding_context| {
+                            bound_typevar.binding_context(db) == binding_context
+                        }))
+                }),
+            )
+        }
+
+        remove_self_inner(db, self, binding_context)
     }
 
     /// Returns the typevars that are inferable in this generic context. This set might include
@@ -2830,7 +2839,13 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 if remaining_actual.is_never() {
                     return Ok(());
                 }
-                self.add_type_mapping(*formal_bound_typevar, remaining_actual, polarity);
+                // Infer through the TypeVar arm so its bound or constraints are still enforced.
+                return self.infer_map_impl(
+                    Type::TypeVar(*formal_bound_typevar),
+                    remaining_actual,
+                    polarity,
+                    seen,
+                );
             }
             (Type::Union(union_formal), _) => {
                 // If the formal is a union and the actual is a bare inferable TypeVar in an
