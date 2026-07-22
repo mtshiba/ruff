@@ -2232,10 +2232,10 @@ impl<'db> Bindings<'db> {
                         }
 
                         Some(KnownFunction::Len) => {
-                            if let [Some(first_arg)] = overload.parameter_types() {
-                                if let Some(len_ty) = first_arg.len(db) {
-                                    overload.set_return_type(len_ty);
-                                }
+                            if let [Some(first_arg)] = overload.parameter_types()
+                                && let Some(len_ty) = first_arg.len(db)
+                            {
+                                overload.set_return_type(len_ty);
                             }
                         }
 
@@ -2268,18 +2268,18 @@ impl<'db> Bindings<'db> {
                             // Similarly to `is_protocol`, we only evaluate to this a frozenset of literal strings if a
                             // class-literal is passed in, not if a generic alias is passed in, to emulate the behaviour
                             // of `typing.get_protocol_members` at runtime.
-                            if let [Some(Type::ClassLiteral(class))] = overload.parameter_types() {
-                                if let Some(protocol_class) = class.into_protocol_class(db) {
-                                    let member_names = protocol_class
-                                        .interface(db)
-                                        .members(db)
-                                        .map(|member| Type::string_literal(db, member.name()));
-                                    let specialization = UnionType::from_elements(db, member_names);
-                                    overload.set_return_type(
-                                        KnownClass::FrozenSet
-                                            .to_specialized_instance(db, &[specialization]),
-                                    );
-                                }
+                            if let [Some(Type::ClassLiteral(class))] = overload.parameter_types()
+                                && let Some(protocol_class) = class.into_protocol_class(db)
+                            {
+                                let member_names = protocol_class
+                                    .interface(db)
+                                    .members(db)
+                                    .map(|member| Type::string_literal(db, member.name()));
+                                let specialization = UnionType::from_elements(db, member_names);
+                                overload.set_return_type(
+                                    KnownClass::FrozenSet
+                                        .to_specialized_instance(db, &[specialization]),
+                                );
                             }
                         }
 
@@ -3144,13 +3144,20 @@ impl<'db> CallableBinding<'db> {
         let Some(bound_self) = self.bound_type.take() else {
             return;
         };
+        let typing_self = match self.callable_type {
+            Type::BoundMethod(bound_method) => bound_method.typing_self_type(db),
+            _ => bound_self,
+        };
         for overload in &mut self.overloads {
             let removed_receiver = overload
                 .signature
                 .parameters()
                 .get(0)
                 .is_some_and(Parameter::is_positional);
-            overload.signature = overload.signature.bind_self(db, Some(bound_self));
+            overload.signature =
+                overload
+                    .signature
+                    .bind_self_with_receiver(db, Some(bound_self), Some(typing_self));
             overload.return_ty = overload.initial_return_type(db);
             overload.source_parameter_index_offset += usize::from(removed_receiver);
         }
@@ -5294,6 +5301,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         if !assignable_to_declared_type {
             builder = SpecializationBuilder::new(self.db, constraints, self.inferable_typevars);
             specialization_errors.clear();
+            self.constraint_set_errors.fill(false);
 
             self.infer_argument_constraints(
                 &mut builder,
@@ -5353,7 +5361,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             Some(promoted)
         };
 
-        let inference = builder.build_inference_with(generic_context, |typevar, bounds| {
+        let mut choose = |typevar: BoundTypeVarInstance<'db>, bounds: Option<&PathBound<'db>>| {
             let bounds = bounds?;
             if let Some(lower) = bounds.lower
                 && let Some(&preferred_ty) = preferred_type_mappings.get(&typevar.identity(self.db))
@@ -5363,7 +5371,30 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             }
 
             maybe_promote(typevar, bounds)
-        });
+        };
+        let inference = match builder.build_inference_with(generic_context, &mut choose) {
+            Ok(inference) => inference,
+            Err(()) => {
+                let parameters = self.signature.parameters();
+                let mut argument_relations = Vec::new();
+                for (argument_index, _, _, argument_types) in self.enumerate_argument_types() {
+                    for matched_parameter in self.argument_matches[argument_index].iter() {
+                        let parameter_index = matched_parameter.index;
+                        if self.is_gradual_variadic_parameter(parameter_index) {
+                            continue;
+                        }
+
+                        let formal = parameters[parameter_index].annotated_type();
+                        let actual = matched_parameter
+                            .argument_type
+                            .unwrap_or_else(|| argument_types.get_for_declared_type(formal));
+                        argument_relations.push((formal, actual));
+                    }
+                }
+
+                builder.build_diagnostic_inference_with(generic_context, argument_relations, choose)
+            }
+        };
         let specialization = inference.specialization(self.db);
 
         self.return_ty = self.return_ty.apply_specialization(self.db, specialization);
@@ -5413,6 +5444,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 );
 
                 if let Err(error) = specialization_result {
+                    self.constraint_set_errors[argument_index] = true;
                     specialization_errors.push(BindingError::SpecializationError {
                         error,
                         argument_index: adjusted_argument_index,

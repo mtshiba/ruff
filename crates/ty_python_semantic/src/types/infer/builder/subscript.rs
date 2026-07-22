@@ -32,10 +32,10 @@ use crate::types::{
     UnionTypeInstance, any_over_type, todo_type,
 };
 use crate::{Db, FxOrderSet};
-use ty_python_core::SemanticIndex;
 use ty_python_core::definition::Definition;
 use ty_python_core::place::{PlaceExpr, PlaceExprRef};
 use ty_python_core::scope::FileScopeId;
+use ty_python_core::{SemanticIndex, place_table};
 
 /// Given a string literal or a union of string literals, return an iterator over the contained
 /// strings, or `None` if the type is neither.
@@ -475,12 +475,44 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }))
         };
 
-        self.infer_explicit_callable_specialization(
+        // Avoid constructing an identity specialization and a full protocol interface for the
+        // many generic protocols that do not directly declare `__class__`.
+        let disable_int_float_special_case = generic_class.is_protocol(db)
+            && place_table(db, generic_class.body_scope(db))
+                .symbol_id("__class__")
+                .is_some()
+            && generic_class
+                .identity_specialization(db)
+                .into_protocol_class(db)
+                .is_some_and(|protocol| {
+                    protocol
+                        .interface(db)
+                        .includes_generic_writable_instance_member(db, "__class__", generic_context)
+                });
+        let previously_disabled_int_float_special_case =
+            disable_int_float_special_case.then(|| {
+                self.context
+                    .inference_flags
+                    .replace(InferenceFlags::DISABLE_INT_FLOAT_SPECIAL_CASE, true)
+            });
+
+        let result = self.infer_explicit_callable_specialization(
             subscript,
             value_ty,
             generic_context,
             specialize,
-        )
+        );
+
+        if let Some(previously_disabled_int_float_special_case) =
+            previously_disabled_int_float_special_case
+        {
+            self.context.inference_flags.set(
+                InferenceFlags::DISABLE_INT_FLOAT_SPECIAL_CASE,
+                previously_disabled_int_float_special_case,
+            );
+        }
+
+        result
     }
 
     pub(super) fn infer_explicit_type_alias_type_specialization(
@@ -491,6 +523,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         generic_context: GenericContext<'db>,
     ) -> Type<'db> {
         let db = self.db();
+        if generic_type_alias.specialization(db).is_some() {
+            if !self.in_string_annotation() {
+                self.infer_expression(&subscript.slice, TypeContext::default());
+            }
+            if let Some(builder) = self.context.report_lint(&NOT_SUBSCRIPTABLE, subscript) {
+                let mut diagnostic =
+                    builder.into_diagnostic("Cannot specialize non-generic type alias");
+                diagnostic.set_primary_message("Double specialization is not allowed");
+            }
+            return Type::unknown();
+        }
+
         let specialize = &|types: &[Option<Type<'db>>]| {
             let type_alias = generic_type_alias.apply_specialization(db, |_| {
                 generic_context.specialize_partial(db, types.iter().copied())
