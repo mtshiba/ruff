@@ -80,7 +80,7 @@ use ty_python_core::semantic_index;
 
 pub(crate) use self::constructor::ConstructorCallableKind;
 
-/// Overrides the lint and top-level message for a call diagnostic emitted from an implicit call.
+/// Overrides the lint and headline message for a call diagnostic emitted from an implicit call.
 ///
 /// The original call-error message is retained on the primary annotation, while `info` explains
 /// why the call happened. `argument_ranges` maps synthetic call arguments back to source ranges.
@@ -2809,7 +2809,10 @@ impl<'db> Bindings<'db> {
                         ));
                     }
 
-                    Type::KnownBoundMethod(KnownBoundMethodType::ConstraintSetForAll(tracked)) => {
+                    Type::KnownBoundMethod(
+                        method @ (KnownBoundMethodType::ConstraintSetExists(tracked)
+                        | KnownBoundMethodType::ConstraintSetForAll(tracked)),
+                    ) => {
                         let [Some(typevars)] = overload.parameter_types() else {
                             continue;
                         };
@@ -2822,11 +2825,12 @@ impl<'db> Bindings<'db> {
 
                         let constraints = ConstraintSetBuilder::new();
                         let result = constraints.into_owned(|constraints| {
-                            constraints.load(db, tracked.constraints(db)).for_all(
-                                db,
-                                constraints,
-                                typevars,
-                            )
+                            let set = constraints.load(db, tracked.constraints(db));
+                            if matches!(method, KnownBoundMethodType::ConstraintSetExists(_)) {
+                                set.reduce_inferable(db, constraints, typevars)
+                            } else {
+                                set.for_all(db, constraints, typevars)
+                            }
                         });
                         let tracked = InternedConstraintSet::new(db, result);
                         overload.set_return_type(Type::KnownInstance(
@@ -7693,12 +7697,12 @@ impl<'db> BindingError<'db> {
                     provenance,
                     InvalidArgumentTypeProvenance::OpenTypedDictExtraItems
                 ) {
-                    diag.set_primary_message(format_args!(
+                    diag.set_primary_annotation_message(format_args!(
                         "Possible extra items in unpacked open `TypedDict` have type \
                          `{provided_ty_display}`, expected `{expected_ty_display}`"
                     ));
                 } else {
-                    diag.set_primary_message(format_args!(
+                    diag.set_primary_annotation_message(format_args!(
                         "Expected `{expected_ty_display}`, found `{provided_ty_display}`"
                     ));
                 }
@@ -7797,7 +7801,7 @@ impl<'db> BindingError<'db> {
                 let mut diag = builder.into_diagnostic(
                     "Argument expression after ** must be a mapping with `str` key type",
                 );
-                diag.set_primary_message(format_args!("Found `{provided_ty_display}`"));
+                diag.set_primary_annotation_message(format_args!("Found `{provided_ty_display}`"));
 
                 if let Some(compound_diag) = compound_diag {
                     compound_diag.add_context(context.db(), &mut diag);
@@ -7989,7 +7993,7 @@ impl<'db> BindingError<'db> {
                     SpecializationError::MismatchedBound { bound_typevar, .. } => {
                         let typevar = bound_typevar.typevar(context.db());
                         let typevar_name = typevar.name(context.db());
-                        diag.set_primary_message(format_args!(
+                        diag.set_primary_annotation_message(format_args!(
                             "Argument type `{argument_ty_display}` does not \
                                 satisfy upper bound `{}` of type variable `{typevar_name}`",
                             typevar
@@ -8003,7 +8007,7 @@ impl<'db> BindingError<'db> {
                     SpecializationError::MismatchedConstraint { bound_typevar, .. } => {
                         let typevar = bound_typevar.typevar(context.db());
                         let typevar_name = typevar.name(context.db());
-                        diag.set_primary_message(format_args!(
+                        diag.set_primary_annotation_message(format_args!(
                             "Argument type `{argument_ty_display}` does not \
                                 satisfy constraints ({}) of type variable `{typevar_name}`",
                             typevar

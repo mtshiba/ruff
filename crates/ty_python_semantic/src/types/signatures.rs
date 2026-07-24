@@ -2281,6 +2281,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     parameter,
                 });
             }
+            // Continuing past a nonterminal contradiction can bind later `ParamSpec`s or
+            // replace the diagnostic context that explains the incompatible parameter.
             !result
                 .intersect(db, self.constraints, constraint_set)
                 .is_never_satisfied(db)

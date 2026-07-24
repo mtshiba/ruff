@@ -661,7 +661,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     self.check_type_pair(db, source_item_field.declared_ty, target_ty),
                 );
 
-                if result.is_never_satisfied(db) {
+                if result.is_trivially_never_satisfied() {
                     return result;
                 }
             }
@@ -685,7 +685,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                             target_item_field.declared_ty,
                         ),
                     );
-                    if result.is_never_satisfied(db) {
+                    if result.is_trivially_never_satisfied() {
                         return result;
                     }
                 }
@@ -880,7 +880,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 }
             };
             result.intersect(db, self.constraints, field_constraints);
-            if result.is_never_satisfied(db) {
+            if result.is_trivially_never_satisfied()
+                || (self.is_context_collection_enabled() && result.is_never_satisfied(db))
+            {
                 if let Some(context) = self.report_context()
                     && let Some(source_item_field) = source_items.get(target_item_name)
                 {
@@ -1462,7 +1464,7 @@ impl<'db> TypedDictKeyAssignment<'_, 'db, '_> {
                     self.key,
                 ));
 
-                diagnostic.set_primary_message(format_args!("key is marked read-only"));
+                diagnostic.set_primary_annotation_message(format_args!("key is marked read-only"));
                 self.add_object_type_annotation(db, &mut diagnostic);
                 Self::add_item_definition_subdiagnostic(
                     db,
@@ -1502,7 +1504,7 @@ impl<'db> TypedDictKeyAssignment<'_, 'db, '_> {
                 self.key,
             ));
 
-            diagnostic.set_primary_message(format_args!("value of type `{value_d}`"));
+            diagnostic.set_primary_annotation_message(format_args!("value of type `{value_d}`"));
 
             diagnostic.annotate(
                 self.context

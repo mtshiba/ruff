@@ -128,7 +128,7 @@ impl<'db> BoundSuperError<'db> {
                         _ => {
                             let mut diagnostic =
                                 builder.into_diagnostic("Argument is not a valid class");
-                            diagnostic.set_primary_message(format_args!(
+                            diagnostic.set_primary_annotation_message(format_args!(
                                 "Argument has type `{}`",
                                 pivot_class.display(context.db())
                             ));
@@ -1009,7 +1009,7 @@ impl<'c, 'db> EquivalenceChecker<'_, 'c, 'db> {
             }
             (ClassBase::TypedDict(_), _) => self.never(),
         };
-        if class_equivalence.is_never_satisfied(db) {
+        if class_equivalence.is_trivially_never_satisfied() {
             return self.never();
         }
         let owner_equivalence = match (left.owner(db), right.owner(db)) {
