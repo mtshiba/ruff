@@ -53,10 +53,12 @@ use crate::{
 };
 use ruff_db::diagnostic::Span;
 use ruff_db::files::File;
+use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
-use ruff_python_ast::{self as ast};
-use ruff_text_size::TextRange;
+use ruff_python_ast::{self as ast, NodeIndex};
+use ruff_text_size::{Ranged, TextRange};
 use ty_python_core::definition::Definition;
+use ty_python_core::scope::ScopeId;
 use ty_python_core::{place_table, use_def_map};
 
 mod dynamic_literal;
@@ -65,6 +67,45 @@ mod known;
 mod named_tuple;
 mod static_literal;
 mod typed_dict;
+
+#[derive(Clone, Copy)]
+enum DynamicClassHeaderAnchor<'db> {
+    Definition(Definition<'db>),
+    ScopeOffset(u32),
+}
+
+/// Returns the source range of a call that creates a dynamic class.
+///
+/// ```python
+/// Color = Enum("Color", "RED GREEN")
+/// #       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/// ```
+fn dynamic_class_header_range<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    anchor: DynamicClassHeaderAnchor<'db>,
+) -> TextRange {
+    let module = parsed_module(db, scope.file(db)).load(db);
+    match anchor {
+        DynamicClassHeaderAnchor::Definition(definition) => definition
+            .kind(db)
+            .value(&module)
+            .expect("dynamic class definitions should only be used for assignments")
+            .range(),
+        DynamicClassHeaderAnchor::ScopeOffset(offset) => {
+            let scope_anchor = scope.node(db).node_index().unwrap_or(NodeIndex::from(0));
+            let anchor_u32 = scope_anchor
+                .as_u32()
+                .expect("anchor should not be NodeIndex::NONE");
+            let absolute_index = NodeIndex::from(anchor_u32 + offset);
+            let node: &ast::ExprCall = module
+                .get_by_index(absolute_index)
+                .try_into()
+                .expect("scope offset should point to ExprCall");
+            node.range()
+        }
+    }
+}
 
 bitflags::bitflags! {
     /// Properties that affect the representation of instances of a class.
@@ -633,13 +674,10 @@ impl<'db> ClassLiteral<'db> {
     /// For static classes, this applies default type arguments.
     /// For dynamic classes, this returns a non-generic class type.
     pub(crate) fn default_specialization(self, db: &'db dyn Db) -> ClassType<'db> {
-        match self {
-            Self::Static(class) => class.default_specialization(db),
-            Self::Dynamic(_)
-            | Self::DynamicNamedTuple(_)
-            | Self::DynamicTypedDict(_)
-            | Self::DynamicEnum(_) => ClassType::NonGeneric(self),
-        }
+        self.as_static().map_or_else(
+            || ClassType::NonGeneric(self),
+            |class| class.default_specialization(db),
+        )
     }
 
     /// Returns the unknown specialization of this class.
@@ -648,24 +686,18 @@ impl<'db> ClassLiteral<'db> {
     /// For a non-specialized generic class, we return a generic alias that maps each of the class's
     /// typevars to `Unknown`.
     pub(crate) fn unknown_specialization(self, db: &'db dyn Db) -> ClassType<'db> {
-        match self {
-            Self::Static(class) => class.unknown_specialization(db),
-            Self::Dynamic(_)
-            | Self::DynamicNamedTuple(_)
-            | Self::DynamicTypedDict(_)
-            | Self::DynamicEnum(_) => ClassType::NonGeneric(self),
-        }
+        self.as_static().map_or_else(
+            || ClassType::NonGeneric(self),
+            |class| class.unknown_specialization(db),
+        )
     }
 
     /// Returns the identity specialization for this class (same as default for non-generic).
     pub(crate) fn identity_specialization(self, db: &'db dyn Db) -> ClassType<'db> {
-        match self {
-            Self::Static(class) => class.identity_specialization(db),
-            Self::Dynamic(_)
-            | Self::DynamicNamedTuple(_)
-            | Self::DynamicTypedDict(_)
-            | Self::DynamicEnum(_) => ClassType::NonGeneric(self),
-        }
+        self.as_static().map_or_else(
+            || ClassType::NonGeneric(self),
+            |class| class.identity_specialization(db),
+        )
     }
 
     /// Returns the generic context if this is a generic class.
@@ -689,13 +721,7 @@ impl<'db> ClassLiteral<'db> {
 
     /// Returns whether this class is `builtins.tuple` exactly
     pub(crate) fn is_tuple(self, db: &'db dyn Db) -> bool {
-        match self {
-            Self::Static(class) => class.is_tuple(db),
-            Self::Dynamic(_)
-            | Self::DynamicNamedTuple(_)
-            | Self::DynamicTypedDict(_)
-            | Self::DynamicEnum(_) => false,
-        }
+        self.as_static().is_some_and(|class| class.is_tuple(db))
     }
 
     /// Return a type representing "the set of all instances of the metaclass of this class".

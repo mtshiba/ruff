@@ -883,9 +883,7 @@ impl<'db> FmtDetailed<'db> for DisplayTypeAliasDeclaration<'db> {
             .display_with(self.db, settings.clone())
             .fmt_detailed(f)?;
         if let Some(generic_context) = generic_context {
-            generic_context
-                .display_with(self.db, settings.clone())
-                .fmt_detailed(f)?;
+            generic_context.display(self.db).fmt_detailed(f)?;
         }
         f.write_str(" = ")?;
         self.value_ty
@@ -1132,7 +1130,6 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'db> {
                         let type_parameters = DisplayOptionalGenericContext {
                             generic_context: signature.generic_context.as_ref(),
                             db: self.db,
-                            settings: self.settings.clone(),
                             hide_unused_self,
                         };
                         f.set_invalid_type_annotation();
@@ -1349,11 +1346,7 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'db> {
                         .write_str(if boolean { "True" } else { "False" })
                 }
                 LiteralValueTypeKind::String(string) => {
-                    write!(
-                        f.with_type(self.ty),
-                        "{}",
-                        string.display_with(self.db, self.settings.clone()),
-                    )
+                    write!(f.with_type(self.ty), "{}", string.display(self.db))
                 }
                 // We used to return `str` as the type here because that feels generally more useful.
                 // However, the inconsistency between the type shown in the inlay hint and its hover, and the
@@ -1647,7 +1640,6 @@ impl<'db> FmtDetailed<'db> for DisplayOverloadLiteral<'db> {
         let type_parameters = DisplayOptionalGenericContext {
             generic_context: signature.generic_context.as_ref(),
             db: self.db,
-            settings: self.settings.clone(),
             hide_unused_self,
         };
 
@@ -1716,7 +1708,6 @@ impl<'db> FmtDetailed<'db> for DisplayFunctionType<'db> {
                 let type_parameters = DisplayOptionalGenericContext {
                     generic_context: signature.generic_context.as_ref(),
                     db: self.db,
-                    settings: settings.clone(),
                     hide_unused_self,
                 };
                 f.set_invalid_type_annotation();
@@ -1825,29 +1816,19 @@ impl Display for DisplayGenericAlias<'_> {
 
 impl<'db> GenericContext<'db> {
     fn display<'a>(&'a self, db: &'db dyn Db) -> DisplayGenericContext<'a, 'db> {
-        Self::display_with(self, db, DisplaySettings::default())
+        DisplayGenericContext {
+            generic_context: self,
+            db,
+            full: false,
+            hide_unused_self: false,
+        }
     }
 
     fn display_full<'a>(&'a self, db: &'db dyn Db) -> DisplayGenericContext<'a, 'db> {
         DisplayGenericContext {
             generic_context: self,
             db,
-            settings: DisplaySettings::default(),
             full: true,
-            hide_unused_self: false,
-        }
-    }
-
-    fn display_with<'a>(
-        &'a self,
-        db: &'db dyn Db,
-        settings: DisplaySettings<'db>,
-    ) -> DisplayGenericContext<'a, 'db> {
-        DisplayGenericContext {
-            generic_context: self,
-            db,
-            settings,
-            full: false,
             hide_unused_self: false,
         }
     }
@@ -1856,7 +1837,6 @@ impl<'db> GenericContext<'db> {
 struct DisplayOptionalGenericContext<'a, 'db> {
     generic_context: Option<&'a GenericContext<'db>>,
     db: &'db dyn Db,
-    settings: DisplaySettings<'db>,
     /// If true, hide `Self` type variables from the generic context prefix
     /// when they are not displayed in the signature body.
     hide_unused_self: bool,
@@ -1868,7 +1848,6 @@ impl<'db> FmtDetailed<'db> for DisplayOptionalGenericContext<'_, 'db> {
             DisplayGenericContext {
                 generic_context,
                 db: self.db,
-                settings: self.settings.clone(),
                 full: false,
                 hide_unused_self: self.hide_unused_self,
             }
@@ -1888,8 +1867,6 @@ impl Display for DisplayOptionalGenericContext<'_, '_> {
 struct DisplayGenericContext<'a, 'db> {
     generic_context: &'a GenericContext<'db>,
     db: &'db dyn Db,
-    #[expect(dead_code)]
-    settings: DisplaySettings<'db>,
     full: bool,
     /// If true, hide `Self` type variables from the generic context prefix.
     hide_unused_self: bool,
@@ -2297,7 +2274,6 @@ impl<'db> FmtDetailed<'db> for DisplaySignature<'_, 'db> {
             DisplayOptionalGenericContext {
                 generic_context: self.generic_context,
                 db: self.db,
-                settings: settings.clone(),
                 hide_unused_self,
             }
             .fmt_detailed(&mut f)?;
@@ -3190,22 +3166,15 @@ impl Display for DisplayTypeArray<'_, '_> {
 }
 
 impl<'db> StringLiteralType<'db> {
-    fn display_with(
-        self,
-        db: &'db dyn Db,
-        settings: DisplaySettings<'db>,
-    ) -> DisplayStringLiteralType<'db> {
+    fn display(self, db: &'db dyn Db) -> DisplayStringLiteralType<'db> {
         DisplayStringLiteralType {
             string: self.value(db),
-            settings,
         }
     }
 }
 
 struct DisplayStringLiteralType<'db> {
     string: &'db str,
-    #[expect(dead_code)]
-    settings: DisplaySettings<'db>,
 }
 
 impl Display for DisplayStringLiteralType<'_> {
