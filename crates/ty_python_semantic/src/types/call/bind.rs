@@ -76,7 +76,7 @@ use crate::types::{
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword, PythonVersion};
-use ty_python_core::semantic_index;
+use ty_python_core::{ProgramFile, semantic_index};
 
 pub(crate) use self::constructor::ConstructorCallableKind;
 
@@ -354,9 +354,9 @@ impl<'db> CallableItem<'db> {
             CallableItem::Regular(binding) => {
                 binding.freshen_generic_contexts_in_place(db, env, nonce_generator);
             }
-            // TODO: Constructor freshening also has to keep constructor instance context in sync
-            // with `__new__`/`__init__` signatures.
-            CallableItem::Constructor(_) => {}
+            CallableItem::Constructor(binding) => {
+                binding.freshen_generic_contexts_in_place(db, env, nonce_generator);
+            }
         }
     }
 
@@ -2305,7 +2305,8 @@ impl<'db> Bindings<'db> {
                                     Type::ModuleLiteral(module_literal) => {
                                         let all_names = module_literal
                                             .module(db)
-                                            .python_file(db)
+                                            .file(db)
+                                            .map(|file| ProgramFile::new(db, file, env.program(db)))
                                             .map(|file| dunder_all_names(db, file))
                                             .unwrap_or_default();
                                         match all_names {
@@ -4321,6 +4322,20 @@ impl<'db> CallableBinding<'db> {
     pub(crate) fn best_failing_overload(&self) -> Option<&Binding<'db>> {
         self.best_failing_overload_index(FailingOverloadSelection::AffectsOverloadResolution)
             .and_then(|index| self.overloads.get(index))
+    }
+
+    /// Returns a failing overload only when the call's argument shape selected it uniquely.
+    ///
+    /// The overload chosen for diagnostics can be arbitrary when multiple signatures accept the
+    /// same argument shape. Its specialization must not determine a constructor's return type:
+    /// for example, `dict(value)` may match the shapes of both mapping and iterable overloads.
+    fn unambiguous_failing_overload(&self) -> Option<&Binding<'db>> {
+        match self.overloads.as_slice() {
+            [overload] => Some(overload),
+            _ => self
+                .matching_overload_before_type_checking
+                .and_then(|index| self.overloads.get(index)),
+        }
     }
 
     /// Returns an iterator over all the mutable overloads that matched for this call binding.
@@ -7658,7 +7673,7 @@ impl<'db> CallableDescription<'db> {
             db: &'db dyn Db,
             function: FunctionType<'db>,
         ) -> Cow<'db, str> {
-            let semantic_index = semantic_index(db, function.python_file(db));
+            let semantic_index = semantic_index(db, function.program_file(db));
             let enclosing_scope = semantic_index.scope(function.definition(db).file_scope(db));
             if let Some(class_node) = enclosing_scope.node().as_class()
                 && let Some(class) =

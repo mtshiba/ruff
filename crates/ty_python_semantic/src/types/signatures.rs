@@ -74,7 +74,7 @@ fn function_signature_expression_type<'db>(
     definition: Definition<'db>,
     expression: &ast::Expr,
 ) -> Type<'db> {
-    let file = definition.python_file(db);
+    let file = definition.program_file(db);
     let index = semantic_index(db, file);
     let file_scope = index.expression_scope_id(expression);
     let scope = file_scope.to_scope_id(db, file);
@@ -92,7 +92,7 @@ fn function_signature_type_expression_flags<'db>(
     definition: Definition<'db>,
     expression: &ast::Expr,
 ) -> TypeExpressionFlags {
-    let file = definition.python_file(db);
+    let file = definition.program_file(db);
     let index = semantic_index(db, file);
     let file_scope = index.expression_scope_id(expression);
     let scope = file_scope.to_scope_id(db, file);
@@ -970,7 +970,7 @@ impl<'db> Signature<'db> {
         })
     }
 
-    fn apply_type_mapping_impl<'a>(
+    pub(super) fn apply_type_mapping_impl<'a>(
         &self,
         db: &'db dyn Db,
         type_mapping: &TypeMapping<'a, 'db>,
@@ -2292,8 +2292,32 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             target
         };
 
-        let source_inferable = source.inferable_typevars(db);
-        let target_inferable = target.inferable_typevars(db);
+        // `inferable` has different roles in the two type-variable evaluation modes:
+        //
+        // * Eager comparisons decide whether the relation holds immediately. An unbound generic
+        //   method's `Self` can have an upper bound such as `C[T]`, so `T` must also be
+        //   inferable; otherwise, a concrete receiver such as `C[int]` is compared against a
+        //   fixed, symbolic `T` and valid higher-order calls are rejected.
+        // * Lazy comparisons record constraints for every type variable, regardless of whether
+        //   it is inferable. Here, `signature_inferable` also determines which type variables
+        //   `reduce_inferable` existentially removes below, so it must contain only variables
+        //   actually bound by these signatures. Including an enclosing class's `T` would turn a
+        //   decorator's return constraint `T <= R` into `exists T. T <= R`, losing the
+        //   relationship needed to infer `R = T`.
+        let include_bound_dependencies = self.typevar_evaluation == TypeVarEvaluation::Eager;
+        let signature_typevars = |signature: &Signature<'db>| {
+            signature
+                .generic_context
+                .map_or(TypeVarSet::None, |context| {
+                    if include_bound_dependencies {
+                        context.inferable_typevars(db)
+                    } else {
+                        TypeVarSet::from_typevars(db, context.variables(db))
+                    }
+                })
+        };
+        let source_inferable = signature_typevars(source);
+        let target_inferable = signature_typevars(target);
         let signature_inferable = source_inferable.merge(db, target_inferable);
         let inferable = self.inferable.merge(db, signature_inferable);
 
@@ -3191,6 +3215,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // A gradual parameter list is a supertype of the "bottom" parameter list (*args: object,
         // **kwargs: object).
         if target.parameters.is_gradual()
+            && (matches!(target.parameters.kind(), ParametersKind::Gradual)
+                || self.typevar_evaluation == TypeVarEvaluation::Lazy)
             && !source.parameters.is_top()
             && source
                 .parameters
@@ -3201,13 +3227,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 .keyword_variadic()
                 .is_some_and(|(_, param)| param.annotated_type().is_object())
         {
-            return self.always();
+            return result;
         }
 
         // The top signature is supertype of (and assignable from) all other signatures. It is a
         // subtype of no signature except itself, and assignable only to the gradual signature.
         if target.parameters.is_top() {
-            return self.always();
+            return result;
         } else if source.parameters.is_top() && !target.parameters.is_gradual() {
             if let Some(context) = self.report_context() {
                 context.push(ErrorContext::TopCallableAssignedToNonTop {
@@ -5337,7 +5363,7 @@ impl<'db> Parameter<'db> {
         parameter: &ast::Parameter,
         kind: ParameterKind<'db>,
     ) -> Self {
-        let index = semantic_index(db, function_definition.python_file(db));
+        let index = semantic_index(db, function_definition.program_file(db));
         let definition = Some(index.expect_single_definition(parameter));
 
         let (annotated_type, inferred_annotation, annotation_flags, has_starred_annotation) =
@@ -5668,13 +5694,13 @@ mod tests {
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::global_symbol;
     use crate::types::{FunctionType, KnownClass, LiteralValueType};
-    use ruff_db::PythonFile;
     use ruff_db::system::DbWithWritableSystem as _;
+    use ty_python_core::ProgramFile;
 
     #[track_caller]
     fn get_function_f<'db>(db: &'db TestDb, file: &'static str) -> FunctionType<'db> {
         let module = ruff_db::files::system_path_to_file(db, file).unwrap();
-        let module = PythonFile::new(db, module, db.python_version());
+        let module = ProgramFile::new(db, module, db.program_environment().program(db));
         global_symbol(db, module, "f")
             .place
             .expect_type()

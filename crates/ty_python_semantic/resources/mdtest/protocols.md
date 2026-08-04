@@ -2015,7 +2015,7 @@ read/write property, a `Final` attribute, or a `ClassVar` attribute:
 ```py
 from typing import ClassVar, Final, Protocol, final
 from ty_extensions import static_assert
-from ty_extensions._internal import is_subtype_of, is_assignable_to, is_disjoint_from
+from ty_extensions._internal import TypeOf, is_subtype_of, is_assignable_to, is_disjoint_from
 
 class HasXProperty(Protocol):
     @property
@@ -2084,6 +2084,18 @@ class HasStrXProperty(Protocol):
 static_assert(not is_assignable_to(XAttrBad, HasXProperty))
 static_assert(not is_assignable_to(HasStrXProperty, HasXProperty))
 static_assert(not is_assignable_to(HasXProperty, HasStrXProperty))
+```
+
+Accessing an instance property on the class object exposes the property descriptor, not the value
+returned by its getter. A class object with only an instance property is therefore disjoint from the
+protocol:
+
+```py
+static_assert(not is_subtype_of(TypeOf[XReadProperty], HasXProperty))
+static_assert(not is_assignable_to(TypeOf[XReadProperty], HasXProperty))
+static_assert(is_disjoint_from(TypeOf[XReadProperty], HasXProperty))
+
+x_class: HasXProperty = XReadProperty  # error: [invalid-assignment]
 ```
 
 A read-only property on a protocol, unlike a mutable attribute, is covariant: `XSub` in the below
@@ -2756,9 +2768,8 @@ has_name: HasCachedName = WithCachedName()
 
 ### Generic descriptor result types
 
-Applying a generic descriptor decorator to a generic protocol method currently loses the protocol's
-type variable and produces `cached_property[Unknown]`. The protocol must preserve that descriptor
-type instead of reducing it to a bare `Unknown`, which would allow an incompatible implementation.
+Applying a generic descriptor decorator to a generic protocol method must preserve the protocol's
+type variable and expose the specialized descriptor's readable and writable member types.
 
 ```py
 from functools import cached_property
@@ -2779,9 +2790,7 @@ class StrValue:
 
 static_assert(not is_assignable_to(StrValue, HasValue[int]))
 
-# TODO: This should be a property with an `int` read type once decorator calls preserve enclosing
-# type variables.
-# revealed: {"value": AttributeMember(`cached_property[Unknown]`)}
+# revealed: {"value": PropertyMember { read: `int`, write: `int` }}
 reveal_protocol_interface(HasValue[int])
 ```
 
