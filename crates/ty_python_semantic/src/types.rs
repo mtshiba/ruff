@@ -1805,6 +1805,23 @@ impl<'db> Type<'db> {
         ty
     }
 
+    /// Selects the constructor used for a type variable's upper bound.
+    ///
+    /// The meta-type of `object` simplifies to permissive bare `type`, so retain the exact class
+    /// object instead. Resolve aliases first so an alias of `object` cannot bypass that behavior.
+    fn constructor_for_typevar_bound(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Type<'db> {
+        let bound = self.resolve_type_alias(db);
+        if bound.is_object() {
+            KnownClass::Object.to_class_literal(db, env)
+        } else {
+            bound.to_meta_type(db, env)
+        }
+    }
+
     /// Returns `Some(UnionType)` if this type behaves like a union. Apart from explicit unions,
     /// this returns `Some` for `TypeAlias`es of unions and `NewType`s of `float` and `complex`.
     fn as_union_like(self, db: &'db dyn Db) -> Option<UnionType<'db>> {
@@ -2961,6 +2978,9 @@ impl<'db> Type<'db> {
             Type::Intersection(inter) => inter.map_with_boundness_and_qualifiers(db, env, |elem| {
                 elem.class_member_with_policy(db, env, name, policy)
             }),
+            Type::TypedDict(TypedDictType::Synthesized(synthesized)) => {
+                class::synthesized_typed_dict_class_member(db, env, synthesized, policy, name)
+            }
             // TODO: Remove this once synthesized protocols have a precise meta-type.
             Type::ProtocolInstance(protocol) if protocol.class_origin(db).is_none() => {
                 ty.instance_member(db, env, name)
@@ -5149,12 +5169,19 @@ impl<'db> Type<'db> {
                 ),
                 SubclassOfInner::TypeVar(tvar) => {
                     let constructor_instance_type = Type::TypeVar(tvar);
-                    let bindings = match tvar.typevar(db).bound_or_constraints(db, env) {
-                        None => KnownClass::Type.to_instance(db, env).bindings(db, env),
-                        Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
-                            bound.to_meta_type(db, env).bindings(db, env)
+                    let bindings = match tvar.typevar(db).require_bound_or_constraints(db, env) {
+                        TypeVarBoundOrConstraints::UpperBound(bound) => {
+                            let constructor = bound.constructor_for_typevar_bound(db, env);
+                            if let Type::ClassLiteral(class) = constructor
+                                && let Some(bindings) =
+                                    self.known_class_literal_bindings(db, env, class)
+                            {
+                                bindings
+                            } else {
+                                constructor.bindings(db, env)
+                            }
                         }
-                        Some(TypeVarBoundOrConstraints::Constraints(constraints)) => {
+                        TypeVarBoundOrConstraints::Constraints(constraints) => {
                             Bindings::from_union(
                                 self,
                                 constraints
@@ -5164,17 +5191,11 @@ impl<'db> Type<'db> {
                             )
                         }
                     };
-                    // TODO We would ideally be able to just do `into_constructor_bindings` in the
-                    // no-bounds/constraints case above (where we get back the bindings for
-                    // `Type.__call__`), and just do `with_constructed_instance_type` in the
-                    // bound/constrained cases, where we should get back constructor bindings (or
-                    // if we don't, we probably shouldn't return `T` from the call?). But currently
-                    // we can't because we special-case some built-in types to return regular
-                    // (not constructor) bindings from `constructor_bindings()`.
+                    // Some built-in constructors, including `object`, are special-cased as regular
+                    // callable bindings. Wrap them so that every bound or constrained call has
+                    // constructor context and constructs `T`; existing constructor bindings keep
+                    // their original kind.
                     bindings
-                        // `into_constructor_bindings` is a no-op for already-constructor bindings,
-                        // so we are just setting the `MetaclassCall` type for `Type.__call__`, or
-                        // the special-cased builtin classes that return regular bindings.
                         .into_constructor_bindings(
                             constructor_instance_type,
                             ConstructorCallableKind::MetaclassCall,
@@ -5235,6 +5256,32 @@ impl<'db> Type<'db> {
                     .iter()
                     .map(|element| element.bindings(db, env)),
             ),
+
+            // A narrowed `type[T: Base] & type[Child]` still needs to construct `T & Child`,
+            // but its constructor must come from `Child`, not from `Base` as an independent,
+            // competing alternative. Flattening the projected instance lets intersection
+            // simplification select that constructor without discarding unrelated providers.
+            Type::Intersection(intersection)
+                if intersection.positive(db).iter().all(|element| {
+                    // A metaclass instance also has an instance-space projection, but it can
+                    // provide an independent `__call__`. Only simplify actual class-object
+                    // variants so `type[Base] & Meta` retains both callable candidates.
+                    matches!(
+                        element.resolve_type_alias(db),
+                        Type::ClassLiteral(_) | Type::GenericAlias(_) | Type::SubclassOf(_)
+                    )
+                }) && let Some(instance_type) = self.to_instance_approximation(db, env)
+                    && let Type::NominalInstance(lookup_instance) =
+                        instance_type.flatten_typevars(db, env)
+                    && let Some(bindings) = {
+                        let bindings = lookup_instance.to_meta_type(db, env).bindings(db, env);
+                        bindings.has_only_constructor_items().then_some(bindings)
+                    } =>
+            {
+                bindings
+                    .with_constructed_instance_type(db, instance_type)
+                    .with_callable_type(self)
+            }
 
             Type::Intersection(intersection) => Bindings::from_intersection(
                 self,
@@ -6668,16 +6715,15 @@ impl<'db> Type<'db> {
             Type::SpecialForm(special_form) => special_form
                 .in_type_expression(db, scope_id, typevar_binding_context, inference_flags)
                 .map_err(|err| {
-                    let fallback_type = if matches!(
-                        err,
+                    let fallback_type = match err {
                         InvalidTypeExpression::Concatenate
-                            | InvalidTypeExpression::RequiresTwoArguments(
-                                SpecialFormType::Concatenate
-                            )
-                    ) {
-                        Type::Dynamic(DynamicType::InvalidConcatenateUnknown)
-                    } else {
-                        Type::unknown()
+                        | InvalidTypeExpression::RequiresTwoArguments(
+                            SpecialFormType::Concatenate,
+                        ) => Type::Dynamic(DynamicType::InvalidConcatenateUnknown),
+                        InvalidTypeExpression::TypingSelfWithIncompatibleReceiver(typing_self) => {
+                            Type::TypeVar(typing_self)
+                        }
+                        _ => Type::unknown(),
                     };
 
                     InvalidTypeExpressionError {
@@ -8867,6 +8913,8 @@ enum InvalidTypeExpression<'db> {
     TypingSelfInTypeAlias,
     /// `typing.Self` cannot be used in metaclass definitions.
     TypingSelfInMetaclass,
+    /// `typing.Self` cannot be used with an incompatible explicit method receiver.
+    TypingSelfWithIncompatibleReceiver(BoundTypeVarInstance<'db>),
     /// Some types are always invalid in type expressions
     InvalidType(Type<'db>, ScopeId<'db>),
     InvalidBareParamSpec(TypeVarInstance<'db>),
@@ -8981,6 +9029,9 @@ impl<'db> InvalidTypeExpression<'db> {
                     InvalidTypeExpression::TypingSelfInMetaclass => {
                         f.write_str("`Self` cannot be used in a metaclass")
                     }
+                    InvalidTypeExpression::TypingSelfWithIncompatibleReceiver(_) => f.write_str(
+                        "`Self` requires `self: Self` or `cls: type[Self]` for annotated receivers",
+                    ),
                     InvalidTypeExpression::InvalidType(Type::FunctionLiteral(function), _) => {
                         write!(
                             f,
