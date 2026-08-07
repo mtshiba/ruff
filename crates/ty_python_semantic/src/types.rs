@@ -101,7 +101,7 @@ pub use crate::types::typevar::{
 use crate::types::typevar::{TypeVarInstance, TypeVarSet};
 pub use crate::types::variance::TypeVarVariance;
 use crate::types::variance::VarianceInferable;
-use crate::types::visitor::any_over_type;
+use crate::types::visitor::{any_over_type, dynamic_content};
 use crate::{Db, FxOrderSet, HasType, NameKind, Program, SemanticModel};
 pub(crate) use class::{ClassLiteral, ClassType, GenericAlias, StaticClassLiteral};
 pub use class::{KnownClass, MethodDecorator};
@@ -492,10 +492,10 @@ pub(crate) struct FindLegacyTypeVars;
 type SpecializationVisitor<'db> = CycleDetector<'db, VisitSpecialization, Type<'db>, (), 3>;
 struct VisitSpecialization;
 
-/// How a generic type has been specialized.
+/// Whether a type represents the upper or lower bound of a gradual type.
 ///
-/// This matters only if there is at least one invariant or constrained type parameter.
-/// For example, we represent `Top[list[Any]]` as a `GenericAlias` with
+/// For generic specializations, this matters only if there is at least one invariant or constrained
+/// type parameter. For example, we represent `Top[list[Any]]` as a `GenericAlias` with
 /// `MaterializationKind` set to Top, which we denote as `Top[list[Any]]`.
 /// A type `Top[list[T]]` includes all fully static list types `list[U]` where `U` is
 /// a supertype of `Bottom[T]` and a subtype of `Top[T]`.
@@ -503,6 +503,9 @@ struct VisitSpecialization;
 /// Similarly, there is `Bottom[list[Any]]`.
 /// This type is harder to make sense of in a set-theoretic framework, but
 /// it is a subtype of all materializations of `list[Any]`.
+///
+/// Recursive type aliases also retain their materialization kind so that materializing the alias
+/// body preserves stable recursive references.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub enum MaterializationKind {
     Top,
@@ -1552,6 +1555,10 @@ impl<'db> Type<'db> {
             }
             None => Type::Divergent(divergent),
         })
+    }
+
+    pub(crate) fn is_fully_static(self, db: &'db dyn Db, env: &ProgramEnvironment) -> bool {
+        dynamic_content(db, env, self).is_absent()
     }
 
     const fn as_intersection(self) -> Option<IntersectionType<'db>> {
@@ -4663,6 +4670,30 @@ impl<'db> Type<'db> {
                 }
 
                 Type::ClassLiteral(class)
+                    if name == "lower_bound" && class.is_known(db, KnownClass::ConstraintSet) =>
+                {
+                    Place::bound(Type::KnownBoundMethod(
+                        KnownBoundMethodType::ConstraintSetLowerBound,
+                    ))
+                    .into()
+                }
+                Type::ClassLiteral(class)
+                    if name == "upper_bound" && class.is_known(db, KnownClass::ConstraintSet) =>
+                {
+                    Place::bound(Type::KnownBoundMethod(
+                        KnownBoundMethodType::ConstraintSetUpperBound,
+                    ))
+                    .into()
+                }
+                Type::ClassLiteral(class)
+                    if name == "equality" && class.is_known(db, KnownClass::ConstraintSet) =>
+                {
+                    Place::bound(Type::KnownBoundMethod(
+                        KnownBoundMethodType::ConstraintSetEquality,
+                    ))
+                    .into()
+                }
+                Type::ClassLiteral(class)
                     if name == "range" && class.is_known(db, KnownClass::ConstraintSet) =>
                 {
                     Place::bound(Type::KnownBoundMethod(
@@ -6763,6 +6794,7 @@ impl<'db> Type<'db> {
                         .materialization_kind(db)
                         .map_or(types, |kind| types.materialize(db, env, kind))
                 }),
+            Type::TypeAlias(alias) => alias.value_type(db).generator_types(db, env),
             Type::Union(union) => {
                 let mut yield_builder = Some(UnionBuilder::new(db, env));
                 let mut send_builder = Some(UnionBuilder::new(db, env));
@@ -7384,6 +7416,9 @@ impl<'db> Type<'db> {
                 )
                 | Type::KnownBoundMethod(
                     KnownBoundMethodType::StrStartswith(_)
+                        | KnownBoundMethodType::ConstraintSetLowerBound
+                        | KnownBoundMethodType::ConstraintSetUpperBound
+                        | KnownBoundMethodType::ConstraintSetEquality
                         | KnownBoundMethodType::ConstraintSetRange
                         | KnownBoundMethodType::ConstraintSetAlways
                         | KnownBoundMethodType::ConstraintSetNever
@@ -7647,6 +7682,13 @@ impl<'db> Type<'db> {
 
             Type::TypeAlias(alias) => {
                 match type_mapping {
+                    TypeMapping::Materialize(_) if alias.materialization_kind(db).is_some() =>
+                    {
+                        self
+                    }
+                    TypeMapping::EagerExpansion if alias.materialization_kind(db).is_some() => {
+                        alias.value_type(db).expand_eagerly(db, visitor.env)
+                    }
                     // For EagerExpansion, expand the raw value type. This path relies on Salsa's cycle
                     // detection rather than the visitor's cycle detection, because the visitor tracks
                     // Type values and `RecursiveList` is different from `RecursiveList[T]`.
@@ -7691,9 +7733,20 @@ impl<'db> Type<'db> {
                         });
 
                         // If the type mapping does not result in any change to this type alias, keep the
-                        // alias node instead of eagerly expanding it.
-                        if alias.value_type(db) == mapped {
+                        // alias node instead of eagerly expanding it. A recursive backedge also returns
+                        // the alias itself, and fully static aliases must retain their original identity.
+                        if mapped == self || alias.value_type(db) == mapped {
                             self
+                        } else if let TypeMapping::Materialize(materialization_kind) = type_mapping
+                            && matches!(
+                                self.to_type_identity(db),
+                                cyclic::TypeIdentity::RecursiveTypeAlias(_)
+                            )
+                        {
+                            Type::TypeAlias(alias.with_materialization_kind(
+                                db,
+                                Some(*materialization_kind),
+                            ))
                         } else {
                             mapped
                         }
@@ -7753,6 +7806,9 @@ impl<'db> Type<'db> {
             | Type::ModuleLiteral(_)
             | Type::KnownBoundMethod(
                 KnownBoundMethodType::StrStartswith(_)
+                | KnownBoundMethodType::ConstraintSetLowerBound
+                | KnownBoundMethodType::ConstraintSetUpperBound
+                | KnownBoundMethodType::ConstraintSetEquality
                 | KnownBoundMethodType::ConstraintSetRange
                 | KnownBoundMethodType::ConstraintSetAlways
                 | KnownBoundMethodType::ConstraintSetNever
@@ -8048,6 +8104,9 @@ impl<'db> Type<'db> {
             | Type::WrapperDescriptor(_)
             | Type::KnownBoundMethod(
                 KnownBoundMethodType::StrStartswith(_)
+                | KnownBoundMethodType::ConstraintSetLowerBound
+                | KnownBoundMethodType::ConstraintSetUpperBound
+                | KnownBoundMethodType::ConstraintSetEquality
                 | KnownBoundMethodType::ConstraintSetRange
                 | KnownBoundMethodType::ConstraintSetAlways
                 | KnownBoundMethodType::ConstraintSetNever
