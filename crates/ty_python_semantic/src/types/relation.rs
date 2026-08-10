@@ -287,13 +287,15 @@ impl<'db> Type<'db> {
             | Type::SpecialForm(_)
             | Type::KnownInstance(_)
             | Type::AlwaysFalsy
-            | Type::AlwaysTruthy
+            | Type::AlwaysTruthy => true,
+
             // `T` is always a subtype of itself,
             // and `T` is always a subtype of `T | None`
-            | Type::TypeVar(_)
+            Type::TypeVar(_) => true,
+
             // might inherit `Any`, but subtyping is still reflexive
-            | Type::ClassLiteral(_)
-             => true,
+            Type::ClassLiteral(_) => true,
+
             Type::Dynamic(_)
             | Type::Divergent(_)
             | Type::NominalInstance(_)
@@ -765,6 +767,7 @@ impl<'db> Type<'db> {
             other,
             &ConstraintSetBuilder::new(),
             materialization_visitor,
+            TypeVarEvaluation::Eager,
         )
         .is_always_satisfied(db, materialization_visitor.env)
     }
@@ -782,6 +785,44 @@ impl<'db> Type<'db> {
             other,
             constraints,
             &materialization_visitor,
+            TypeVarEvaluation::Eager,
+        )
+    }
+
+    /// Returns whether `self` and `other` can be equivalent under some typevar specialization.
+    pub(super) fn can_be_constraint_set_equivalent_to(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        other: Type<'db>,
+    ) -> bool {
+        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _| true, heap_size=ruff_memory_usage::heap_size)]
+        fn can_be_constraint_set_equivalent_to_impl<'db>(
+            db: &'db dyn Db,
+            types: TypePair<'db>,
+        ) -> bool {
+            let env = ProgramEnvironment::from_program(types.program(db));
+            let constraints = ConstraintSetBuilder::new();
+            let materialization_visitor = ApplyTypeMappingVisitor::new(&env);
+            !types
+                .first(db)
+                .when_equivalent_to_with_materialization_visitor(
+                    db,
+                    types.second(db),
+                    &constraints,
+                    &materialization_visitor,
+                    TypeVarEvaluation::Lazy,
+                )
+                .is_never_satisfied(db, &env)
+        }
+
+        if self == other {
+            return true;
+        }
+
+        can_be_constraint_set_equivalent_to_impl(
+            db,
+            TypePair::new(db, env.program(db), self, other),
         )
     }
 
@@ -791,6 +832,7 @@ impl<'db> Type<'db> {
         other: Type<'db>,
         constraints: &'c ConstraintSetBuilder<'db>,
         materialization_visitor: &ApplyTypeMappingVisitor<'_, 'db>,
+        typevar_evaluation: TypeVarEvaluation,
     ) -> ConstraintSet<'db, 'c> {
         let relation_visitor = HasRelationToVisitor::default(constraints);
         let disjointness_visitor = IsDisjointVisitor::default(constraints);
@@ -800,6 +842,7 @@ impl<'db> Type<'db> {
             constraints,
             given: ConstraintSet::from_bool(constraints, false),
             perform_expensive_checks: true,
+            typevar_evaluation,
             relation_visitor: &relation_visitor,
             disjointness_visitor: &disjointness_visitor,
             signature_relation_visitor: &signature_relation_visitor,
@@ -2650,6 +2693,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             constraints: self.constraints,
             given: self.given,
             perform_expensive_checks: self.perform_expensive_checks,
+            typevar_evaluation: TypeVarEvaluation::Eager,
             relation_visitor: self.relation_visitor,
             disjointness_visitor: self.disjointness_visitor,
             signature_relation_visitor: self.signature_relation_visitor,
@@ -2704,6 +2748,7 @@ pub(super) struct EquivalenceChecker<'a, 'c, 'db> {
     pub(super) constraints: &'c ConstraintSetBuilder<'db>,
     given: ConstraintSet<'db, 'c>,
     perform_expensive_checks: bool,
+    typevar_evaluation: TypeVarEvaluation,
 
     // N.B. these fields are private to reduce the risk of
     // "double-visiting" a given pair of types. You should
@@ -2725,7 +2770,7 @@ impl<'c, 'db> EquivalenceChecker<'_, 'c, 'db> {
         TypeRelationChecker {
             env: self.env,
             relation: TypeRelation::Redundancy { pure: true },
-            typevar_evaluation: TypeVarEvaluation::Eager,
+            typevar_evaluation: self.typevar_evaluation,
             constraints: self.constraints,
             context_tree: None,
             given: self.given,
@@ -2836,6 +2881,7 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             constraints: self.constraints,
             given: self.given,
             perform_expensive_checks: self.perform_expensive_checks,
+            typevar_evaluation: TypeVarEvaluation::Eager,
             relation_visitor: self.relation_visitor,
             disjointness_visitor: self.disjointness_visitor,
             signature_relation_visitor: self.signature_relation_visitor,
