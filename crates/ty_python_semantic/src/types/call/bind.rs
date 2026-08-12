@@ -1986,7 +1986,11 @@ impl<'db> Bindings<'db> {
                             .map(|init| !init.bool(db, env).is_always_false())
                             .unwrap_or(true);
 
-                        let kw_only = if env.python_version(db) >= PythonVersion::PY310 {
+                        // Only the standard-library field specifier requires Python 3.10 for
+                        // `kw_only`; third-party field specifiers can support it earlier.
+                        let kw_only = if env.python_version(db) >= PythonVersion::PY310
+                            || !function_type.is_known(db, KnownFunction::Field)
+                        {
                             match kw_only.and_then(Type::as_literal_value_kind) {
                                 // We are more conservative here when turning the type for `kw_only`
                                 // into a bool, because a field specifier in a stub might use
@@ -3014,40 +3018,6 @@ impl<'db> Bindings<'db> {
                         overload.set_return_type(Type::KnownInstance(
                             KnownInstanceType::ConstraintSet(tracked),
                         ));
-                    }
-
-                    Type::KnownBoundMethod(
-                        KnownBoundMethodType::ConstraintSetSatisfiedByAllTypeVars(tracked),
-                    ) => {
-                        let extract_inferable = |instance: &NominalInstanceType<'db>| {
-                            if instance.has_known_class(db, KnownClass::NoneType) {
-                                // Caller explicitly passed None, so no typevars are inferable.
-                                return Some(TypeVarSet::None);
-                            }
-                            inferable_typevars_from_tuple(db, env, instance)
-                        };
-
-                        let inferable = match overload.parameter_types() {
-                            // Caller did not provide argument, so no typevars are inferable.
-                            [None] => TypeVarSet::None,
-                            [Some(ty)] => {
-                                let Type::NominalInstance(instance) = ty.project_type_form(db, env)
-                                else {
-                                    continue;
-                                };
-                                match extract_inferable(&instance) {
-                                    Some(inferable) => inferable,
-                                    None => continue,
-                                }
-                            }
-                            _ => continue,
-                        };
-
-                        let constraints = ConstraintSetBuilder::new();
-                        let set = constraints.load(db, env, tracked.constraints(db));
-                        let result =
-                            set.satisfied_by_all_typevars(db, env, &constraints, inferable);
-                        overload.set_return_type(Type::bool_literal(result));
                     }
 
                     Type::KnownBoundMethod(KnownBoundMethodType::ConstraintSetSolutionsFor(
