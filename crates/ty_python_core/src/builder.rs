@@ -1416,12 +1416,19 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
                 self.add_dict_key_assignment_definitions(&node.targets, &node.value, assignment);
             }
-            Some(CurrentAssignment::AnnAssign(ann_assign)) => {
+            Some(CurrentAssignment::AnnAssign {
+                node: ann_assign,
+                pending,
+            }) => {
                 self.add_standalone_type_expression(&ann_assign.annotation);
-                let assignment = self.add_definition(
-                    place_id,
-                    AnnotatedAssignmentDefinitionNodeRef { node: ann_assign },
-                );
+                let assignment = if let Some(pending) = pending {
+                    self.finish_annotated_assignment(pending)
+                } else {
+                    self.add_definition(
+                        place_id,
+                        AnnotatedAssignmentDefinitionNodeRef { node: ann_assign },
+                    )
+                };
 
                 if let Some(value) = ann_assign.value.as_deref() {
                     self.add_dict_key_assignment_definitions(
@@ -1498,7 +1505,19 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         place: ScopedPlaceId,
         definition_node: impl Into<DefinitionNodeRef<'ast, 'db>> + std::fmt::Debug + Copy,
     ) -> Definition<'db> {
-        let (definition, num_definitions) = self.push_additional_definition(place, definition_node);
+        let definition = self.create_definition(place, definition_node);
+        self.record_definition(place, definition, None);
+        definition
+    }
+
+    /// Create a definition without making its declaration or binding visible in control flow.
+    fn create_definition(
+        &mut self,
+        place: ScopedPlaceId,
+        definition_node: impl Into<DefinitionNodeRef<'ast, 'db>> + std::fmt::Debug + Copy,
+    ) -> Definition<'db> {
+        let (definition, num_definitions) =
+            self.create_additional_definition(place, definition_node);
         debug_assert_eq!(
             num_definitions, 1,
             "Attempted to create multiple `Definition`s associated with AST node {definition_node:?}"
@@ -1528,14 +1547,24 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     /// Push a new [`Definition`] onto the list of definitions
     /// associated with the `definition_node` AST node.
     ///
-    /// Returns a 2-element tuple, where the first element is the newly created [`Definition`]
-    /// and the second element is the number of definitions that are now associated with
-    /// `definition_node`.
-    ///
     /// Most AST nodes can only be associated with at most one [`Definition`]. Generally prefer
     /// `add_definition` above, which enforces that. This method should currently only be used with
     /// `*` imports and loop headers.
     fn push_additional_definition(
+        &mut self,
+        place: ScopedPlaceId,
+        definition_node: impl Into<DefinitionNodeRef<'ast, 'db>>,
+    ) {
+        let (definition, _) = self.create_additional_definition(place, definition_node);
+        self.record_definition(place, definition, None);
+    }
+
+    /// Create a [`Definition`] without recording it in control flow.
+    ///
+    /// Returns the new definition and the number of definitions now associated with its AST
+    /// node. Loop headers are not stored by AST node, so their count is zero. Prefer
+    /// [`Self::create_definition`] when the node must have exactly one definition.
+    fn create_additional_definition(
         &mut self,
         place: ScopedPlaceId,
         definition_node: impl Into<DefinitionNodeRef<'ast, 'db>>,
@@ -1560,8 +1589,6 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             definitions.len()
         };
 
-        self.record_definition(place, definition, None);
-
         (definition, num_definitions)
     }
 
@@ -1578,8 +1605,82 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         previous_definitions: Option<PreviousDefinitions>,
     ) {
         let kind = definition.kind(self.db);
-        let is_loop_header = kind.is_loop_header();
         let category = kind.category(self.source_type.is_stub(), self.module);
+        match category {
+            DefinitionCategory::Declaration => {
+                self.mark_place_declared(place);
+                self.current_use_def_map_mut()
+                    .record_declaration(place, definition);
+            }
+            DefinitionCategory::DeclarationAndBinding => {
+                self.mark_place_declared(place);
+                self.record_binding_with(definition, |use_def, place| {
+                    use_def.record_combined_definition(place, definition, category);
+                });
+            }
+            DefinitionCategory::Binding => {
+                let previous = previous_definitions.unwrap_or(if kind.is_loop_header() {
+                    PreviousDefinitions::AreKept
+                } else {
+                    PreviousDefinitions::AreShadowed
+                });
+                self.record_binding_with(definition, |use_def, place| {
+                    use_def.record_binding(
+                        place,
+                        definition,
+                        previous,
+                        FutureDefinitions::ShadowThisOne,
+                    );
+                });
+            }
+        }
+    }
+
+    /// Declare an annotated name assignment whose value will be bound after visiting its RHS.
+    /// Other targets and annotations without a RHS are recorded in full by `add_definition`.
+    fn begin_annotated_assignment(
+        &mut self,
+        node: &'ast ast::StmtAnnAssign,
+    ) -> Option<PendingAnnotatedAssignment<'db>> {
+        let ast::Expr::Name(name) = &*node.target else {
+            return None;
+        };
+        node.value.as_ref()?;
+
+        let place = self.add_symbol(name.id.clone()).into();
+        let definition =
+            self.create_definition(place, AnnotatedAssignmentDefinitionNodeRef { node });
+        self.mark_place_declared(place);
+        self.current_use_def_map_mut().record_combined_definition(
+            place,
+            definition,
+            DefinitionCategory::Declaration,
+        );
+        Some(PendingAnnotatedAssignment { definition })
+    }
+
+    /// Bind the value of an annotated assignment whose declaration was recorded before its RHS.
+    fn finish_annotated_assignment(
+        &mut self,
+        pending: PendingAnnotatedAssignment<'db>,
+    ) -> Definition<'db> {
+        let definition = pending.definition;
+        self.record_binding_with(definition, |use_def, place| {
+            use_def.record_combined_definition(place, definition, DefinitionCategory::Binding);
+        });
+        definition
+    }
+
+    /// Record one binding while keeping aliases, captures, and lazy snapshots in sync.
+    /// The callback receives the definition's place and must append that binding to the current
+    /// use-def map.
+    fn record_binding_with(
+        &mut self,
+        definition: Definition<'db>,
+        record: impl FnOnce(&mut UseDefMapBuilder<'db>, ScopedPlaceId),
+    ) {
+        let place = definition.place(self.db);
+        let is_loop_header = definition.kind(self.db).is_loop_header();
 
         // We need to avoid marking places as bound as soon as we encounter a loop header
         // definition for them, because that would lead to false-positive semantic syntax errors in
@@ -1589,43 +1690,19 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         //     global x  # [invalid-syntax] if `x` is already used or bound
         //     x = 1
         // ```
-        if category.is_binding() && !is_loop_header {
+        if !is_loop_header {
             self.mark_place_bound(place);
             self.invalidate_narrowing_aliases_for(place);
         }
-        if category.is_declaration() {
-            self.mark_place_declared(place);
-        }
 
         let definition_id = self.current_use_def_map().next_definition_id();
-        let use_def = self.current_use_def_map_mut();
-        match category {
-            DefinitionCategory::DeclarationAndBinding => {
-                use_def.record_declaration_and_binding(place, definition);
-                self.delete_associated_bindings(place);
-            }
-            DefinitionCategory::Declaration => use_def.record_declaration(place, definition),
-            DefinitionCategory::Binding => {
-                let previous = previous_definitions.unwrap_or(if is_loop_header {
-                    PreviousDefinitions::AreKept
-                } else {
-                    PreviousDefinitions::AreShadowed
-                });
-                use_def.record_binding(
-                    place,
-                    definition,
-                    previous,
-                    FutureDefinitions::ShadowThisOne,
-                );
-                if !is_loop_header {
-                    self.delete_associated_bindings(place);
-                }
-            }
+        record(self.current_use_def_map_mut(), place);
+
+        if !is_loop_header {
+            self.delete_associated_bindings(place);
         }
 
-        if category.is_binding()
-            && let Some(id) = place.as_symbol()
-        {
+        if let Some(id) = place.as_symbol() {
             self.record_pending_capture_binding(id, definition_id);
             self.update_lazy_snapshots(id);
         }
@@ -2235,6 +2312,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     }
 
     /// Records the current flow state immediately before an operation that may raise an exception.
+    ///
+    /// This models exceptions from ordinary operations, not every possible interruption. In
+    /// particular, we do not add arbitrary exception points for asynchronously raised exceptions
+    /// such as those originating in signal handlers.
     ///
     /// Child expressions must already have been visited, so their completed assignments are
     /// visible if the parent operation fails:
@@ -3180,6 +3261,146 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .get_or_init(|| source_text(self.db, self.file.file(self.db)))
     }
 
+    /// Visits a conditional expression without reserving its flow snapshots in every recursive
+    /// expression-visitor frame. This matters for deeply nested expressions in unoptimized builds.
+    fn visit_if_expression(&mut self, node: &'ast ast::ExprIf) {
+        let ast::ExprIf {
+            body, test, orelse, ..
+        } = node;
+        self.visit_expr(test);
+        let condition_flow_snapshot = self.flow_snapshot_for_condition(test);
+        let falsy = if let Some(snapshots) = condition_flow_snapshot.into_branches() {
+            self.flow_restore(snapshots.truthy);
+            snapshots.falsy
+        } else {
+            self.flow_snapshot()
+        };
+        let (predicate, predicate_id) = self.record_expression_narrowing_constraint(test);
+        let reachability_constraint = self.record_reachability_constraint(predicate);
+        let in_type_checking_block = self.in_type_checking_block;
+        self.current_use_def_map_mut()
+            .record_range_reachability(body.range(), in_type_checking_block);
+        self.visit_expr(body);
+        let post_body = self.flow_snapshot();
+        self.flow_restore(falsy);
+
+        self.record_negated_narrowing_constraint(predicate, predicate_id);
+        self.record_negated_reachability_constraint(reachability_constraint);
+        let in_type_checking_block = self.in_type_checking_block;
+        self.current_use_def_map_mut()
+            .record_range_reachability(orelse.range(), in_type_checking_block);
+        self.visit_expr(orelse);
+        self.flow_merge(post_body);
+    }
+
+    /// Keeps short-circuit flow snapshots out of the common recursive expression-visitor frame.
+    fn visit_bool_expression(&mut self, node: &'ast ast::ExprBoolOp) {
+        let ast::ExprBoolOp { values, op, .. } = node;
+        let mut snapshots = vec![];
+        let mut reachability_constraints = vec![];
+        let mut last_condition_flow_snapshots = None;
+
+        for (index, value) in values.iter().enumerate() {
+            for id in &reachability_constraints {
+                self.current_use_def_map_mut()
+                    .record_reachability_constraint(*id); // TODO: nicer API
+            }
+
+            let in_type_checking_block = self.in_type_checking_block;
+            self.current_use_def_map_mut()
+                .record_range_reachability(value.range(), in_type_checking_block);
+            self.visit_expr(value);
+
+            // Only non-final values can short-circuit this boolean operation. The final
+            // value can still have its own outcome-specific flow if it is nested.
+            if index < values.len() - 1 {
+                self.record_exception_checkpoint_if(!Self::condition_evaluation_is_known_safe(
+                    value,
+                ));
+                let condition_flow_snapshots = self.take_condition_flow_snapshots(value);
+                let predicate = self.build_predicate(value);
+                let possibly_narrowed = self.compute_possibly_narrowed_places(&predicate);
+                let predicate_id = match op {
+                    ast::BoolOp::And => self.add_predicate(predicate),
+                    ast::BoolOp::Or => self.add_negated_predicate(predicate),
+                };
+                let reachability_constraint = self
+                    .current_reachability_constraints_mut()
+                    .add_atom(predicate_id);
+
+                let continuation = if let Some(condition_flow_snapshots) = condition_flow_snapshots
+                {
+                    let (short_circuit, continuation) =
+                        condition_flow_snapshots.into_short_circuit_and_continuation(*op);
+                    self.flow_restore(short_circuit);
+                    continuation
+                } else {
+                    self.flow_snapshot()
+                };
+
+                // We first model the short-circuiting behavior. We take the short-circuit
+                // path here if all of the previous short-circuit paths were not taken, so
+                // we record all previously existing reachability constraints, and negate the
+                // one for the current expression.
+
+                self.record_negated_reachability_constraint(reachability_constraint);
+                snapshots.push(self.flow_snapshot());
+
+                // Then we model the non-short-circuiting behavior. Here, we need to delay
+                // the application of the reachability constraint until after the expression
+                // has been evaluated, so we only push it onto the stack here.
+                self.flow_restore(continuation);
+                self.record_narrowing_constraint_id_for_places(predicate_id, &possibly_narrowed);
+                reachability_constraints.push(reachability_constraint);
+            } else {
+                last_condition_flow_snapshots = self.take_condition_flow_snapshots(value);
+            }
+        }
+
+        let has_specialized_last = last_condition_flow_snapshots.is_some();
+        let (last_short_circuit, no_short_circuit) =
+            if let Some(condition_flow_snapshots) = last_condition_flow_snapshots {
+                let (short_circuit, no_short_circuit) =
+                    condition_flow_snapshots.into_short_circuit_and_continuation(*op);
+                (Some(short_circuit), Some(no_short_circuit))
+            } else {
+                (
+                    None,
+                    values
+                        .iter()
+                        .any(|value| any_over_expr(value, &ast::Expr::is_named_expr))
+                        .then(|| self.flow_snapshot()),
+                )
+            };
+
+        if let Some(last_short_circuit) = last_short_circuit {
+            self.flow_restore(last_short_circuit);
+        }
+
+        for snapshot in snapshots {
+            self.flow_merge(snapshot);
+        }
+
+        if let Some(no_short_circuit) = no_short_circuit {
+            let bool_op_key = ExpressionNodeKey::from(ast::ExprRef::BoolOp(node));
+            let maybe_short_circuit = self.flow_snapshot();
+
+            if has_specialized_last {
+                // Restore the merged post-expression flow after constructing the two
+                // outcome-specific snapshots.
+                self.flow_merge(no_short_circuit.clone());
+            }
+
+            let (truthy, falsy) = match op {
+                ast::BoolOp::And => (no_short_circuit, maybe_short_circuit),
+                ast::BoolOp::Or => (maybe_short_circuit, no_short_circuit),
+            };
+
+            self.condition_flow_snapshots_by_node
+                .insert(bool_op_key, ConditionFlowSnapshots { truthy, falsy });
+        }
+    }
+
     fn visit_stmt_impl(&mut self, stmt: &'ast ast::Stmt) {
         self.with_semantic_checker(|semantic, context| semantic.visit_stmt(stmt, context));
 
@@ -3708,6 +3929,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             }
             ast::Stmt::AnnAssign(node) => {
                 debug_assert_eq!(&self.current_assignments, &[]);
+                // For an assignment with a value, an exception from the annotation or RHS must
+                // not discard the declared type. The value is still bound only after the RHS
+                // completes, so a handler can observe an earlier binding (or an unbound name).
+                let pending = self.begin_annotated_assignment(node);
                 self.visit_expr(&node.annotation);
                 if let Some(value) = &node.value {
                     self.visit_expr(value);
@@ -3748,7 +3973,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     *node.target,
                     ast::Expr::Attribute(_) | ast::Expr::Subscript(_) | ast::Expr::Name(_)
                 ) {
-                    self.push_assignment(CurrentAssignment::AnnAssign(node));
+                    self.push_assignment(CurrentAssignment::AnnAssign { node, pending });
                     self.visit_expr(&node.target);
                     self.pop_assignment();
 
@@ -4348,6 +4573,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                                 guard_predicate_id,
                                 &possibly_narrowed,
                             );
+                        self.current_use_def_map_mut()
+                            .record_exception_checkpoint_binding_change();
                         let match_success_guard_failure = self.flow_snapshot();
                         self.flow_restore(truthy);
                         self.current_use_def_map_mut()
@@ -4355,6 +4582,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                                 guard_predicate_id,
                                 &possibly_narrowed,
                             );
+                        self.current_use_def_map_mut()
+                            .record_exception_checkpoint_binding_change();
                         match_success_guard_failure
                     });
 
@@ -5185,34 +5414,7 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                 self.visit_expr(lambda.body.as_ref());
                 self.pop_scope();
             }
-            ast::Expr::If(ast::ExprIf {
-                body, test, orelse, ..
-            }) => {
-                self.visit_expr(test);
-                let condition_flow_snapshot = self.flow_snapshot_for_condition(test);
-                let falsy = if let Some(snapshots) = condition_flow_snapshot.into_branches() {
-                    self.flow_restore(snapshots.truthy);
-                    snapshots.falsy
-                } else {
-                    self.flow_snapshot()
-                };
-                let (predicate, predicate_id) = self.record_expression_narrowing_constraint(test);
-                let reachability_constraint = self.record_reachability_constraint(predicate);
-                let in_type_checking_block = self.in_type_checking_block;
-                self.current_use_def_map_mut()
-                    .record_range_reachability(body.range(), in_type_checking_block);
-                self.visit_expr(body);
-                let post_body = self.flow_snapshot();
-                self.flow_restore(falsy);
-
-                self.record_negated_narrowing_constraint(predicate, predicate_id);
-                self.record_negated_reachability_constraint(reachability_constraint);
-                let in_type_checking_block = self.in_type_checking_block;
-                self.current_use_def_map_mut()
-                    .record_range_reachability(orelse.range(), in_type_checking_block);
-                self.visit_expr(orelse);
-                self.flow_merge(post_body);
-            }
+            ast::Expr::If(node) => self.visit_if_expression(node),
             ast::Expr::ListComp(
                 list_comprehension @ ast::ExprListComp {
                     elt, generators, ..
@@ -5300,117 +5502,7 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                     ));
                 }
             }
-            ast::Expr::BoolOp(ast::ExprBoolOp {
-                values,
-                range: _,
-                node_index: _,
-                op,
-            }) => {
-                let mut snapshots = vec![];
-                let mut reachability_constraints = vec![];
-                let mut last_condition_flow_snapshots = None;
-
-                for (index, value) in values.iter().enumerate() {
-                    for id in &reachability_constraints {
-                        self.current_use_def_map_mut()
-                            .record_reachability_constraint(*id); // TODO: nicer API
-                    }
-
-                    let in_type_checking_block = self.in_type_checking_block;
-                    self.current_use_def_map_mut()
-                        .record_range_reachability(value.range(), in_type_checking_block);
-                    self.visit_expr(value);
-
-                    // Only non-final values can short-circuit this boolean operation. The final
-                    // value can still have its own outcome-specific flow if it is nested.
-                    if index < values.len() - 1 {
-                        self.record_exception_checkpoint_if(
-                            !Self::condition_evaluation_is_known_safe(value),
-                        );
-                        let condition_flow_snapshots = self.take_condition_flow_snapshots(value);
-                        let predicate = self.build_predicate(value);
-                        let possibly_narrowed = self.compute_possibly_narrowed_places(&predicate);
-                        let predicate_id = match op {
-                            ast::BoolOp::And => self.add_predicate(predicate),
-                            ast::BoolOp::Or => self.add_negated_predicate(predicate),
-                        };
-                        let reachability_constraint = self
-                            .current_reachability_constraints_mut()
-                            .add_atom(predicate_id);
-
-                        let continuation =
-                            if let Some(condition_flow_snapshots) = condition_flow_snapshots {
-                                let (short_circuit, continuation) = condition_flow_snapshots
-                                    .into_short_circuit_and_continuation(*op);
-                                self.flow_restore(short_circuit);
-                                continuation
-                            } else {
-                                self.flow_snapshot()
-                            };
-
-                        // We first model the short-circuiting behavior. We take the short-circuit
-                        // path here if all of the previous short-circuit paths were not taken, so
-                        // we record all previously existing reachability constraints, and negate the
-                        // one for the current expression.
-
-                        self.record_negated_reachability_constraint(reachability_constraint);
-                        snapshots.push(self.flow_snapshot());
-
-                        // Then we model the non-short-circuiting behavior. Here, we need to delay
-                        // the application of the reachability constraint until after the expression
-                        // has been evaluated, so we only push it onto the stack here.
-                        self.flow_restore(continuation);
-                        self.record_narrowing_constraint_id_for_places(
-                            predicate_id,
-                            &possibly_narrowed,
-                        );
-                        reachability_constraints.push(reachability_constraint);
-                    } else {
-                        last_condition_flow_snapshots = self.take_condition_flow_snapshots(value);
-                    }
-                }
-
-                let has_specialized_last = last_condition_flow_snapshots.is_some();
-                let (last_short_circuit, no_short_circuit) =
-                    if let Some(condition_flow_snapshots) = last_condition_flow_snapshots {
-                        let (short_circuit, no_short_circuit) =
-                            condition_flow_snapshots.into_short_circuit_and_continuation(*op);
-                        (Some(short_circuit), Some(no_short_circuit))
-                    } else {
-                        (
-                            None,
-                            any_over_expr(expr, &ast::Expr::is_named_expr)
-                                .then(|| self.flow_snapshot()),
-                        )
-                    };
-
-                if let Some(last_short_circuit) = last_short_circuit {
-                    self.flow_restore(last_short_circuit);
-                }
-
-                for snapshot in snapshots {
-                    self.flow_merge(snapshot);
-                }
-
-                if let Some(no_short_circuit) = no_short_circuit {
-                    let bool_op_key = ExpressionNodeKey::from(expr);
-                    let maybe_short_circuit = self.flow_snapshot();
-
-                    if has_specialized_last {
-                        // Restore the merged post-expression flow after constructing the two
-                        // outcome-specific snapshots.
-                        self.flow_merge(no_short_circuit.clone());
-                    }
-
-                    let (truthy, falsy) = match op {
-                        ast::BoolOp::And => (no_short_circuit, maybe_short_circuit),
-                        ast::BoolOp::Or => (maybe_short_circuit, no_short_circuit),
-                    };
-
-                    self.condition_flow_snapshots_by_node
-                        .insert(bool_op_key, ConditionFlowSnapshots { truthy, falsy });
-                }
-            }
+            ast::Expr::BoolOp(node) => self.visit_bool_expression(node),
             ast::Expr::StringLiteral(_) => {
                 walk_expr(self, expr);
             }
@@ -5698,13 +5790,23 @@ impl SemanticSyntaxContext for SemanticIndexBuilder<'_, '_> {
     }
 }
 
+/// A simple-name annotated assignment with an RHS whose declaration is already recorded.
+/// Created only by `begin_annotated_assignment`; finishing it records the value binding.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct PendingAnnotatedAssignment<'db> {
+    definition: Definition<'db>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum CurrentAssignment<'ast, 'db> {
     Assign {
         node: &'ast ast::StmtAssign,
         unpack: Option<Unpack<'db>>,
     },
-    AnnAssign(&'ast ast::StmtAnnAssign),
+    AnnAssign {
+        node: &'ast ast::StmtAnnAssign,
+        pending: Option<PendingAnnotatedAssignment<'db>>,
+    },
     AugAssign(&'ast ast::StmtAugAssign),
     For {
         node: &'ast ast::StmtFor,
@@ -5729,7 +5831,9 @@ impl CurrentAssignment<'_, '_> {
             Self::For { unpack, .. }
             | Self::WithItem { unpack, .. }
             | Self::Comprehension { unpack, .. } => unpack.as_mut().map(|(position, _)| position),
-            Self::Assign { .. } | Self::AnnAssign(_) | Self::AugAssign(_) | Self::Named(_) => None,
+            Self::Assign { .. } | Self::AnnAssign { .. } | Self::AugAssign(_) | Self::Named(_) => {
+                None
+            }
         }
     }
 }
