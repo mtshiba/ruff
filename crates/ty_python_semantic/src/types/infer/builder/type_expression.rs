@@ -201,9 +201,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     node_index: _,
                 } = subscript;
 
-                let value_ty = self.infer_expression(value, TypeContext::default());
-
                 if is_dotted_name(value) {
+                    let value_ty = self.infer_expression(value, TypeContext::default());
+
                     // Preserve the flag for another `Unpack` so that nested unpacking emits a
                     // diagnostic. Other subscripts are no longer the direct unpack operand.
                     let previously_in_unpack_type_argument =
@@ -229,6 +229,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     ty
                 } else {
                     if !self.in_string_annotation() {
+                        self.infer_expression(value, TypeContext::default());
                         self.infer_expression(slice, TypeContext::default());
                     }
                     self.report_invalid_type_expression(
@@ -1356,14 +1357,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                                 }
                                 None => {
                                     self.infer_expression(parameters, TypeContext::default());
-                                    if let Some(builder) =
-                                        self.context.report_lint(&NOT_SUBSCRIPTABLE, subscript)
-                                    {
-                                        builder.into_diagnostic(format_args!(
-                                            "Cannot subscript non-generic type `{}`",
-                                            value_ty.display(db, self.program_environment())
-                                        ));
-                                    }
+                                    self.report_invalid_type_expression(
+                                        subscript,
+                                        format_args!(
+                                            "Non-generic class `{}` cannot be specialized in a type expression",
+                                            class_literal.name(db)
+                                        ),
+                                    );
                                     Type::unknown()
                                 }
                             }
@@ -1807,14 +1807,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     }
                     _ => {
                         self.infer_expression(slice, TypeContext::default());
-                        if let Some(builder) =
-                            self.context.report_lint(&NOT_SUBSCRIPTABLE, subscript)
-                        {
-                            builder.into_diagnostic(format_args!(
-                                "Cannot subscript non-generic type `{}`",
-                                value_ty.display(db, self.program_environment())
-                            ));
-                        }
+                        self.report_invalid_type_expression(
+                            subscript,
+                            format_args!(
+                                "Non-generic class `{}` cannot be specialized in a type expression",
+                                class.name(db)
+                            ),
+                        );
                         Type::unknown()
                     }
                 }
