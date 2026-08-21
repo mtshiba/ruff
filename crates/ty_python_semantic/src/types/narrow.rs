@@ -36,7 +36,7 @@ use ruff_python_stdlib::identifiers::is_identifier;
 
 use super::UnionType;
 use super::call::CallArguments;
-use super::constraints::{ConstraintSetBuilder, PathBounds, Solutions};
+use super::constraints::{ConstraintSetBuilder, PathBoundSolution, PathBounds, Solutions};
 use super::equality::{
     ComparisonSoundnessPolicy, equality_exclusion_constraint, equality_truthiness,
     evaluate_type_equality, evaluate_type_inequality,
@@ -879,12 +879,9 @@ fn specialize_narrowing_target_from_intersection<'db>(
         combined_constraints.intersect(db, &constraints, base_constraint);
     }
 
-    let solutions = combined_constraints.solutions(
-        db,
-        env,
-        &constraints,
-        generic_context.inferable_typevars(db),
-    );
+    let solutions = combined_constraints
+        .solutions(db, env, generic_context.inferable_typevars(db))
+        .ok()?;
     let specialized_class =
         specialize_generic_class_from_solutions(db, env, target_class, solutions)?;
     Some(Type::instance(db, env, specialized_class))
@@ -2384,12 +2381,12 @@ impl<'db> PatternSuccessAnalyzer<'db> {
             )
             .solve_with(|variance, path_bound| {
                 let Some(lower) = path_bound.lower else {
-                    return Ok(None);
+                    return PathBoundSolution::Unsolved;
                 };
                 if variance != TypeVarVariance::Invariant
                     || path_bound.upper.materialize_exact(db, &self.env) != lower
                 {
-                    return Ok(None);
+                    return PathBoundSolution::Unsolved;
                 }
                 PathBounds::default_solve(db, &self.env, &constraints, path_bound)
             });

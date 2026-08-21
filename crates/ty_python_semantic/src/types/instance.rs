@@ -3,6 +3,7 @@
 use crate::ProgramEnvironment;
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::debug_assert_matches;
 use std::marker::PhantomData;
 
 use ruff_python_ast::name::Name;
@@ -693,7 +694,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
         let source_arguments = source_alias.specialization(db).types(db);
         if !source_arguments.iter().all(|argument| match argument {
-            Type::TypeVar(typevar) => nominally_satisfied.mentions_typevar(typevar.identity(db)),
+            Type::TypeVar(typevar) => nominally_satisfied.mentions_typevar(*typevar),
             argument => !any_over_type_expanding_aliases(db, env, *argument, Type::is_type_var),
         }) {
             return None;
@@ -832,10 +833,10 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         protocol: ProtocolInstanceType<'db>,
     ) -> ConstraintSet<'db, 'c> {
         let env = self.env;
-        debug_assert!(matches!(
+        debug_assert_matches!(
             meta_ty,
             Type::ClassLiteral(_) | Type::SubclassOf(_) | Type::GenericAlias(_)
-        ));
+        );
 
         let constructed_ty = meta_ty.bindings(db, env).return_type(db, env);
         self.check_type_pair(db, constructed_ty, Type::ProtocolInstance(protocol))
