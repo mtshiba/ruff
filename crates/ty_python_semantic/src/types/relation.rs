@@ -311,6 +311,7 @@ impl<'db> Type<'db> {
                 | KnownBoundMethodType::PropertyDunderDelete(_),
             )
             | Type::PropertyInstance(_)
+            | Type::SlotDescriptor(_)
             | Type::BoundSuper(_)
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
@@ -2616,15 +2617,9 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             // Similarly `type[enum.Enum]`  is a subtype of `enum.EnumMeta` because `enum.Enum`
             // is an instance of `enum.EnumMeta`. `type[Any]` and `type[Unknown]` do not participate in subtyping,
             // however, as they are not fully static types.
-            (Type::SubclassOf(subclass_of_ty), _) => self.check_type_pair(
-                db,
-                subclass_of_ty
-                    .subclass_of()
-                    .into_class(db, env)
-                    .map(|source_class| source_class.metaclass_instance_type(db, env))
-                    .unwrap_or_else(|| KnownClass::Type.to_instance(db, env)),
-                target,
-            ),
+            (Type::SubclassOf(subclass_of_ty), _) => {
+                self.check_type_pair(db, subclass_of_ty.to_metaclass_instance(db, env), target)
+            }
 
             (Type::TypeForm(_), _) => self.check_type_pair(db, Type::object(), target),
 
@@ -2657,6 +2652,16 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             (_, Type::PropertyInstance(property)) => {
                 self.check_type_pair(db, source, property.instance_fallback(db, env))
             }
+            (Type::SlotDescriptor(_), _) => self.check_type_pair(
+                db,
+                KnownClass::MemberDescriptorType.to_instance(db, env),
+                target,
+            ),
+            (_, Type::SlotDescriptor(_)) => self.check_type_pair(
+                db,
+                source,
+                KnownClass::MemberDescriptorType.to_instance(db, env),
+            ),
             // Other than the special cases enumerated above, nominal-instance types are never
             // subtypes of any other variants
             (Type::NominalInstance(_), _) => self.never(),
@@ -3490,15 +3495,14 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             (Type::SubclassOf(subclass_of_ty), other)
             | (other, Type::SubclassOf(subclass_of_ty)) => {
                 nontrivial_check(self, || match subclass_of_ty.subclass_of() {
-                    SubclassOfInner::Dynamic(_) => {
+                    SubclassOfInner::Dynamic(_) | SubclassOfInner::Protocol(_) => {
                         self.check_type_pair(db, KnownClass::Type.to_instance(db, env), other)
                     }
-                    SubclassOfInner::Class(class) => {
-                        self.check_type_pair(db, class.metaclass_instance_type(db, env), other)
-                    }
-                    SubclassOfInner::Protocol(_) => {
-                        self.check_type_pair(db, KnownClass::Type.to_instance(db, env), other)
-                    }
+                    SubclassOfInner::Class(_) => self.check_type_pair(
+                        db,
+                        subclass_of_ty.to_metaclass_instance(db, env),
+                        other,
+                    ),
                     SubclassOfInner::TypeVar(_) => unreachable!(),
                 })
             }
@@ -3805,6 +3809,16 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             | (other, Type::PropertyInstance(property)) => nontrivial_check(self, || {
                 self.check_type_pair(db, property.instance_fallback(db, env), other)
             }),
+
+            (Type::SlotDescriptor(_), other) | (other, Type::SlotDescriptor(_)) => {
+                nontrivial_check(self, || {
+                    self.check_type_pair(
+                        db,
+                        KnownClass::MemberDescriptorType.to_instance(db, env),
+                        other,
+                    )
+                })
+            }
 
             (Type::BoundSuper(left), Type::BoundSuper(right)) => nontrivial_check(self, || {
                 self.as_equivalence_checker()

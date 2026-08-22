@@ -269,14 +269,26 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             // we also check for the case where one of the operands is a class-literal type
                             // or generic-alias type and the other is a string literal. The normal dunder lookup
                             // fails to catch this error, since typeshed annotates `type.__(r)or__` as accepting `Any`.
+                            // ABCMeta and _ProtocolMeta inherit these operators unchanged. The typeshed
+                            // protocol fallback does not establish a custom operator either.
                             let should_emit_error = if dunder_fails {
                                 true
                             } else {
                                 let literal = match (left_type_value, right_type_value) {
                                     (Type::ClassLiteral(class), Type::LiteralValue(literal))
                                     | (Type::LiteralValue(literal), Type::ClassLiteral(class))
-                                        if class.metaclass(db)
-                                            == KnownClass::Type.to_class_literal(db, env) =>
+                                        if matches!(
+                                            class
+                                                .inferred_metaclass(db)
+                                                .for_inheritance(db, env)
+                                                .to_class_type(db)
+                                                .and_then(|metaclass| metaclass.known(db)),
+                                            Some(
+                                                KnownClass::Type
+                                                    | KnownClass::ABCMeta
+                                                    | KnownClass::ProtocolMeta
+                                            )
+                                        ) =>
                                     {
                                         Some(literal)
                                     }
@@ -2602,35 +2614,55 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
             SpecialFormType::LiteralString => {
                 let arguments = self.infer_expression(arguments_slice, TypeContext::default());
-
                 if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
                     let mut diag =
                         builder.into_diagnostic("`LiteralString` expects no type parameter");
 
-                    let arguments_as_tuple = arguments.exact_tuple_instance_spec(db);
+                    let argument_elements = if self.in_string_annotation() {
+                        let argument_expressions = match arguments_slice {
+                            ast::Expr::Tuple(tuple) => tuple.elts.as_slice(),
+                            _ => std::slice::from_ref(arguments_slice),
+                        };
+                        let mut builder = self.speculate_without_diagnostics();
+                        argument_expressions
+                            .iter()
+                            .map(|argument| {
+                                builder
+                                    .infer_literal_parameter_type(argument)
+                                    .unwrap_or(Type::unknown())
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        let arguments_as_tuple = arguments.exact_tuple_instance_spec(db);
+                        arguments_as_tuple.as_ref().map_or_else(
+                            || vec![arguments],
+                            |tuple| tuple.iter_element_types(db).collect(),
+                        )
+                    };
 
-                    let argument_elements = arguments_as_tuple.as_ref().map_or_else(
-                        || vec![arguments],
-                        |tuple| tuple.iter_element_types(db).collect(),
-                    );
-                    let mut argument_elements = argument_elements.into_iter();
+                    let probably_meant_literal = argument_elements.into_iter().all(|ty| {
+                        let elements = match ty {
+                            Type::Union(union) => union.elements(db),
+                            _ => std::slice::from_ref(&ty),
+                        };
 
-                    let probably_meant_literal = argument_elements.all(|ty| match ty {
-                        Type::LiteralValue(literal)
-                            if matches!(
-                                literal.kind(),
-                                LiteralValueTypeKind::String(_)
-                                    | LiteralValueTypeKind::Bytes(_)
-                                    | LiteralValueTypeKind::Enum(_)
-                                    | LiteralValueTypeKind::Bool(_)
-                            ) =>
-                        {
-                            true
-                        }
-                        Type::NominalInstance(instance) => {
-                            instance.has_known_class(db, KnownClass::NoneType)
-                        }
-                        _ => false,
+                        elements.iter().all(|ty| match ty {
+                            Type::LiteralValue(literal)
+                                if matches!(
+                                    literal.kind(),
+                                    LiteralValueTypeKind::String(_)
+                                        | LiteralValueTypeKind::Bytes(_)
+                                        | LiteralValueTypeKind::Enum(_)
+                                        | LiteralValueTypeKind::Bool(_)
+                                ) =>
+                            {
+                                true
+                            }
+                            Type::NominalInstance(instance) => {
+                                instance.has_known_class(db, KnownClass::NoneType)
+                            }
+                            _ => false,
+                        })
                     });
 
                     if probably_meant_literal {
