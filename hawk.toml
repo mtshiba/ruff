@@ -552,6 +552,22 @@ reason = "one-indexed arithmetic intentionally provides checked and saturating o
 
 [[override]]
 lint = "hawk::dead_public"
+crate = "ruff_text_size"
+item = "size::TextSize::saturating_add"
+kind = "inherent_method"
+level = "expect"
+reason = "TextSize intentionally provides both checked and saturating arithmetic"
+
+[[override]]
+lint = "hawk::dead_public"
+crate = "ruff_text_size"
+item = "size::TextSize::saturating_sub"
+kind = "inherent_method"
+level = "expect"
+reason = "TextSize intentionally provides both checked and saturating arithmetic"
+
+[[override]]
+lint = "hawk::dead_public"
 crate = "ty_project"
 item = "db::changes::ChangeResult::custom_stdlib_changed"
 kind = "inherent_method"
@@ -877,14 +893,6 @@ item = "system::command::Command::get_current_dir"
 kind = "inherent_method"
 level = "expect"
 reason = "command descriptions expose a complete argument builder and inspection API"
-
-[[override]]
-lint = "hawk::dead_public"
-crate = "ty_python_core"
-item = "expression::Expression::<'db>::python_file"
-kind = "inherent_method"
-level = "expect"
-reason = "semantic ingredients expose consistent file, scope, and program accessors"
 
 [[override]]
 lint = "hawk::dead_public"
