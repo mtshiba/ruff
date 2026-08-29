@@ -65,15 +65,16 @@ use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
     self, CALL_NON_CALLABLE, CONFLICTING_DECLARATIONS, CYCLIC_TYPE_ALIAS_DEFINITION,
     DYNAMIC_FUNCTION_DECORATOR_RETURN, GeneratorMismatchKind, INEFFECTIVE_FINAL,
-    INVALID_ARGUMENT_TYPE, INVALID_ASSIGNMENT, INVALID_DECLARATION, INVALID_ENUM_MEMBER_ANNOTATION,
-    INVALID_LEGACY_TYPE_VARIABLE, INVALID_NEWTYPE, INVALID_PARAMSPEC, INVALID_TYPE_ALIAS_TYPE,
-    INVALID_TYPE_FORM, INVALID_TYPE_VARIABLE_BOUND, INVALID_TYPE_VARIABLE_CONSTRAINTS,
-    INVALID_TYPE_VARIABLE_DEFAULT, POSSIBLY_MISSING_IMPLICIT_CALL, POSSIBLY_MISSING_SUBMODULE,
-    TypeCheckDiagnostics, UNDEFINED_REVEAL, UNRESOLVED_ATTRIBUTE, UNRESOLVED_GLOBAL,
-    UNRESOLVED_REFERENCE, UNSOUND_ASSIGNMENT, UNSOUND_YIELD, UNSUPPORTED_OPERATOR,
-    UNUSED_AWAITABLE, YieldKind, autofix_with_notimplementederror,
-    hint_if_stdlib_attribute_exists_on_other_versions, report_attempted_protocol_instantiation,
-    report_bad_dunder_delattr_call, report_bad_dunder_delete_call, report_call_to_abstract_method,
+    INVALID_ARGUMENT_TYPE, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, INVALID_DECLARATION,
+    INVALID_ENUM_MEMBER_ANNOTATION, INVALID_LEGACY_TYPE_VARIABLE, INVALID_NEWTYPE,
+    INVALID_PARAMSPEC, INVALID_TYPE_ALIAS_TYPE, INVALID_TYPE_FORM, INVALID_TYPE_VARIABLE_BOUND,
+    INVALID_TYPE_VARIABLE_CONSTRAINTS, INVALID_TYPE_VARIABLE_DEFAULT,
+    POSSIBLY_MISSING_IMPLICIT_CALL, POSSIBLY_MISSING_SUBMODULE, TypeCheckDiagnostics,
+    UNDEFINED_REVEAL, UNRESOLVED_ATTRIBUTE, UNRESOLVED_GLOBAL, UNRESOLVED_REFERENCE,
+    UNSOUND_ASSIGNMENT, UNSOUND_YIELD, UNSUPPORTED_OPERATOR, UNUSED_AWAITABLE, YieldKind,
+    autofix_with_notimplementederror, hint_if_stdlib_attribute_exists_on_other_versions,
+    report_attempted_protocol_instantiation, report_bad_dunder_delattr_call,
+    report_bad_dunder_delete_call, report_call_to_abstract_method,
     report_cannot_pop_required_field_on_typed_dict, report_dynamic_function_decorator_return,
     report_invalid_assignment, report_invalid_class_match_pattern, report_invalid_exception_caught,
     report_invalid_exception_cause, report_invalid_exception_raised,
@@ -1864,6 +1865,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Returns `true` when the value is assignable, even if the stricter `unsound-assignment`
     /// rule reports that it is not a subtype. Returns `false` when the value is not assignable,
     /// in which case `invalid-assignment` is reported instead.
+    ///
+    /// The `unsound-assignment` rule is deliberately limited to name bindings; assignments to
+    /// attributes and subscripts are outside its scope.
     fn validate_assignment_type(
         &self,
         target_node: AnyNodeRef,
@@ -1944,13 +1948,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_type_alias(&mut self, type_alias: &ast::StmtTypeAlias) {
-        let db = self.db();
         let previous_check_unbound_typevars = self
             .context
             .inference_flags
             .replace(InferenceFlags::CHECK_UNBOUND_TYPEVARS, true);
         self.context.inference_flags |= InferenceFlags::IN_TYPE_ALIAS;
-        let value_ty = self.infer_type_expression(&type_alias.value);
+        self.infer_type_expression(&type_alias.value);
         self.context
             .inference_flags
             .remove(InferenceFlags::IN_TYPE_ALIAS);
@@ -1959,34 +1962,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             previous_check_unbound_typevars,
         );
 
-        // A type alias where a value type points to itself, i.e. the expanded type is `Divergent` is meaningless
-        // (but a type alias that expands to something like `list[Divergent]` may be a valid recursive type alias)
-        // and would lead to infinite recursion. Therefore, such type aliases should not be exposed.
-        // ```python
-        // type Itself = Itself  # error: "Cyclic definition of `Itself`"
-        // type A = B  # error: "Cyclic definition of `A`"
-        // type B = A  # error: "Cyclic definition of `B`"
-        // type G[T] = G[T]  # error: "Cyclic definition of `G`"
-        // type RecursiveList[T] = list[T | RecursiveList[T]]  # OK
-        // type RecursiveList2[T] = list[RecursiveList2[T]]  # It's not possible to create an element of this, but it's not an error for now
-        // type IntOr = int | IntOr  # It's redundant, but OK for now
-        // type IntOrStr = int | StrOrInt  # It's redundant, but OK
-        // type StrOrInt = str | IntOrStr  # It's redundant, but OK
-        // ```
+        if let Some(name) = type_alias.name.as_name_expr() {
+            self.check_type_alias_cycle(&name.id, &type_alias.value, type_alias);
+        }
+    }
+
+    /// Check both alias syntaxes, including union members that disappear during expansion.
+    fn check_type_alias_cycle(&mut self, name: &str, value: &ast::Expr, node: impl Ranged) {
+        let db = self.db();
+        let value_ty = self.expression_type(value);
         let expanded = value_ty.expand_eagerly(db, self.program_environment());
-        if expanded.is_divergent() {
-            if let Some(builder) = self
+        if (expanded.is_divergent() || value_ty.has_unguarded_alias_cycle(db))
+            && let Some(builder) = self
                 .context
-                .report_lint(&CYCLIC_TYPE_ALIAS_DEFINITION, type_alias)
-            {
-                builder.into_diagnostic(format_args!(
-                    "Cyclic definition of `{}`",
-                    type_alias.name.as_name_expr().unwrap().id,
-                ));
-            }
-            // Replace with `Divergent`.
-            self.expressions
-                .insert(type_alias.value.as_ref().into(), expanded);
+                .report_lint(&CYCLIC_TYPE_ALIAS_DEFINITION, node)
+        {
+            builder.into_diagnostic(format_args!("Cyclic definition of `{name}`"));
+        }
+        if expanded.is_divergent() {
+            // Preserve the dynamic recovery type for aliases that cannot be expanded at all.
+            // Union cycles retain their non-recursive members for recovery.
+            self.expressions.insert(value.into(), expanded);
         }
     }
 
@@ -3802,7 +3798,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 Some(KnownClass::TypeAliasType | KnownClass::ExtensionsTypeAliasType),
                 InferenceRegion::Deferred(definition),
             ) => {
-                self.infer_typealiastype_assignment_deferred(definition, arguments);
+                self.infer_typealiastype_assignment_deferred(definition, target, arguments);
                 return;
             }
             (Some(KnownClass::Type), InferenceRegion::Deferred(definition)) => {
@@ -4039,6 +4035,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_typealiastype_assignment_deferred(
         &mut self,
         definition: Definition<'db>,
+        target: &ast::Expr,
         arguments: &ast::Arguments,
     ) {
         let db = self.db();
@@ -4202,6 +4199,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         self.typevar_binding_context = previous_context;
+        if let Some(name) = target.as_name_expr() {
+            self.check_type_alias_cycle(&name.id, &arguments.args[1], &arguments.args[1]);
+        }
     }
 
     fn is_valid_receiver_annotation_target(&self, target: &ast::Expr) -> bool {
@@ -10442,6 +10442,34 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_attribute_load_impl(attribute, value_type)
     }
 
+    /// Reject access to a generic instance attribute through a class while retaining the normal
+    /// attribute type for recovery. Reads and writes use the same restriction.
+    fn validate_generic_class_attribute_access(
+        &self,
+        attribute: &ast::ExprAttribute,
+        object_ty: Type<'db>,
+        emit_diagnostics: bool,
+    ) -> bool {
+        if !object_ty.has_generic_instance_attribute(
+            self.db(),
+            self.program_environment(),
+            &attribute.attr.id,
+        ) {
+            return true;
+        }
+        if emit_diagnostics
+            && let Some(builder) = self
+                .context
+                .report_lint(&INVALID_ATTRIBUTE_ACCESS, attribute)
+        {
+            builder.into_diagnostic(format_args!(
+                "Cannot access generic instance attribute `{}` through a class",
+                attribute.attr.id,
+            ));
+        }
+        false
+    }
+
     /// Infer an attribute load on a known receiver, returning its recovery type if lookup fails.
     fn infer_attribute_load_impl(
         &mut self,
@@ -10506,6 +10534,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .map_type(|ty| {
                 self.narrow_expr_with_applicable_constraints(attribute, ty, &constraint_keys)
             });
+
+        // An augmented assignment also loads its target, but its write validation reports this
+        // error. Avoid reporting the same invalid access twice.
+        if !attribute.ctx.is_store() {
+            self.validate_generic_class_attribute_access(attribute, value_type, true);
+        }
 
         let attr_name = &attr.id;
         let lookup_result = fallback_place.into_lookup_result(db, env);

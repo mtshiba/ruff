@@ -459,13 +459,14 @@ Added in <a href="https://github.com/astral-sh/ty/releases/tag/0.0.1-alpha.29">0
 **What it does**
 
 
-Checks for type alias definitions that (directly or mutually) refer to themselves.
+Checks for circular type alias definitions.
 
 **Why is it bad?**
 
 
-Although it is permitted to define a recursive type alias, it is not meaningful to have a type alias
-whose expansion can only result in itself, and is therefore not allowed.
+Recursive aliases are valid when recursive references occur inside another type, such as
+`list[Tree]`. An alias cannot expand directly to itself or include itself as a union member. This
+applies to both `type` statements and aliases created with `TypeAliasType`.
 
 **Examples**
 
@@ -476,10 +477,18 @@ python-version = "3.12"
 ```
 
 ```python
+from typing import TypeAliasType
+
 type Itself = Itself  # error
 
 type A = B  # error
 type B = A  # error
+
+type IntOr = int | IntOr  # error
+
+Cycle = TypeAliasType("Cycle", "Cycle")  # error
+
+type Tree = int | list[Tree]  # valid recursive alias
 ```
 
 ## `dataclass-field-order`
@@ -1308,10 +1317,16 @@ Added in <a href="https://github.com/astral-sh/ty/releases/tag/0.0.1-alpha.1">0.
 
 
 Checks for assignments to class variables from instances and assignments to instance-only attributes
-from their class.
+from their class. Also checks for reads and writes of generic instance attributes through a generic
+class or a specialized generic alias.
 
 An "instance-only" variable is one which is only ever assigned to or declared when accessed via
 `self` in an instance method.
+
+A generic instance attribute has a type that depends on the class's type parameters. Specializing a
+generic class does not create separate class attribute storage, so these attributes cannot be
+accessed through the generic class or a specialized alias. Access through a `type[...]` receiver is
+allowed because it can refer to a concrete subclass with its own class attributes.
 
 **Why is this bad?**
 
@@ -1350,6 +1365,23 @@ C().class_var = 3  # error
 
 # Cannot assign to instance-only variable from class
 C.instance_only_var = 56  # error
+```
+
+```python
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+
+class Box(Generic[T]):
+    value: T
+
+
+Box[int].value = 1  # error
+Box.value  # error
+
+box = Box[int]()
+box.value = 1  # okay
 ```
 
 ## `invalid-attribute-override`
@@ -3682,8 +3714,8 @@ Preview (since <a href="https://github.com/astral-sh/ty/releases/tag/0.0.76">0.0
 **What it does**
 
 
-Checks for imports from installable packages that the current project does not declare as direct
-dependencies.
+Checks for imports from installable packages that the current project or PEP 723 script does not
+declare as direct dependencies.
 
 The name used in dependency declarations can differ from the import name: for example, the `pillow`
 package is imported as `PIL`.
@@ -3692,8 +3724,8 @@ package is imported as `PIL`.
 
 
 A dependency can be installed because another package requires it. Importing that dependency without
-declaring it makes your project rely on another package's dependency list. If that package removes
-the dependency, your imports can fail.
+declaring it makes your code rely on another package's dependency list. If that package removes the
+dependency, your imports can fail.
 
 Declare the packages that provide your imports in `project.dependencies` or
 `project.optional-dependencies` in `pyproject.toml`. Non-package files, such as tests and
@@ -3705,11 +3737,17 @@ for how to add these declarations.
 **Rule status**
 
 
-This rule is disabled by default. It requires uv workspace integration (`TY_UV=1`) and an existing,
-synchronized environment. Running [`uv check`](https://docs.astral.sh/uv/reference/cli/#uv-check)
-synchronizes the environment automatically before invoking ty, unless `--no-sync` is passed. The
-rule itself reads the dependency graph and module ownership returned by `uv workspace metadata`; it
-does not install or update dependencies. uv 0.12.3 or later is required.
+This rule is disabled by default and requires uv integration.
+
+For projects, enable uv workspace integration (`TY_UV=1`) and use an existing, synchronized
+environment. Running [`uv check`](https://docs.astral.sh/uv/reference/cli/#uv-check) synchronizes
+the environment automatically before invoking ty, unless `--no-sync` is passed. For these checks, ty
+reads the dependency graph and module ownership returned by `uv workspace metadata` without
+installing or updating dependencies. uv 0.12.3 or later is required.
+
+For PEP 723 scripts, enable uv script integration with `TY_UV=scripts` or `TY_UV=1`. ty synchronizes
+each script's environment and checks imports against its inline `dependencies` list. Declarations
+and environments from the enclosing workspace or other scripts do not apply.
 
 **Known limitations**
 
@@ -3722,7 +3760,7 @@ can use development-only dependencies, such as type stub packages, without requi
 as runtime dependencies.
 
 Standard-library imports and imports whose owning package cannot be identified unambiguously are
-also not reported. This rule does not support PEP 723 scripts.
+also not reported.
 
 Imports of [namespace packages](https://docs.python.org/3/reference/import.html#namespace-packages)
 themselves, such as `import ns`, are not reported: the namespace can contain modules from several
@@ -5193,12 +5231,11 @@ Added in <a href="https://github.com/astral-sh/ty/releases/tag/0.0.73">0.0.73</a
 **What it does**
 
 
-Detects assignments that unsoundly assign a type that is not a [subtype] of the target's declared
-type.
+Detects variable assignments that unsoundly assign a type that is not a [subtype] of a variable's
+declared type.
 
-This rule is a stricter version of [`invalid-assignment`](#invalid-assignment). The rule currently only flags unsound
-assignments to variables (excluding attributes and subscripts), but its scope may be expanded in the
-future.
+This rule is a stricter version of [`invalid-assignment`](#invalid-assignment). Whereas that rule also flags assignments to
+attributes and subscripts, however, this rule is only applied to variable assignments.
 
 This rule has no effect on stub files.
 

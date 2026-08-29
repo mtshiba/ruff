@@ -29,7 +29,10 @@ use self::class::ClassInstanceFlags;
 pub use self::cyclic::CycleDetector;
 pub(crate) use self::cyclic::TypeTransformer;
 use self::cyclic::{ActiveRecursionDetector, TypeIdentity};
-pub use self::dedicated::pytest::{FixtureBinding, fixture_bindings_for_parameter};
+pub use self::dedicated::pytest::{
+    FixtureBinding, FixtureExposure, FixtureNameSource, fixture_bindings_for_parameter,
+    fixture_exposures_for_definition, pytest_global_plugin_files,
+};
 pub(crate) use self::diagnostic::TypeCheckDiagnostics;
 pub(crate) use self::diagnostic::register_lints;
 pub use self::diagnostic::{UNDEFINED_REVEAL, UNRESOLVED_REFERENCE};
@@ -4852,6 +4855,80 @@ impl<'db> Type<'db> {
             MemberLookupPolicy::default(),
             None,
         )
+    }
+
+    /// Whether class access exposes an instance attribute whose type depends on the class's
+    /// type parameters. Specializing a class does not give it separate attribute storage:
+    /// `Box[int].value` and `Box[str].value` both refer to `Box.value` at runtime.
+    /// A `type[Box[int]]` receiver can refer to a concrete subclass with its own attributes,
+    /// so this restriction only applies to class literals and generic aliases.
+    fn has_generic_instance_attribute(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        name: &str,
+    ) -> bool {
+        let class = match self {
+            Type::Union(union) => {
+                return union
+                    .elements(db)
+                    .iter()
+                    .any(|element| element.has_generic_instance_attribute(db, env, name));
+            }
+            Type::ClassLiteral(class) => class,
+            Type::GenericAlias(alias) => alias.origin(db).into(),
+            _ => return false,
+        };
+        let Some(generic_context) = class
+            .as_static()
+            .and_then(|class| class.generic_context(db))
+        else {
+            return false;
+        };
+        // A metaclass data descriptor takes precedence over the instance declaration.
+        if class
+            .metaclass(db)
+            .find_name_in_mro_with_policy(db, env, name, MemberLookupPolicy::default())
+            .and_then(|member| member.place.ignore_possibly_undefined())
+            .is_some_and(|ty| ty.is_data_descriptor(db, env))
+        {
+            return false;
+        }
+        let member = Type::from(class.identity_specialization(db)).class_object_member(
+            db,
+            env,
+            name,
+            MemberLookupPolicy::default(),
+        );
+        let Place::Defined(DefinedPlace {
+            ty,
+            origin: TypeOrigin::Declared,
+            ..
+        }) = member.place
+        else {
+            return false;
+        };
+        if member.is_class_var() {
+            return false;
+        }
+        let ty = match ty.resolve_type_alias(db) {
+            Type::Union(union) if union.has_aliases(db) => union.expand_aliases(db, env),
+            ty => ty,
+        };
+        let alternatives = match &ty {
+            Type::Union(union) => union.elements(db),
+            _ => std::slice::from_ref(&ty),
+        };
+        alternatives.iter().any(|ty| {
+            // Descriptors define their own class-access behavior, but do not exempt other
+            // alternatives in a union from the restriction on generic instance storage.
+            ty.class_member(db, env, "__get__").is_undefined()
+                // Variance accounts for aliases without expanding recursive specializations,
+                // and ignores alias arguments that do not affect the resulting type.
+                && generic_context.variables(db).any(|typevar| {
+                    ty.variance_of(db, env, typevar.identity(db)) != TypeVarVariance::Bivariant
+                })
+        })
     }
 
     /// Similar to [`Type::member`], but allows the caller to specify what policy should be used
