@@ -2798,6 +2798,11 @@ impl<'db> Type<'db> {
         }
     }
 
+    fn is_int_literal(&self) -> bool {
+        self.as_literal_value()
+            .is_some_and(LiteralValueType::is_int)
+    }
+
     fn as_int_literal(self) -> Option<i64> {
         match self {
             Type::LiteralValue(literal) => literal.as_int(),
@@ -8567,6 +8572,22 @@ impl<'db> Type<'db> {
         specialization: Specialization<'db>,
         specialize_self_domain: bool,
     ) -> Type<'db> {
+        if let Type::NominalInstance(instance) = self
+            && !instance.is_definition_generic(db)
+        {
+            return self;
+        }
+
+        if let Type::TypeVar(typevar) = self
+            && !typevar.is_paramspec(db)
+        {
+            match specialization.get(db, typevar) {
+                Some(mapped) if specialization.materialization_kind(db).is_none() => return mapped,
+                None if !specialize_self_domain || !typevar.typevar(db).is_self(db) => return self,
+                _ => {}
+            }
+        }
+
         if matches!(
             self,
             Type::Dynamic(_)
