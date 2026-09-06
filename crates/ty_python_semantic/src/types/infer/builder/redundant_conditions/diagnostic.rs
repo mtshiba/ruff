@@ -3,26 +3,50 @@
 use std::borrow::Cow;
 
 use ruff_db::{
-    diagnostic::{Annotation, Span, SubDiagnostic, SubDiagnosticSeverity},
+    diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity},
     parsed::parsed_module,
     source::source_text,
 };
 use ruff_diagnostics::{Applicability, Edit, Fix};
-use ruff_python_ast as ast;
-use ruff_source_file::LineRanges;
-use ruff_text_size::Ranged;
-use ty_python_core::Truthiness;
+use ruff_python_ast::{
+    self as ast, PythonVersion,
+    helpers::any_over_expr,
+    token::{TokenKind, Tokens, parenthesized_range},
+};
+use ruff_python_trivia::indentation_at_offset;
+use ruff_source_file::{LineRanges, UniversalNewlineIterator, find_newline};
+use ruff_text_size::{Ranged, TextRange, TextSize};
+use ty_module_resolver::{SearchPath, file_to_module};
+use ty_python_core::{
+    Truthiness,
+    ast_ids::HasScopedUseId,
+    definition::DefinitionKind,
+    place::PlaceExpr,
+    predicate::{Predicate, PredicateNode},
+    scope::{NodeWithScopeKind, ScopeKind},
+};
 
 use crate::{
     SemanticModel,
+    importer::ImportRequest,
+    place::{Place, PlaceAndQualifiers},
+    place_load::{PlaceLoadMode, PlaceLoadResolutionStep, resolve_place_load},
     types::{
         KnownClass, LintDiagnosticGuard, LintDiagnosticGuardBuilder, MemberLookupPolicy, Type,
-        call::bind::CallableDescription, enum_metadata, function::KnownFunction,
-        infer::TypeInferenceBuilder, signatures::CallableSignature, tuple::TupleLength,
+        TypeContext,
+        call::bind::CallableDescription,
+        diagnostic::typing_module_for_fix,
+        enum_metadata,
+        function::KnownFunction,
+        infer::TypeInferenceBuilder,
+        infer_definition_types, infer_scope_types,
+        narrow::{NarrowingConstraint, infer_narrowing_constraints},
+        signatures::CallableSignature,
+        tuple::{Tuple, TupleLength},
     },
 };
 
-use super::RedundantCondition;
+use super::{ConditionKind, RedundantCondition, exemptions::condition_definition_info};
 
 impl<'db> TypeInferenceBuilder<'db, '_> {
     pub(super) fn report_redundant_condition<'ctx>(
@@ -209,16 +233,39 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let mut diagnostic =
                     builder.into_diagnostic(format_args!("{function} is always truthy"));
 
-                // Add a suggestion and fix that they might have meant to call this function.
+                // Add a suggestion and fix that they might have meant to call (and possibly
+                // also await) this function.
                 //
                 // It's true that calling the function might not actually fix this diagnostic
                 // if the function returns something that is always truthy. They still probably
                 // meant to call the function, though, so it's still a useful suggestion/fix!
 
-                diagnostic.set_primary_annotation_message(format_args!(
-                    "Did you mean to call this {}?",
-                    function.kind()
-                ));
+                // A coroutine return type establishes that calling and awaiting the function
+                // is appropriate. `Any`, `Unknown`, and `Never` do not establish this, even
+                // though they are assignable to `CoroutineType`.
+                // Use the top materialization so the unspecified generic arguments do not
+                // prevent concrete coroutine types from being subtypes.
+                let coroutine = KnownClass::CoroutineType
+                    .to_instance(db, env)
+                    .top_materialization(db, env);
+
+                let is_awaitable_coro_function = self.can_await_here(test)
+                    && function.signature().iter().all(|signature| {
+                        !signature.return_ty.is_equivalent_to(db, env, Type::Never)
+                            && signature.return_ty.is_subtype_of(db, env, coroutine)
+                    });
+
+                let kind = function.kind();
+
+                if is_awaitable_coro_function {
+                    diagnostic.set_primary_annotation_message(format_args!(
+                        "Did you mean to `await` and call this {kind}?",
+                    ));
+                } else {
+                    diagnostic.set_primary_annotation_message(format_args!(
+                        "Did you mean to call this {kind}?"
+                    ));
+                }
 
                 if matches!(test, ast::Expr::Name(_) | ast::Expr::Attribute(_)) {
                     let (call, applicability) = if function.signature().has_parameters() {
@@ -228,7 +275,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     };
                     let call_edit = Edit::insertion(call.to_string(), test.end());
 
-                    diagnostic.set_fix(Fix::applicable_edit(call_edit, applicability));
+                    let fix = if is_awaitable_coro_function {
+                        Fix::applicable_edits(
+                            Edit::insertion("await ".to_string(), test.start()),
+                            [call_edit],
+                            applicability,
+                        )
+                    } else {
+                        Fix::applicable_edit(call_edit, applicability)
+                    };
+                    diagnostic.set_fix(fix);
                 }
 
                 diagnostic
@@ -264,6 +320,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 }
 
                 annotate_inferred_type(&mut diagnostic);
+                self.diagnose_single_length_tuple(length, test, *test_type, &mut diagnostic);
 
                 diagnostic
             } else if let Type::TypedDict(typed_dict) = test_type
@@ -391,7 +448,20 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let mut diagnostic = builder.into_diagnostic("Condition is always truthy");
                 add_always_truthy_concise_message(&mut diagnostic);
                 annotate_inferred_type(&mut diagnostic);
-                if let Type::NominalInstance(instance) = test_type {
+                if test_type.try_await(db, env).is_ok() && self.can_await_here(test) {
+                    diagnostic.help("Did you mean to `await` this expression?");
+
+                    let fix = if test.precedence() <= ast::OperatorPrecedence::Await {
+                        Fix::unsafe_edits(
+                            Edit::insertion("await (".to_string(), test.start()),
+                            [Edit::insertion(")".to_string(), test.end())],
+                        )
+                    } else {
+                        Fix::unsafe_edit(Edit::insertion("await ".to_string(), test.start()))
+                    };
+
+                    diagnostic.set_fix(fix);
+                } else if let Type::NominalInstance(instance) = test_type {
                     let class = instance.class(db, env);
                     if class.is_final(db)
                         && !class.is_known(db, KnownClass::CoroutineType)
@@ -525,6 +595,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 diagnostic
             }
         };
+
         Some(diagnostic)
     }
 
@@ -600,6 +671,448 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     subexpression_type.display(db, env)
                 )),
         );
+        if let Ok(length) = usize::try_from(length) {
+            self.diagnose_single_length_tuple(
+                TupleLength::Fixed(length),
+                test_subexpression,
+                subexpression_type,
+                &mut diagnostic,
+            );
+        }
         diagnostic
     }
+
+    fn diagnose_single_length_tuple(
+        &self,
+        length: TupleLength,
+        node: &ast::Expr,
+        node_type: Type<'db>,
+        diagnostic: &mut Diagnostic,
+    ) {
+        let db = self.db();
+        let env = self.program_environment();
+
+        // The ellipsis suggestion is for `tuple[T]`, not named tuples or other
+        // subclasses whose fixed length is part of their definition.
+        if length == TupleLength::Fixed(1)
+            && let Some(tuple_spec) = node_type.tuple_instance_spec(db, env)
+            && let Tuple::Fixed(fixed_length_tuple) = &*tuple_spec
+            && matches!(node, ast::Expr::Name(_) | ast::Expr::Attribute(_))
+        {
+            if node_type.exact_tuple_instance_spec(db).is_none() {
+                if let Some(definition) = node_type.definition(db, env)
+                    && let Some(definition) = definition.definition()
+                {
+                    let module = parsed_module(db, definition.python_file(db)).load(db);
+                    diagnostic.annotate(
+                        Annotation::secondary(Span::from(definition.focus_range(db, &module)))
+                            .message(format_args!(
+                                "`{}` defined here",
+                                node_type.display(db, env)
+                            )),
+                    );
+                }
+                return;
+            }
+
+            let definition_info =
+                condition_definition_info(db, self.program_file(), node, |expr| {
+                    self.expression_type(expr)
+                });
+
+            if let Some(single_definition) = definition_info.single_definition {
+                let file = single_definition.python_file(db);
+                let program_file = single_definition.program_file(db);
+                let module = parsed_module(db, file).load(db);
+                let annotation_info = match single_definition.kind(db) {
+                    DefinitionKind::AnnotatedAssignment(assignment) => {
+                        let annotation = assignment.annotation(&module);
+                        infer_definition_types(db, single_definition)
+                            .try_expression_type(annotation)
+                            .map(|annotation_type| (annotation, annotation_type))
+                    }
+                    DefinitionKind::Parameter(parameter) => {
+                        parameter.annotation(&module).and_then(|annotation| {
+                            let scope = single_definition.scope(db).scope(db).parent()?;
+                            let annotation_type = infer_scope_types(
+                                db,
+                                scope.to_scope_id(db, program_file),
+                                TypeContext::default(),
+                            )
+                            .try_expression_type(annotation)?;
+                            Some((annotation, annotation_type))
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some((annotation, annotation_type)) = annotation_info
+                    && annotation_type == node_type
+                {
+                    let file = single_definition.file(db);
+                    let diagnostic_annotation =
+                        || Annotation::secondary(Span::from(file).with_range(annotation.range()));
+                    diagnostic.annotate(
+                        diagnostic_annotation()
+                            .message("Inferred as a 1-element tuple due to this annotation"),
+                    );
+
+                    let sole_element = fixed_length_tuple.elements_slice()[0];
+                    let suggested_type = Type::homogeneous_tuple(db, env, sole_element)
+                        .display(db, env)
+                        .to_string_parts();
+
+                    if suggested_type.is_valid_syntax {
+                        let resolver_file = single_definition.program_file(db).resolver_file(db);
+                        let annotated_in_first_party_code = file == self.file()
+                            || file_to_module(db, resolver_file)
+                                .and_then(|module| module.search_path(db))
+                                .is_some_and(SearchPath::is_first_party);
+
+                        let maybe_star = if annotation.is_starred_expr() {
+                            "*"
+                        } else {
+                            ""
+                        };
+
+                        let annotation = if annotated_in_first_party_code {
+                            diagnostic_annotation().message(format_args!(
+                                "Did you mean `{maybe_star}{}`?",
+                                suggested_type.label
+                            ))
+                        } else {
+                            diagnostic_annotation().message(format_args!(
+                                "The author of this code might have meant `{maybe_star}{}`?",
+                                suggested_type.label
+                            ))
+                        };
+
+                        diagnostic.annotate(annotation);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns `true` if adding `await` at `expression` would produce valid Python.
+    ///
+    /// Accounts for asynchronous functions, notebook cells, annotation restrictions, enclosing
+    /// scopes, and the different scoping behavior of comprehensions and generator expressions.
+    fn can_await_here(&self, expression: &ast::Expr) -> bool {
+        let Some(expression_scope) = self.index.try_expression_scope_id(expression) else {
+            return false;
+        };
+        let annotation_parent_scope = self
+            .index
+            .annotation_parent_scope_id(self.module(), expression);
+
+        let db = self.db();
+
+        let mut in_eager_comprehension = false;
+
+        for (scope_id, scope) in self.index.ancestor_scopes(expression_scope) {
+            // The first iterable of a comprehension stays in the annotation's enclosing scope.
+            // Eager comprehensions also inherit the restriction, but a generator body can allow
+            // `await` before we reach the scope enclosing its annotation.
+            // Conservatively reject annotations on every Python version, even though some allow
+            // `await` before Python 3.14 without `from __future__ import annotations`. Avoiding
+            // invalid syntax matters more than offering every possible fix in this rare context.
+            if Some(scope_id) == annotation_parent_scope {
+                return false;
+            }
+
+            // Before Python 3.11, awaiting in a nested list, set, or dict comprehension cannot
+            // implicitly make its containing comprehension or generator expression asynchronous.
+            if in_eager_comprehension
+                && scope.kind() == ScopeKind::Comprehension
+                && self.program_environment().python_version(db) < PythonVersion::PY311
+                && !scope_id.is_async_comprehension(self.index)
+            {
+                return false;
+            }
+
+            match scope.node() {
+                NodeWithScopeKind::Function(function) => {
+                    return function.node(self.module()).is_async;
+                }
+                NodeWithScopeKind::Lambda(_)
+                | NodeWithScopeKind::Class(_)
+                | NodeWithScopeKind::ClassTypeParameters(_)
+                | NodeWithScopeKind::FunctionTypeParameters(_)
+                | NodeWithScopeKind::TypeAliasTypeParameters(_)
+                | NodeWithScopeKind::TypeAlias(_) => {
+                    return false;
+                }
+                NodeWithScopeKind::GeneratorExpression(_) => {
+                    return true;
+                }
+                NodeWithScopeKind::Module => {
+                    return source_text(db, self.file()).is_notebook();
+                }
+                NodeWithScopeKind::DictComprehension(_)
+                | NodeWithScopeKind::ListComprehension(_)
+                | NodeWithScopeKind::SetComprehension(_) => {
+                    in_eager_comprehension = true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub(super) fn annotate_redundant_if_or_elif(
+        &self,
+        condition: &RedundantCondition<'_, 'db>,
+        diagnostic: &mut Diagnostic,
+        if_stmt: &ast::StmtIf,
+    ) {
+        let RedundantCondition {
+            expression: test,
+            value_type: _,
+            is_truthy,
+            kind,
+        } = condition;
+
+        if *is_truthy
+            && *kind == ConditionKind::Boolean
+            && let Some(clause) = if_stmt.elif_else_clauses.last()
+            && clause.test.as_ref() == Some(test)
+            && !diagnostic.has_applicable_fix(Applicability::DisplayOnly)
+        {
+            if let Some(fix) = self.add_assert_never_else(clause, test) {
+                diagnostic.help("Add an `else` branch that calls `assert_never`");
+                diagnostic.set_fix(fix);
+            } else {
+                diagnostic.help(
+                    "Replace this `elif` with an `else` branch \
+                that asserts the condition to be `True`",
+                );
+                if let Some(fix) = self.replace_redundant_elif_with_assertion(clause, test) {
+                    diagnostic.set_fix(fix);
+                }
+            }
+        }
+    }
+
+    /// Add an explicit exhaustiveness check after a redundant final `elif`.
+    ///
+    /// Only read a plain variable whose type is a union before the chain, and which narrows
+    /// to `Never` when the condition is false. Repeating attribute access or a function call
+    /// could have side effects. Returns `None`
+    /// when no such variable or unshadowed runtime import is available.
+    /// The fix is unsafe because the new branch raises if the static assumptions fail at runtime.
+    fn add_assert_never_else(&self, clause: &ast::ElifElseClause, test: &ast::Expr) -> Option<Fix> {
+        let db = self.db();
+        let first_statement = clause.body.first()?;
+        let source = source_text(db, self.file());
+        let indentation = indentation_at_offset(clause.start(), &source)?;
+        let argument = self.assert_never_argument(test)?;
+
+        let module = typing_module_for_fix(&self.context, "assert_never", PythonVersion::PY311)?;
+        let importer = self.context.importer();
+
+        let action = importer.import_for_diagnostic(
+            ImportRequest::import_from(module.as_str(), "assert_never"),
+            self.scope().file_scope_id(db),
+            clause.start(),
+        )?;
+
+        let body_indentation = indentation_at_offset(first_statement.start(), &source)
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(format!("{indentation}{}", importer.indentation())));
+
+        let line_ending = find_newline(&source)
+            .map(|(_, ending)| ending)
+            .unwrap_or_default()
+            .as_str();
+
+        let mut end = logical_line_end(&source, self.module().tokens(), clause.end());
+
+        // Keep trailing body comments with the `elif`, including those after a nested statement.
+        for line in UniversalNewlineIterator::with_offset(&source[usize::from(end)..], end) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.starts_with(body_indentation.as_ref()) && line.trim_start().starts_with('#') {
+                end = line.full_end();
+            } else {
+                break;
+            }
+        }
+
+        let leading_newline = if source.line_start(end) == end {
+            ""
+        } else {
+            line_ending
+        };
+
+        Some(Fix::unsafe_edits(
+            Edit::insertion(
+                format!(
+                    "{leading_newline}{indentation}else:{line_ending}{body_indentation}{}({}){line_ending}",
+                    action.symbol_text(),
+                    argument.id,
+                ),
+                end,
+            ),
+            action.import().cloned(),
+        ))
+    }
+
+    /// Find a variable tested directly, by a comparison, or by a narrowing function.
+    /// More complex conditions cannot provide an argument without repeating their evaluation.
+    fn assert_never_argument<'a>(&self, test: &'a ast::Expr) -> Option<&'a ast::ExprName> {
+        if any_over_expr(test, ast::Expr::is_named_expr) {
+            return None;
+        }
+
+        let mut operand = test;
+
+        while let ast::Expr::UnaryOp(unary) = operand
+            && unary.op == ast::UnaryOp::Not
+        {
+            operand = &unary.operand;
+        }
+
+        let candidates = match operand {
+            ast::Expr::Name(_) => [Some(operand), None],
+            ast::Expr::Compare(compare) if compare.ops.len() == 1 => {
+                [Some(compare.left.as_ref()), compare.comparators.first()]
+            }
+            ast::Expr::Call(call) => [call.arguments.args.first(), None],
+            _ => return None,
+        };
+
+        let db = self.db();
+        let env = self.program_environment();
+        let places = self.index.place_table(self.scope().file_scope_id(db));
+
+        let predicate = Predicate {
+            node: PredicateNode::Expression(self.index.expression(test)),
+            is_positive: false,
+        };
+
+        candidates.into_iter().flatten().find_map(|candidate| {
+            let name = candidate.as_name_expr()?;
+            let ty = self.expression_type(candidate);
+            if ty.is_never() || !self.type_before_if_chain(name)?.is_union() {
+                return None;
+            }
+            let place = places.symbol_id(&name.id)?;
+            let (constraint, _) = infer_narrowing_constraints(db, predicate, place.into());
+            NarrowingConstraint::intersection(ty)
+                .merge_constraint_and(constraint?)
+                .evaluate_constraint_type(db, env)
+                .is_never()
+                .then_some(name)
+        })
+    }
+
+    /// Resolve a name using the bindings and constraints that precede its `if` chain.
+    /// This preserves earlier narrowing, including constraints on captured variables.
+    fn type_before_if_chain(&self, name: &ast::ExprName) -> Option<Type<'db>> {
+        let db = self.db();
+        let env = self.program_environment();
+        let use_def = self.index.use_def_map(self.scope().file_scope_id(db));
+        let snapshot =
+            use_def.if_chain_start_for_use(name.scoped_use_id(db, self.program_file()))?;
+        let mut resolution = resolve_place_load(
+            db,
+            self.index,
+            self.scope(),
+            PlaceExpr::from_expr_name(name),
+            PlaceLoadMode::AtNameSnapshot(snapshot),
+        );
+        let mut place = PlaceAndQualifiers::from(Place::Undefined);
+        while let Some(PlaceLoadResolutionStep::Source(source)) = resolution.next() {
+            let constraints = resolution.narrowing_constraints_for(&source);
+            place = place.or_fall_back_to(db, env, || {
+                self.infer_place_load_source(resolution.place_expr(), source, constraints)
+            });
+            if place.place.is_definitely_bound() {
+                break;
+            }
+        }
+        place.place.ignore_possibly_undefined()
+    }
+
+    /// Replaces an always-true final `elif` with an `else` branch and a defensive assertion.
+    ///
+    /// Preserves the original condition, comments, branch indentation, and file-wide line-ending
+    /// style. Bare assignment expressions are parenthesized so they remain valid assertion tests.
+    /// Returns `None` when the branch has no body, its first statement cannot accommodate a new
+    /// indented assertion, or rewriting the header would discard a comment.
+    ///
+    /// The fix is unsafe because an incorrect static assumption can cause the new assertion to
+    /// fail at runtime, and optimized Python execution may remove the assertion entirely.
+    fn replace_redundant_elif_with_assertion(
+        &self,
+        clause: &ast::ElifElseClause,
+        test: &ast::Expr,
+    ) -> Option<Fix> {
+        let first_statement = clause.body.first()?;
+        let source = source_text(self.db(), self.file());
+        let tokens = self.module().tokens();
+        let first_statement_line_start = source.line_start(first_statement.start());
+
+        if first_statement_line_start < logical_line_end(&source, tokens, clause.start()) {
+            return None;
+        }
+
+        // An indent token can span backslash continuations. In that case, the first statement's
+        // physical indentation may differ from the indentation that determines the body's scope.
+        if let Some(token) = tokens.before(first_statement.start()).last()
+            && token.kind() == TokenKind::Indent
+            && token.start() < first_statement_line_start
+        {
+            return None;
+        }
+
+        let indentation = indentation_at_offset(first_statement.start(), &source)?;
+        let parenthesized_test_range = parenthesized_range(test.into(), clause.into(), tokens);
+        let test_range = parenthesized_test_range.unwrap_or(test.range());
+        let header_prefix_range = TextRange::new(clause.start(), test_range.start());
+
+        // Ruff caches `CommentRanges` in its indexer, but ty does not. Constructing
+        // `CommentRanges` here would scan and index every comment in the file just to check
+        // this small range, so inspect the existing tokens directly instead.
+        if tokens
+            .in_range(header_prefix_range)
+            .iter()
+            .any(|token| token.kind().is_comment())
+        {
+            return None;
+        }
+
+        let condition = &source[test_range];
+        let assertion_condition = if test.is_named_expr() && parenthesized_test_range.is_none() {
+            format!("({condition})")
+        } else {
+            condition.to_string()
+        };
+        let line_ending = find_newline(&source)
+            .map(|(_, ending)| ending)
+            .unwrap_or_default()
+            .as_str();
+
+        Some(Fix::unsafe_edits(
+            Edit::range_replacement(
+                "else".to_string(),
+                TextRange::new(clause.start(), test_range.end()),
+            ),
+            [Edit::insertion(
+                format!("assert {assertion_condition}{line_ending}{indentation}"),
+                first_statement.start(),
+            )],
+        ))
+    }
+}
+
+/// Returns the end of the logical line at `offset`, including its newline.
+/// A trailing backslash can extend the line beyond its last AST node's physical line.
+fn logical_line_end(source: &str, tokens: &Tokens, offset: TextSize) -> TextSize {
+    tokens
+        .after(offset)
+        .iter()
+        .find(|token| token.kind() == TokenKind::Newline)
+        .map_or_else(|| source.full_line_end(offset), Ranged::end)
 }

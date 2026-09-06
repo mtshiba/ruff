@@ -828,44 +828,25 @@ impl<'db> StaticClassLiteral<'db> {
     ) -> Result<&'db Mro<'db>, &'db StaticMroError<'db>> {
         match specialization {
             None => self.try_mro_unspecialized(db),
-            Some(specialization) => self.try_mro_specialized(db, specialization),
+            Some(specialization) => GenericAlias::new(db, self, specialization).try_mro(db),
         }
+        .map_err(Box::as_ref)
     }
 
     #[salsa::tracked(
         returns(as_ref),
         cycle_initial=|db, _, self_: StaticClassLiteral<'db>| {
             let env = ProgramEnvironment::from_scope(self_.body_scope(db));
-            Err(StaticMroError::cycle(
+            Err(Box::new(StaticMroError::cycle(
                 db, &env,
                 self_.apply_optional_specialization(db, None),
-            ))
+            )))
         },
         heap_size=ruff_memory_usage::heap_size
     )]
-    fn try_mro_unspecialized(self, db: &'db dyn Db) -> Result<Mro<'db>, StaticMroError<'db>> {
+    fn try_mro_unspecialized(self, db: &'db dyn Db) -> Result<Mro<'db>, Box<StaticMroError<'db>>> {
         tracing::trace!("StaticClassLiteral::try_mro: {}", self.name(db));
-        Mro::of_static_class(db, self, None)
-    }
-
-    #[salsa::tracked(
-        returns(as_ref),
-        cycle_initial=|db, _, self_: StaticClassLiteral<'db>, specialization| {
-            let env = ProgramEnvironment::from_scope(self_.body_scope(db));
-            Err(StaticMroError::cycle(
-                db, &env,
-                self_.apply_optional_specialization(db, Some(specialization)),
-            ))
-        },
-        heap_size=ruff_memory_usage::heap_size
-    )]
-    fn try_mro_specialized(
-        self,
-        db: &'db dyn Db,
-        specialization: Specialization<'db>,
-    ) -> Result<Mro<'db>, StaticMroError<'db>> {
-        tracing::trace!("StaticClassLiteral::try_mro: {}", self.name(db));
-        Mro::of_static_class(db, self, Some(specialization))
+        Mro::of_static_class(db, self, None).map_err(Box::new)
     }
 
     /// Iterate over the [method resolution order] ("MRO") of the class.
