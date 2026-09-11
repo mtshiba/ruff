@@ -4290,7 +4290,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     for element in union.elements(db) {
                         self.infer_map_impl(
                             formal_protocol,
-                            element.bindings(db, self.env).return_type(db, self.env),
+                            element.instance_type_for_meta_protocol(db, self.env),
                             polarity,
                             seen,
                         )?;
@@ -4299,7 +4299,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
                 return self.infer_map_impl(
                     formal_protocol,
-                    actual.bindings(db, self.env).return_type(db, self.env),
+                    actual.instance_type_for_meta_protocol(db, self.env),
                     polarity,
                     seen,
                 );
@@ -4353,6 +4353,19 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     polarity,
                     seen,
                 );
+            }
+
+            (
+                Type::NominalInstance(formal_instance),
+                Type::KnownInstance(KnownInstanceType::MethodWrapper(wrapper)),
+            ) if formal_instance
+                .class(db, self.env)
+                .is_known(db, wrapper.class(db)) =>
+            {
+                // The descriptor relation compares its wrapped callable with the nominal
+                // annotation's `__func__`, retaining parameter and return type constraints.
+                let when = self.constraint_for_relation(formal, actual, relation_polarity);
+                return self.infer_from_constraint_set(when);
             }
 
             (formal, Type::ProtocolInstance(actual_protocol)) => {
