@@ -46,11 +46,10 @@ pub(crate) use self::iteration::extract_fixed_length_iterable_element_types;
 pub use self::known_instance::KnownInstanceType;
 use self::known_instance::MethodWrapperKind;
 pub(crate) use self::match_pattern::{
-    ClassPatternPositionalSource, callable_pattern_type, class_pattern_positional_sources,
-    definite_match_pattern_type, definite_match_pattern_type_for_subject,
-    exact_sequence_pattern_type, mapping_pattern_type, pattern_binding_fallthrough_type,
-    sequence_pattern_type_builder, singleton_pattern_type, starred_sequence_pattern_type,
-    typed_dict_matches_class_pattern,
+    ClassPatternPositionalSource, class_pattern_positional_sources, definite_match_pattern_type,
+    definite_match_pattern_type_for_subject, exact_sequence_pattern_type, mapping_pattern_type,
+    pattern_binding_fallthrough_type, sequence_pattern_type_builder, singleton_pattern_type,
+    starred_sequence_pattern_type, typed_dict_matches_class_pattern,
 };
 pub(crate) use self::relation_error::{ErrorContext, ErrorContextTree, ParameterDescription};
 use self::set_theoretic::NegativeIntersectionElements;
@@ -4645,15 +4644,20 @@ impl<'db> Type<'db> {
                     // `find_name_in_mro` when called on function-like `Callable`s. This would
                     // allow us to correctly model the behavior of *explicit*
                     // `SomeDataclass.__init__.__get__` calls.
-                    let return_type = if instance.is_none() && is_function_like {
-                        ty
+                    let return_type = if is_function_like {
+                        instance.map_or(ty, |instance| {
+                            Type::Callable(callable.bind_self(db, env, Some(instance)))
+                        })
                     } else {
-                        let self_type = instance.unwrap_or_else(|| {
-                            // For classmethod-like callables, bind to the owner class.
-                            owner.to_instance_approximation(db, env).unwrap_or(owner)
-                        });
-
-                        Type::Callable(callable.bind_self(db, env, Some(self_type)))
+                        // Class methods receive the owner class even through an instance, while
+                        // `typing.Self` denotes an instance of that class.
+                        let typing_self = owner.to_instance_approximation(db, env).unwrap_or(owner);
+                        Type::Callable(callable.bind_self_with_receiver(
+                            db,
+                            env,
+                            Some(owner),
+                            Some(typing_self),
+                        ))
                     };
 
                     return Ok(Some(DescriptorGetResult {
