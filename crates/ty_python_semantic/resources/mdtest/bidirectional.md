@@ -506,6 +506,9 @@ x5: dict[str, int] = {**42}
 
 ### Collection unions
 
+When a collection literal is inferred against a union type context, the union is narrowed to the
+first compatible element, with inference attempts performed in source-order.
+
 ```py
 from collections.abc import Mapping, Sequence
 from typing import Literal
@@ -543,6 +546,17 @@ type NestedOp[T] = T | Ops[T]
 
 x9: NestedOp[str] = {"$in": ["a", "b"]}
 reveal_type(x9)  # revealed: dict[Literal["$in", "$nin"], list[str]]
+```
+
+Tuple literals perform narrowing similarly.
+
+```py
+def _(key: str):
+    x10: tuple[int, list[str]] | tuple[str, list[int]] = (key, [True])
+    reveal_type(x10)  # revealed: tuple[str, list[int]]
+
+    x11: tuple[int, list[int]] | tuple[str, list[str]] = (key, [])
+    reveal_type(x11)  # revealed: tuple[str, list[str]]
 ```
 
 ### Binary operations
@@ -1333,6 +1347,29 @@ class MultiPath[T]:
 # fmt: off
 x10: Callable[[list[int]], MultiPath[int] | MultiPath[list[int]]] = reveal_type(MultiPath)  # revealed: <class 'MultiPath'>
 # fmt: on
+```
+
+## Generic class specialization through recursive callable aliases
+
+A recursive callable context specializes a generic class used as a factory. The returned container
+keeps the recursive element type.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Callable
+
+Factory = Callable[[], list["Factory"]]
+type ExplicitFactory = Callable[[], list[ExplicitFactory]]
+
+factory: Factory = list
+explicit_factory: ExplicitFactory = list
+
+reveal_type(factory())  # revealed: list[Factory]
+reveal_type(explicit_factory())  # revealed: list[ExplicitFactory]
 ```
 
 ## Narrow union declared type for generic calls
@@ -2951,6 +2988,88 @@ reveal_type(x23)  # revealed: list[float | str | None]
 x24 = {"a": 1}
 x24[1] = "b"
 reveal_type(x24)  # revealed: dict[int | str, str | int]
+```
+
+## Unconstrained collection use-sites
+
+Calling a method that does not constrain a collection's element type does not affect its inferred
+type.
+
+```py
+def _():
+    x1 = [1]
+    x1.reverse()
+    reveal_type(x1)  # revealed: list[int]
+
+    x2 = {1}
+    x2.clear()
+    reveal_type(x2)  # revealed: set[int]
+
+    x3 = {"a": 1}
+    x3.clear()
+    reveal_type(x3)  # revealed: dict[str, int]
+```
+
+Calls that partially constrain the collection do not affect the type inferred for unrelated type
+variables.
+
+```py
+def _():
+    values = {"a": 1}
+    values.pop("a")
+    reveal_type(values)  # revealed: dict[str, int]
+```
+
+An empty collection remains unknown until another use supplies an element type:
+
+```py
+def _():
+    x1 = []
+    x1.reverse()
+    reveal_type(x1)  # revealed: list[Unknown]
+
+    x2 = []
+    x2.reverse()
+    x2.append(1)
+    reveal_type(x2)  # revealed: list[int]
+```
+
+Gradual types that explicitly constrain a collection are preserved in the inferred type.
+
+```py
+def _(unknown):
+    x1 = [1]
+    x1.reverse()
+    x1.append(unknown)
+    reveal_type(x1)  # revealed: list[Unknown | int]
+```
+
+An upper bound on the element type introduced by a callback does not influence the type of the
+collection literal:
+
+```py
+from typing import Any
+
+def key(value) -> int:
+    return 0
+
+def any_key(value: Any) -> int:
+    return 0
+
+def _():
+    x1 = [(0, "a")]
+    x1.sort(key=lambda x: x[0])
+    reveal_type(x1)  # revealed: list[tuple[int, str]]
+
+    x2 = [(0, "a")]
+    x2.sort(key=key)
+    # TODO: This should reveal `list[tuple[int, str]]`.
+    reveal_type(x2)  # revealed: list[Unknown | tuple[int, str]]
+
+    x3 = [(0, "a")]
+    x3.sort(key=any_key)
+    # TODO: This should reveal `list[tuple[int, str]]`.
+    reveal_type(x3)  # revealed: list[Any | tuple[int, str]]
 ```
 
 ## Multi-inference diagnostics
