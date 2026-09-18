@@ -61,7 +61,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         #[derive(Debug)]
         enum FunctionInfo<'db> {
             Function(&'db CallableSignature<'db>, &'db str),
-            Method(&'db CallableSignature<'db>, Cow<'db, str>),
+            Method(&'db CallableSignature<'db>, Option<Cow<'db, str>>),
             Lambda(&'db CallableSignature<'db>),
         }
 
@@ -86,7 +86,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
                     FunctionInfo::Function(_, name) => write!(f, "Function `{name}`"),
-                    FunctionInfo::Method(_, name) => write!(f, "Method `{name}`"),
+                    FunctionInfo::Method(_, Some(name)) => write!(f, "Method `{name}`"),
+                    FunctionInfo::Method(_, None) => write!(f, "Method"),
                     FunctionInfo::Lambda(_) => write!(f, "Function object"),
                 }
             }
@@ -110,10 +111,18 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         };
 
         let annotate_inferred_type = |diagnostic: &mut LintDiagnosticGuard| {
-            diagnostic.set_primary_annotation_message(format_args!(
-                "Inferred type is `{}`",
-                test_type.display(db, env)
-            ));
+            if test_type.is_bool_literal() || test_type.bool(db, env).is_ambiguous() {
+                diagnostic.set_primary_annotation_message(format_args!(
+                    "Inferred type is `{}`",
+                    test_type.display(db, env)
+                ));
+            } else {
+                let is_truthy = if *is_truthy { "truthy" } else { "falsy" };
+                diagnostic.set_primary_annotation_message(format_args!(
+                    "Inferred type `{}` is always {is_truthy}",
+                    test_type.display(db, env)
+                ));
+            }
         };
 
         let describe_condition = |diagnostic: &mut LintDiagnosticGuard| {
@@ -211,18 +220,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     function.signature(db),
                     function.name(db),
                 )),
-                Type::BoundMethod(method) if let Some(function) = method.function(db) => {
+                Type::BoundMethod(method) if let Some(signatures) = method.bound_signatures(db) => {
                     Some(FunctionInfo::Method(
-                        function.bound_signatures(
-                            db,
-                            method.signature_receiver(db),
-                            method.typing_self_type(db),
-                        ),
-                        CallableDescription::defining_class(db, *test_type)
-                            .map(|class| {
-                                Cow::Owned(format!("{}.{}", class.name(db), function.name(db)))
-                            })
-                            .unwrap_or(Cow::Borrowed(&**function.name(db))),
+                        signatures,
+                        method.function(db).map(|function| {
+                            CallableDescription::defining_class(db, *test_type)
+                                .map(|class| {
+                                    Cow::Owned(format!("{}.{}", class.name(db), function.name(db)))
+                                })
+                                .unwrap_or(Cow::Borrowed(&**function.name(db)))
+                        }),
                     ))
                 }
                 Type::Callable(callable) if callable.is_function_like(db) => {
