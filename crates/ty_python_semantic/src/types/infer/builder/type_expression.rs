@@ -14,15 +14,16 @@ use super::{DeferredExpressionState, TypeInferenceBuilder};
 use crate::types::call::CallArguments;
 use crate::types::definition_resolution::{ImportAliasResolution, resolve_definition};
 use crate::types::diagnostic::{
-    self, EXPERIMENTAL_SYNTAX, INVALID_INIT_TYPE_VARIABLE, INVALID_TYPE_FORM, NOT_SUBSCRIPTABLE,
-    UNBOUND_TYPE_VARIABLE, UNSUPPORTED_OPERATOR, report_invalid_argument_number_to_special_form,
-    report_invalid_arguments_to_callable, report_invalid_concatenate_last_arg,
-    report_missing_type_arguments, report_unsupported_binary_operation,
+    self, CYCLIC_TYPE_ALIAS_DEFINITION, EXPERIMENTAL_SYNTAX, INVALID_INIT_TYPE_VARIABLE,
+    INVALID_TYPE_FORM, NOT_SUBSCRIPTABLE, UNBOUND_TYPE_VARIABLE, UNSUPPORTED_OPERATOR,
+    report_invalid_argument_number_to_special_form, report_invalid_arguments_to_callable,
+    report_invalid_concatenate_last_arg, report_missing_type_arguments,
+    report_unsupported_binary_operation,
 };
 use crate::types::infer::builder::subscript::AnnotatedExprContext;
 use crate::types::infer::{
-    ImplicitAliasInference, InferenceFlags, TypeExpressionFlags, implicit_alias_parameters,
-    infer_implicit_alias_type,
+    CyclicTypeAliasError, ImplicitAliasInference, InferenceFlags, TypeExpressionFlags,
+    implicit_alias_parameters, infer_implicit_alias_type,
 };
 use crate::types::signatures::{ConcatenateTail, Signature};
 use crate::types::special_form::{AliasSpec, LegacyStdlibAlias};
@@ -50,23 +51,21 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     ) -> Option<(Type<'db>, Option<GenericContext<'db>>)> {
         let db = self.db();
         let mut definition = definition?;
-        // A resolved non-recursive value already describes the alias. Gradual types and
-        // invalid unions can hide recursive references, so they still need inference.
-        if !any_over_type(
-            db,
-            self.program_environment(),
-            value_ty,
-            false,
-            |ty| match ty {
-                Type::Dynamic(_) | Type::Divergent(_) | Type::Recursive(_) | Type::TypeAlias(_) => {
-                    true
-                }
-                Type::KnownInstance(KnownInstanceType::UnionType(union)) => {
-                    union.union_type(db).is_err()
-                }
-                _ => false,
-            },
-        ) {
+        // A resolved non-recursive value already describes the alias. Gradual types, unions,
+        // and quoted aliases can hide recursive references, so they still need inference.
+        // Even a valid union can have lost a cyclic member during value inference.
+        if !any_over_type(db, self.program_environment(), value_ty, false, |ty| {
+            matches!(
+                ty,
+                Type::Dynamic(_)
+                    | Type::Divergent(_)
+                    | Type::Recursive(_)
+                    | Type::TypeAlias(_)
+                    | Type::KnownInstance(
+                        KnownInstanceType::UnionType(_) | KnownInstanceType::LiteralStringAlias(_)
+                    )
+            )
+        }) {
             return None;
         }
         if definition.kind(db).is_import() {
@@ -109,10 +108,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             _ => return None,
         }
         let parameters = implicit_alias_parameters(db, definition);
-        let ty = infer_implicit_alias_type(db, definition, parameters).ty;
-        if !any_over_type(db, self.program_environment(), ty, false, |ty| {
+        let result = infer_implicit_alias_type(db, definition, parameters).ty;
+        // Preserve cycle errors even when recovery removes every recursive reference. Both
+        // runtime-value inference and enclosing aliases need the fallback type to converge.
+        let ty = result.unwrap_or_else(|error| error.fallback_type);
+        let is_recursive = any_over_type(db, self.program_environment(), ty, false, |ty| {
             matches!(ty, Type::Recursive(_))
-        }) {
+        });
+        if result.is_ok() && !is_recursive {
             return None;
         }
 
@@ -133,6 +136,29 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         self.typevar_binding_context = Some(definition);
         self.context.inference_flags |= InferenceFlags::IN_TYPE_ALIAS;
         let ty = self.infer_type_expression(value);
+        let db = self.db();
+        let ty = if ty.has_unguarded_alias_cycle(db) {
+            let target = match definition.kind(db) {
+                DefinitionKind::Assignment(assignment) => Some(assignment.target(self.module())),
+                DefinitionKind::AnnotatedAssignment(assignment) => {
+                    Some(assignment.target(self.module()))
+                }
+                _ => None,
+            };
+            if let Some(name) = target.and_then(ast::Expr::as_name_expr)
+                && let Some(diagnostic) = self
+                    .context
+                    .report_lint(&CYCLIC_TYPE_ALIAS_DEFINITION, value)
+            {
+                diagnostic.into_diagnostic(format_args!(
+                    "Type alias `{}` has a circular definition",
+                    name.id
+                ));
+            }
+            Err(CyclicTypeAliasError { fallback_type: ty })
+        } else {
+            Ok(ty)
+        };
         ImplicitAliasInference {
             ty,
             diagnostics: self.context.finish(),
@@ -3383,32 +3409,40 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 .inference_flags()
                 .contains(InferenceFlags::IN_INIT_RECEIVER_ANNOTATION)
             && let Some(owner) = typevar.binding_context(db).definition()
-            && matches!(owner.kind(db), DefinitionKind::Class(_))
+            && Some(owner) != self.typevar_binding_context
             && let Some(builder) = self
                 .context
                 .report_lint(&INVALID_INIT_TYPE_VARIABLE, expression)
         {
             let mut diagnostic = builder.into_diagnostic(format_args!(
-                "First parameter of `__init__` cannot use the class's type variable `{}`",
+                "First parameter of `__init__` cannot use type variable `{}` from an outer scope",
                 typevar.name(db)
             ));
             diagnostic.set_concise_message(format_args!(
-                "First parameter of `__init__` cannot use the class's type variable `{}`",
+                "First parameter of `__init__` cannot use type variable `{}` from an outer scope",
                 typevar.name(db)
             ));
             diagnostic.set_primary_annotation_message(format_args!(
                 "`{}` used in the first parameter's annotation here",
                 typevar.name(db)
             ));
-            if let Type::ClassLiteral(class) = binding_type(db, owner) {
-                diagnostic.annotate(Annotation::secondary(class.header_span(db)).message(
-                    format_args!("`{}` is a type parameter of this class", typevar.name(db)),
-                ));
+            let owner_span = match binding_type(db, owner) {
+                Type::ClassLiteral(class) => Some(class.header_span(db)),
+                Type::FunctionLiteral(function) => Some(function.spans(db).signature),
+                _ => None,
+            };
+            if let Some(owner_span) = owner_span {
+                diagnostic.annotate(Annotation::secondary(owner_span).message(format_args!(
+                    "`{}` is bound to this enclosing scope",
+                    typevar.name(db)
+                )));
             }
             diagnostic.info(
-                "Using a class's type variables here can make the constructed type ambiguous",
+                "Using type variables from an outer scope can make the constructed type ambiguous",
             );
-            diagnostic.help("Use a new type variable, or omit the first parameter's annotation");
+            diagnostic.help(
+                "Use a type variable scoped to `__init__`, or omit the first parameter's annotation",
+            );
             diagnostic
                 .info("See https://typing.python.org/en/latest/spec/constructors.html#init-method");
         }
