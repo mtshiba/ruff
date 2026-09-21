@@ -128,14 +128,13 @@ use crate::types::unpacker::{
 };
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType,
-    CallableTypes, ClassType, DynamicType, GeneratorTypeMode, InferenceFlags,
-    InternedConstraintSet, InternedType, IntersectionBuilder, IntersectionType,
-    KnownBoundMethodType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueType,
-    LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind, Parameter, Parameters,
-    ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature, SpecialFormType,
-    SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeQualifiers,
-    TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule, UnionAccumulator,
-    UnionBuilder, UnionType, any_over_type, binding_type,
+    ClassType, DynamicType, GeneratorTypeMode, InferenceFlags, InternedConstraintSet, InternedType,
+    IntersectionBuilder, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
+    KnownUnion, LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind,
+    Parameter, Parameters, ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature,
+    SpecialFormType, SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext,
+    TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule,
+    UnionAccumulator, UnionBuilder, UnionType, any_over_type, binding_type,
     extract_fixed_length_iterable_element_types, infer_complete_scope_types, infer_scope_types,
     is_discarded_dict_key_assignment, todo_type,
 };
@@ -1909,8 +1908,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // "declared types is `Unknown` (e.g. due to a bad annotation, missing
                     // import, etc.)". Ideally we would still prefer `Unknown` declared type,
                     // but use inferred type if there is no declared type.
+                    // Keep the inferred value while a cyclic annotation is unresolved. For
+                    // `str: "str" = ""`, that value lets the next iteration reject the annotation
+                    // instead of leaving both the annotation and the binding divergent.
                     if !should_preserve_inferred_binding_type(inferred_ty)
-                        && !matches!(declared_type, Type::Dynamic(DynamicType::Unknown))
+                        && !matches!(
+                            declared_type,
+                            Type::Dynamic(DynamicType::Unknown) | Type::Divergent(_)
+                        )
                         && declared_type.is_assignable_to(db, env, inferred_ty)
                     {
                         (declared_ty, declared_type)
@@ -5579,12 +5584,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Type::FunctionLiteral(func) => Some(func.callable_type_kind(db)),
             _ => decorated_ty
                 .try_upcast_to_callable(db, env)
-                .and_then(CallableTypes::exactly_one)
-                .and_then(|callable| match callable.kind(self.db()) {
-                    kind @ (CallableTypeKind::FunctionLike
-                    | CallableTypeKind::StaticMethodLike
-                    | CallableTypeKind::ClassMethodLike) => Some(kind),
-                    _ => None,
+                .and_then(|callables| {
+                    callables
+                        .iter()
+                        .map(|callable| callable.kind(db))
+                        .all_equal_value()
+                        .ok()
+                })
+                .filter(|kind| {
+                    matches!(
+                        kind,
+                        CallableTypeKind::FunctionLike
+                            | CallableTypeKind::StaticMethodLike
+                            | CallableTypeKind::ClassMethodLike
+                    )
                 }),
         };
 
@@ -6802,7 +6815,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let inferable = class_generic_context.inferable_typevars(db);
         let constraints = ConstraintSetBuilder::new();
         let path_bounds = source_callable
-            .into_type(db, env)
+            .to_type(db, env)
             .assignable_solutions_with_inferable(
                 db,
                 env,
@@ -11660,14 +11673,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 let range = TextRange::new(left.start(), right.end());
 
-                let ty = comparisons::infer_binary_type_comparison(
+                let literal_membership = comparisons::infer_literal_membership_comparison(
                     &builder.context,
                     left_ty,
                     *op,
-                    right_ty,
-                    range,
-                )
-                .unwrap_or_else(|error| {
+                    right,
+                    |element| builder.expression_type(element),
+                );
+
+                let comparison = match literal_membership {
+                    Some(ty) => Ok(ty),
+                    None => comparisons::infer_binary_type_comparison(
+                        &builder.context,
+                        left_ty,
+                        *op,
+                        right_ty,
+                        range,
+                    ),
+                };
+                let ty = comparison.unwrap_or_else(|error| {
                     report_unsupported_comparison(
                         &builder.context,
                         &error,
