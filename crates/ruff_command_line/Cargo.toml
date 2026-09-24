@@ -1,5 +1,5 @@
 [package]
-name = "ruff_index"
+name = "ruff_command_line"
 version = "0.0.15"
 description = "This is an internal component crate of Ruff"
 authors = { workspace = true }
@@ -10,16 +10,8 @@ documentation = { workspace = true }
 repository = { workspace = true }
 license = { workspace = true }
 
-[lib]
-doctest = false
-
 [dependencies]
-get-size2 = { workspace = true }
-ruff_macros = { workspace = true }
-salsa = { workspace = true, optional = true }
-
-[dev-dependencies]
-static_assertions = { workspace = true }
+argfile = { workspace = true }
 
 [lints]
 workspace = true
