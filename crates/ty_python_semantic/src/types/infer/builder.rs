@@ -6859,8 +6859,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 Type::Callable(target_callable),
                 inferable,
             );
-        let Solutions::Constrained(solutions) = path_bounds.solve(db, env, &constraints, inferable)
-        else {
+        let Solutions::Constrained(solutions) = path_bounds.solve(db, env, &constraints) else {
             return ty;
         };
 
@@ -7698,19 +7697,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 let path_bounds =
                     identity_instance.assignable_solutions_with_inferable(db, env, tcx, inferable);
-                let solutions = path_bounds.solve_with(db, env, |variance, path_bound| {
+                let solutions = path_bounds.solve_with(|variance, path_bound| {
                     let identity = path_bound.bound_typevar.identity(db);
                     elt_tcx_variance
                         .entry(identity)
                         .and_modify(|current| *current = current.join(variance))
                         .or_insert(variance);
-                    CandidateSolutions::preliminary_solve(
-                        db,
-                        env,
-                        &constraints,
-                        inferable,
-                        path_bound,
-                    )
+                    CandidateSolutions::preliminary_solve(db, env, &constraints, path_bound)
                 });
 
                 match solutions {
@@ -8125,8 +8118,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let path_bounds =
             generator_ty.assignable_solutions_with_inferable(db, env, annotation, inferable);
         let constraints = ConstraintSetBuilder::new();
-        let Solutions::Constrained(solutions) = path_bounds.solve(db, env, &constraints, inferable)
-        else {
+        let Solutions::Constrained(solutions) = path_bounds.solve(db, env, &constraints) else {
             return TypeContext::default();
         };
 
@@ -9716,11 +9708,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     Type::FunctionLiteral(function_literal) => {
                         if let Some(known_function) = function_literal.known(self.db()) {
                             known_function.check_call(
-                                &self.context,
+                                self,
                                 overload,
                                 &call_arguments,
                                 call_expression,
-                                self.index,
                             );
                         }
                     }

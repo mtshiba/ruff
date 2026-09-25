@@ -6061,19 +6061,13 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 // lower/upper bounds on each BDD path.
                 let mut variance_map: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
                     FxHashMap::default();
-                let solutions = path_bounds.solve_with(db, self.env, |variance, path_bound| {
+                let solutions = path_bounds.solve_with(|variance, path_bound| {
                     let identity = path_bound.bound_typevar.identity(db);
                     variance_map
                         .entry(identity)
                         .and_modify(|current| *current = current.join(variance))
                         .or_insert(variance);
-                    CandidateSolutions::preliminary_solve(
-                        db,
-                        self.env,
-                        constraints,
-                        self.inferable_typevars,
-                        path_bound,
-                    )
+                    CandidateSolutions::preliminary_solve(db, self.env, constraints, path_bound)
                 });
 
                 let Solutions::Constrained(solutions) = solutions else {
@@ -6233,26 +6227,22 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
             // Promotion must preserve unsatisfiable outcomes and the completeness of fallbacks.
             Some(
-                CandidateSolutions::default_solve(
-                    db,
-                    self.env,
-                    constraints,
-                    self.inferable_typevars,
-                    bounds,
-                )
-                .map(|solution| {
-                    let promoted = solution.promote(db, self.env);
+                CandidateSolutions::default_solve(db, self.env, constraints, bounds).map(
+                    |solution| {
+                        let promoted = solution.promote(db, self.env);
 
-                    // If the TypeVar has an upper bound, only use the promoted type if it
-                    // still satisfies the bound.
-                    if let Some(TypeVarBoundOrConstraints::UpperBound(bound)) = bound_or_constraints
-                        && !promoted.is_assignable_to(db, self.env, bound)
-                    {
-                        return solution;
-                    }
+                        // If the TypeVar has an upper bound, only use the promoted type if it
+                        // still satisfies the bound.
+                        if let Some(TypeVarBoundOrConstraints::UpperBound(bound)) =
+                            bound_or_constraints
+                            && !promoted.is_assignable_to(db, self.env, bound)
+                        {
+                            return solution;
+                        }
 
-                    promoted
-                }),
+                        promoted
+                    },
+                ),
             )
         };
 
@@ -6279,11 +6269,31 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
         let inference = match builder.build_inference_with(&mut choose) {
             Ok(inference) => inference,
-            Err(()) => builder.build_diagnostic_inference_with(
-                self.argument_relations()
-                    .map(|relation| (relation.declared_type, relation.argument_type)),
-                choose,
-            ),
+            Err(errors) => {
+                for error in errors {
+                    // Report at-most one failure per type variable to avoid redundant diagnostics.
+                    if self.errors.iter().any(|existing| {
+                        matches!(
+                            existing,
+                            BindingError::SpecializationError { error: existing, .. }
+                                if existing.bound_typevar() == error.bound_typevar()
+                        )
+                    }) {
+                        continue;
+                    }
+
+                    self.errors.push(BindingError::SpecializationError {
+                        error,
+                        argument_index: None,
+                    });
+                }
+
+                builder.build_diagnostic_inference_with(
+                    self.argument_relations()
+                        .map(|relation| (relation.declared_type, relation.argument_type)),
+                    choose,
+                )
+            }
         };
         let specialization = inference.merged_specialization(db);
 
@@ -7941,8 +7951,8 @@ impl<'db> Binding<'db> {
                 inferable,
             );
 
-            let solutions = path_bounds.solve_with(db, env, |_variance, path_bound| {
-                CandidateSolutions::preliminary_solve(db, env, constraints, inferable, path_bound)
+            let solutions = path_bounds.solve_with(|_variance, path_bound| {
+                CandidateSolutions::preliminary_solve(db, env, constraints, path_bound)
             });
             if let Solutions::Constrained(solutions) = solutions {
                 for solution in solutions.into_vec() {
