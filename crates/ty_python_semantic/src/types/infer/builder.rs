@@ -174,8 +174,8 @@ mod named_tuple;
 mod new_class;
 mod paramspec_validation;
 mod post_inference;
-mod redundant_conditions;
 mod subscript;
+mod suspicious_conditions;
 mod type_call;
 mod type_expression;
 mod type_form;
@@ -7415,13 +7415,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut item_types = FxHashMap::default();
 
         // Validate `TypedDict` dictionary literal assignments.
-        if let Some(annotation) =
-            tcx.annotation
-                .map(|annotation| match annotation.resolve_type_alias(db) {
-                    Type::Union(union) if union.has_aliases(db) => union.expand_aliases(db, env),
-                    annotation => annotation,
-                })
-        {
+        if let Some(annotation) = tcx.annotation {
+            let annotation = annotation.expand_top_level_aliases(db, env);
             if let Some(typed_dict) = annotation.as_typed_dict() {
                 // If there is a single typed dict annotation, infer against it directly. Expanding
                 // first means a union whose arms all alias the same `TypedDict` reaches this

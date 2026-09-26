@@ -396,7 +396,7 @@ pub(crate) fn inferred_declaration<'db>(
 /// Supports expressions that are evaluated within a type-params sub-scope.
 ///
 /// ## Panics
-/// If the given expression is not a sub-expression of the given [`Definition`].
+/// If the expression is absent from the semantic index for the definition's file.
 fn definition_expression_type<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
@@ -406,6 +406,20 @@ fn definition_expression_type<'db>(
     let index = semantic_index(db, file);
     let file_scope = index.expression_scope_id(expression);
     let scope = file_scope.to_scope_id(db, file);
+    definition_expression_type_in_scope(db, definition, expression, scope)
+}
+
+/// Infer a definition's expression using an explicitly supplied evaluation scope.
+///
+/// [`definition_expression_type`] can look up the scope of a string literal used as an annotation,
+/// but not the scope of nodes parsed from its contents: those nodes are absent from the semantic
+/// index. This helper lets the caller supply the enclosing annotation's scope for such nodes.
+fn definition_expression_type_in_scope<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    expression: &ast::Expr,
+    scope: ScopeId<'db>,
+) -> Type<'db> {
     if scope == definition.scope(db) {
         // expression is in the definition scope
         let inference = infer_definition_types(db, definition);
@@ -421,7 +435,8 @@ fn definition_expression_type<'db>(
             Type::unknown()
         }
     } else {
-        // expression is in a type-params sub-scope
+        // The expression is evaluated in another scope, such as a type-parameter scope
+        // or the scope containing a function's parameter annotations.
         infer_complete_scope_types(db, scope).expression_type(expression)
     }
 }
@@ -1933,17 +1948,27 @@ impl<'db> DataclassParams<'db> {
         div: Type<'db>,
         nested: bool,
     ) -> Option<Self> {
-        let field_specifiers = self
-            .field_specifiers(db)
-            .iter()
-            .map(|ty| {
-                let ty = ty.recursive_type_normalized_impl(db, env, div, true);
-                if nested { ty } else { Some(ty.unwrap_or(div)) }
-            })
-            .collect::<Option<Box<_>>>()?;
+        let field_specifiers =
+            normalize_field_specifiers(db, env, self.field_specifiers(db), div, nested)?;
 
         Some(Self::new(db, self.flags(db), field_specifiers))
     }
+}
+
+fn normalize_field_specifiers<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    field_specifiers: &[Type<'db>],
+    div: Type<'db>,
+    nested: bool,
+) -> Option<Box<[Type<'db>]>> {
+    field_specifiers
+        .iter()
+        .map(|ty| {
+            let ty = ty.recursive_type_normalized_impl(db, env, div, true);
+            if nested { ty } else { Some(ty.unwrap_or(div)) }
+        })
+        .collect()
 }
 
 /// Representation of a type: a set of possible values at runtime.
@@ -2890,6 +2915,16 @@ impl<'db> Type<'db> {
         }
     }
 
+    /// Resolve outermost aliases and expand aliases that expose top-level union elements.
+    ///
+    /// Aliases nested inside non-union types remain unexpanded.
+    fn expand_top_level_aliases(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Self {
+        match self.resolve_type_alias(db) {
+            Type::Union(union) if union.has_aliases(db) => union.expand_aliases(db, env),
+            ty => ty,
+        }
+    }
+
     /// Selects the constructor used for a type variable's upper bound.
     ///
     /// The meta-type of `object` simplifies to permissive bare `type`, so retain the exact class
@@ -3711,7 +3746,7 @@ impl<'db> Type<'db> {
         if nested && (self.same_divergent_marker(div) || self.is_pending_narrowing()) {
             return None;
         }
-        // These types stay opaque, but pending values in their stored arguments, bounds, or
+        // Some of these types stay opaque, but pending values in their stored arguments, bounds, or
         // fields still invalidate the enclosing constructor's approximation.
         if nested
             && matches!(
@@ -3789,20 +3824,23 @@ impl<'db> Type<'db> {
                 .map(|ty| TypeFormType::from_type_expression(db, ty)),
             Type::Divergent(_) => Some(self),
             Type::Dynamic(dynamic) => Some(Type::Dynamic(dynamic.recursive_type_normalized())),
-            Type::TypedDict(_) => {
-                // TODO: Normalize TypedDicts
-                Some(self)
-            }
+            Type::TypedDict(typed_dict) => typed_dict
+                .recursive_type_normalized_impl(db, env, div, nested)
+                .map(Type::TypedDict),
             Type::TypeAlias(_) => Some(self),
             Type::NewTypeInstance(newtype) => newtype
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::NewTypeInstance),
+            Type::DataclassDecorator(params) => params
+                .recursive_type_normalized_impl(db, env, div, nested)
+                .map(Type::DataclassDecorator),
+            Type::DataclassTransformer(params) => params
+                .recursive_type_normalized_impl(db, env, div, nested)
+                .map(Type::DataclassTransformer),
             Type::AlwaysFalsy
             | Type::AlwaysTruthy
             | Type::Never
             | Type::WrapperDescriptor(_)
-            | Type::DataclassDecorator(_)
-            | Type::DataclassTransformer(_)
             | Type::ModuleLiteral(_)
             | Type::SpecialForm(_)
             | Type::LiteralValue(_) => Some(self),
@@ -5667,10 +5705,7 @@ impl<'db> Type<'db> {
         if member.is_class_var() {
             return false;
         }
-        let ty = match ty.resolve_type_alias(db) {
-            Type::Union(union) if union.has_aliases(db) => union.expand_aliases(db, env),
-            ty => ty,
-        };
+        let ty = ty.expand_top_level_aliases(db, env);
         let alternatives = match &ty {
             Type::Union(union) => union.elements(db),
             _ => std::slice::from_ref(&ty),
