@@ -1,6 +1,6 @@
 use crate::{Program, ProgramEnvironment};
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, LazyCell, RefCell};
 use std::collections::hash_map::Entry;
 
 use itertools::Itertools;
@@ -1420,7 +1420,7 @@ impl<'db> Specialization<'db> {
 
         let mut new_materialization_kind = self.materialization_kind(db);
         let types = self.map_types(db, |i, typevar, ty| {
-            let tcx = TypeContext::new(tcx.get(i).copied());
+            let tcx = TypeContext::declared(tcx.get(i).copied());
             if type_mapping.is_structural() {
                 return ty.apply_type_mapping_impl(db, type_mapping, tcx, visitor);
             }
@@ -1573,8 +1573,11 @@ impl<'db> Specialization<'db> {
         let types = self.map_types(db, |_, bound_typevar, vartype| {
             let variance = specialization_variance(db, bound_typevar);
             let top_materialization = vartype.materialize(db, MaterializationKind::Top, visitor);
-            let has_dynamic_type =
-                !visitor.is_equivalent_to_materialization(db, vartype, top_materialization);
+            // Equivalence can recursively inspect a protocol's requirements. Only check it when
+            // the result affects this materialization.
+            let has_dynamic_type = LazyCell::new(|| {
+                !visitor.is_equivalent_to_materialization(db, vartype, top_materialization)
+            });
 
             match variance {
                 TypeVarVariance::Bivariant => {
@@ -1583,7 +1586,7 @@ impl<'db> Specialization<'db> {
                     top_materialization
                 }
                 TypeVarVariance::Covariant | TypeVarVariance::Contravariant
-                    if has_dynamic_type && bound_typevar.typevar(db).is_constrained(db) =>
+                    if bound_typevar.typevar(db).is_constrained(db) && *has_dynamic_type =>
                 {
                     has_unsimplified_dynamic_typevar = true;
                     vartype
@@ -1597,9 +1600,9 @@ impl<'db> Specialization<'db> {
                     let materialized =
                         vartype.materialize(db, effective_materialization_kind, visitor);
 
-                    if has_dynamic_type
-                        && effective_materialization_kind == MaterializationKind::Top
+                    if effective_materialization_kind == MaterializationKind::Top
                         && let Some(upper_bound) = bound_typevar.top_materialized_upper_bound(db)
+                        && *has_dynamic_type
                     {
                         IntersectionType::from_two_elements(
                             db,
@@ -1612,7 +1615,7 @@ impl<'db> Specialization<'db> {
                     }
                 }
                 TypeVarVariance::Invariant => {
-                    has_unsimplified_dynamic_typevar |= has_dynamic_type;
+                    has_unsimplified_dynamic_typevar |= *has_dynamic_type;
                     vartype
                 }
             }
@@ -1717,9 +1720,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // Assignability and pure redundancy must retain the source's gradual semantics.
         if matches!(
             self.relation,
-            TypeRelation::Subtyping
-                | TypeRelation::SubtypingAssuming
-                | TypeRelation::Redundancy { pure: false }
+            TypeRelation::Subtyping | TypeRelation::Redundancy { pure: false }
         ) && (
             // Explicitly materialized sources are already static and cannot advance further.
             source.materialization_kind(db).is_none()
@@ -1995,32 +1996,24 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 }
             }
             // For gradual types, A <: B (subtyping) is defined as Top[A] <: Bottom[B]
-            (
-                None,
-                Some(target_mat),
-                TypeRelation::Subtyping
-                | TypeRelation::Redundancy { .. }
-                | TypeRelation::SubtypingAssuming,
-            ) => self.check_subtyping_in_invariant_position(
-                db,
-                source_type,
-                MaterializationKind::Top,
-                target_type,
-                target_mat,
-            ),
-            (
-                Some(source_mat),
-                None,
-                TypeRelation::Subtyping
-                | TypeRelation::Redundancy { .. }
-                | TypeRelation::SubtypingAssuming,
-            ) => self.check_subtyping_in_invariant_position(
-                db,
-                source_type,
-                source_mat,
-                target_type,
-                MaterializationKind::Bottom,
-            ),
+            (None, Some(target_mat), TypeRelation::Subtyping | TypeRelation::Redundancy { .. }) => {
+                self.check_subtyping_in_invariant_position(
+                    db,
+                    source_type,
+                    MaterializationKind::Top,
+                    target_type,
+                    target_mat,
+                )
+            }
+            (Some(source_mat), None, TypeRelation::Subtyping | TypeRelation::Redundancy { .. }) => {
+                self.check_subtyping_in_invariant_position(
+                    db,
+                    source_type,
+                    source_mat,
+                    target_type,
+                    MaterializationKind::Bottom,
+                )
+            }
             // And A <~ B (assignability) is Bottom[A] <: Top[B]
             (None, Some(target_mat), TypeRelation::Assignability) => self
                 .check_subtyping_in_invariant_position(
@@ -2767,6 +2760,12 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         set: ConstraintSet<'db, 'c>,
     ) -> Result<(), SpecializationError<'db>> {
         self.infer_from_constraint_set(set)
+    }
+
+    /// Adds the provided constraint set as a validity constraint to the generic call.
+    pub(crate) fn intersect_validity_constraints(&mut self, set: ConstraintSet<'db, 'c>) {
+        let set = set.with_validity_bounds(self.db, self.env);
+        self.record_constraint_set(set);
     }
 
     /// Build a merged specialization, using a caller-provided hook to select the solution for
