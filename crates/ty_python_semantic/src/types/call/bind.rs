@@ -3188,6 +3188,35 @@ impl<'db> Bindings<'db> {
                         overload.set_return_type(result);
                     }
 
+                    Type::KnownBoundMethod(
+                        method @ (KnownBoundMethodType::ConstraintSetIsAlwaysSatisfied(tracked)
+                        | KnownBoundMethodType::ConstraintSetIsNeverSatisfied(tracked)),
+                    ) => {
+                        let [Some(inferable)] = overload.parameter_types() else {
+                            continue;
+                        };
+                        let Type::NominalInstance(inferable) = inferable.project_type_form(db, env)
+                        else {
+                            continue;
+                        };
+                        let Some(inferable) = inferable_typevars_from_tuple(db, env, &inferable)
+                        else {
+                            continue;
+                        };
+
+                        let result = tracked.constraints(db).query(|_builder, set| {
+                            if matches!(
+                                method,
+                                KnownBoundMethodType::ConstraintSetIsAlwaysSatisfied(_)
+                            ) {
+                                set.is_always_satisfied(db, env, inferable)
+                            } else {
+                                set.is_never_satisfied(db, env, inferable)
+                            }
+                        });
+                        overload.set_return_type(Type::bool_literal(result));
+                    }
+
                     Type::KnownBoundMethod(KnownBoundMethodType::ConstraintSetSolutions(
                         tracked,
                     )) => {
@@ -3835,54 +3864,42 @@ impl<'db> CallableBinding<'db> {
         // `*arg` where `arg` is a union of a 2-tuple and a 3-tuple, we shouldn't eliminate any
         // overload for arity reasons before trying argument expansion.
         let argument_expansions = call_arguments.expansions(db, env);
-        let (should_retry_after_provisional_arity, overloads_for_expansion) =
-            if self.should_retry_after_provisional_arity(&argument_expansions) {
-                // We will retry all overloads after argument expansion.
-                (true, (0..self.overloads.len()).collect())
-            } else {
-                match self.matching_overload_index() {
-                    MatchingOverloadIndex::None => {
-                        // If no candidate overloads remain from the arity check, we can stop here. We
-                        // still perform type checking for non-overloaded function to provide better
-                        // user experience.
-                        if let [overload] = self.overloads.as_mut_slice() {
-                            overload.check_types(
-                                db,
-                                env,
-                                constraints,
-                                call_arguments.as_ref(),
-                                call_expression_tcx,
-                            );
-                        }
-                        return;
+        let (should_retry_after_provisional_arity, overloads_for_expansion) = if self
+            .should_retry_after_provisional_arity(&argument_expansions)
+        {
+            // We will retry all overloads after argument expansion.
+            (true, (0..self.overloads.len()).collect())
+        } else {
+            match self.matching_overload_index() {
+                MatchingOverloadIndex::None => {
+                    // If no candidate overloads remain from the arity check, we can stop here. We
+                    // still perform type checking for non-overloaded function to provide better
+                    // user experience.
+                    if let [overload] = self.overloads.as_mut_slice() {
+                        overload.check_types(db, env, call_arguments.as_ref(), call_expression_tcx);
                     }
-                    MatchingOverloadIndex::Single(index) => {
-                        // If only one candidate overload remains, it is the winning match. Evaluate
-                        // it as a regular (non-overloaded) call.
-                        self.matching_overload_before_type_checking = Some(index);
-                        self.overloads[index].check_types(
-                            db,
-                            env,
-                            constraints,
-                            call_arguments.as_ref(),
-                            call_expression_tcx,
-                        );
-                        return;
-                    }
-                    MatchingOverloadIndex::Multiple(indexes) => (false, indexes),
+                    return;
                 }
-            };
+                MatchingOverloadIndex::Single(index) => {
+                    // If only one candidate overload remains, it is the winning match. Evaluate
+                    // it as a regular (non-overloaded) call.
+                    self.matching_overload_before_type_checking = Some(index);
+                    self.overloads[index].check_types(
+                        db,
+                        env,
+                        call_arguments.as_ref(),
+                        call_expression_tcx,
+                    );
+                    return;
+                }
+                MatchingOverloadIndex::Multiple(indexes) => (false, indexes),
+            }
+        };
 
         // Step 2: Evaluate each remaining overload as a regular (non-overloaded) call to determine
         // whether it is compatible with the supplied argument list.
         for (_, overload) in self.matching_overloads_mut() {
-            overload.check_types(
-                db,
-                env,
-                constraints,
-                call_arguments.as_ref(),
-                call_expression_tcx,
-            );
+            overload.check_types(db, env, call_arguments.as_ref(), call_expression_tcx);
         }
 
         tracing::trace!(
@@ -4010,7 +4027,7 @@ impl<'db> CallableBinding<'db> {
                             constraints,
                             overload.inferable_typevars,
                         )
-                        .is_always_satisfied(db, env)
+                        .is_always_satisfied(db, env, overload.inferable_typevars)
                 })
             });
             if !is_argument_assignable_to_any_overload {
@@ -4067,13 +4084,7 @@ impl<'db> CallableBinding<'db> {
                 );
 
                 for (_, overload) in self.matching_overloads_mut() {
-                    overload.check_types(
-                        db,
-                        env,
-                        constraints,
-                        expanded_arguments,
-                        call_expression_tcx,
-                    );
+                    overload.check_types(db, env, expanded_arguments, call_expression_tcx);
                 }
 
                 tracing::trace!(
@@ -4310,7 +4321,7 @@ impl<'db> CallableBinding<'db> {
                     (Some(first_parameter_type), Some(current_parameter_type)) => {
                         if !first_parameter_type
                             .when_equivalent_to(db, env, current_parameter_type, constraints)
-                            .is_always_satisfied(db, env)
+                            .is_always_satisfied(db, env, TypeVarSet::None)
                         {
                             participating_slot_indices.insert(slot_index);
                         }
@@ -4394,15 +4405,10 @@ impl<'db> CallableBinding<'db> {
                 }),
             );
 
+            let inferable = self.overloads[*current_index].inferable_typevars;
             if top_materialized_argument_type
-                .when_assignable_to(
-                    db,
-                    env,
-                    parameter_types,
-                    constraints,
-                    self.overloads[*current_index].inferable_typevars,
-                )
-                .is_always_satisfied(db, env)
+                .when_assignable_to(db, env, parameter_types, constraints, inferable)
+                .is_always_satisfied(db, env, inferable)
             {
                 filter_remaining_overloads = true;
             }
@@ -4421,7 +4427,7 @@ impl<'db> CallableBinding<'db> {
                     overload
                         .return_type()
                         .when_equivalent_to(db, env, first_overload_return_type, constraints)
-                        .is_always_satisfied(db, env)
+                        .is_always_satisfied(db, env, TypeVarSet::None)
                 })
             } else {
                 // No matching overload
@@ -5662,7 +5668,7 @@ fn validate_keyword_unpack_key_type<'db>(
             constraints,
             inferable_typevars,
         )
-        .is_always_satisfied(db, env)
+        .is_always_satisfied(db, env, inferable_typevars)
     {
         KeywordUnpackKeyTypeCheck::Valid
     } else {
@@ -6825,7 +6831,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     constraints,
                     self.inferable_typevars,
                 )
-                .is_never_satisfied(db, self.env)
+                .is_never_satisfied(db, self.env, self.inferable_typevars)
             && !self.should_defer_typevartuple_callable_check(
                 parameter.annotated_type(),
                 expected_ty,
@@ -8202,10 +8208,23 @@ impl<'db> Binding<'db> {
         &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
-        constraints: &ConstraintSetBuilder<'db>,
         arguments: &CallArguments<'_, 'db>,
         call_expression_tcx: TypeContext<'db>,
     ) {
+        // Each overload is an independent inference problem. Two candidates can contain
+        // typevars with the same identity but different specialized bounds, so sharing a
+        // builder would make the second candidate reuse the first candidate's bounds.
+        //
+        // TODO: Ideally reuse of a `ConstraintSetBuilder` across any inference scope would be
+        // semantically safe. Currently this is not true because the `ConstraintSetBuilder` interns
+        // typevars by identity and pulls bounds/constraints off the first interned instance of a
+        // given identity, but our current typevar representation explicitly allows multiple
+        // `TypeVarInstance` for a single `TypeVarIdentity`, with bounds/constraints carried by the
+        // `TypeVarInstance`. And we have cases (`Self` specialization, materialization) where we
+        // create multiple instances of a single typevar identity with different
+        // bounds/constraints. We should reconcile the invariants expected by the constraint solver
+        // with those actually enforced by our typevar representation.
+        let constraints = &ConstraintSetBuilder::new();
         let parameters = self.signature.parameters();
 
         if parameters.is_top() {

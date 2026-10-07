@@ -781,7 +781,7 @@ fn protocol_materialization_is_noop_with_type_parameters<'db>(
         {
             return false;
         }
-        has_property |= !template_member.is_method();
+        has_property |= !template_member.is_method(db);
         has_explicit_receiver |= template_member.has_explicit_receiver_annotation(db);
         if has_property && has_explicit_receiver {
             return false;
@@ -934,12 +934,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             // Check that inexpensive case first: comparing every requirement of an unrelated
             // recursive protocol can expand its interface before structural member ordering gets
             // a chance to reject an incompatible finite member.
-            let can_use_nominal_result_directly = nominally_satisfied.is_never_satisfied(db, env)
-                || ((protocol.materialization_kind(db) == Some(MaterializationKind::Top)
-                    || !protocol.materialization_changes_requirements(db, env, protocol))
-                    && !source_protocol.is_some_and(|source| {
-                        source.materialization_changes_requirements(db, env, protocol)
-                    }));
+            let can_use_nominal_result_directly =
+                nominally_satisfied.is_never_satisfied(db, env, self.inferable)
+                    || ((protocol.materialization_kind(db) == Some(MaterializationKind::Top)
+                        || !protocol.materialization_changes_requirements(db, env, protocol))
+                        && !source_protocol.is_some_and(|source| {
+                            source.materialization_changes_requirements(db, env, protocol)
+                        }));
 
             if can_use_nominal_result_directly
                 && result
@@ -1016,7 +1017,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 })
         };
         if let Some(context) = self.report_context()
-            && structurally_satisfied.is_never_satisfied(db, env)
+            && structurally_satisfied.is_never_satisfied(db, env, self.inferable)
         {
             context.push(ErrorContext::TypeNotCompatibleWithProtocol {
                 ty,
@@ -1140,7 +1141,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         for (_, member) in recursive_members {
             if structurally_satisfied
                 .implies(db, self.constraints, || nominally_satisfied)
-                .is_always_satisfied(db, env)
+                .is_always_satisfied(db, env, self.inferable)
             {
                 break;
             }
@@ -1257,7 +1258,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         let target_interface = protocol.interface(db);
         let target_non_recursive = non_recursive_protocol_interface(
             db,
-            target_interface.base(),
+            target_interface,
             identity_protocol,
             Type::ProtocolInstance(protocol),
         );
@@ -1276,10 +1277,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             db,
             ty,
             source_interface,
-            ProtocolInterfaceView::new(
-                target_non_recursive,
-                target_interface.materialization_kind(),
-            ),
+            target_interface.with_interface(target_non_recursive),
         );
 
         // A skipped member can be the only source of information about a type variable. In this
@@ -1325,7 +1323,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 })
                 || !structurally_satisfied
                     .implies(db, self.constraints, || nominally_satisfied)
-                    .is_always_satisfied(db, env))
+                    .is_always_satisfied(db, env, self.inferable))
         {
             return None;
         }
@@ -1334,7 +1332,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // expanding recursive members. If it cannot reject, the caller checks the full
         // interface instead.
         (self.typevar_evaluation == TypeVarEvaluation::Lazy
-            || structurally_satisfied.is_never_satisfied(db, env))
+            || structurally_satisfied.is_never_satisfied(db, env, self.inferable))
         .then_some(structurally_satisfied)
     }
 
@@ -1399,7 +1397,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 #[salsa::tracked(returns(copy), heap_size=ruff_memory_usage::heap_size)]
 fn non_recursive_protocol_interface<'db>(
     db: &'db dyn Db,
-    interface: ProtocolInterface<'db>,
+    interface: ProtocolInterfaceView<'db>,
     protocol: ProtocolClass<'db>,
     receiver_ty: Type<'db>,
 ) -> ProtocolInterface<'db> {
@@ -1449,7 +1447,7 @@ fn non_recursive_protocol_interface<'db>(
     }
 
     let env = ProgramEnvironment::from_file(protocol.class_literal(db).program_file(db));
-    interface.filter_members(db, |member| {
+    interface.filter_members_for_recursion(db, |member| {
         let visitor = ProtocolReferenceFinder {
             env: &env,
             origin: protocol.class_literal(db),
@@ -1912,7 +1910,7 @@ impl<'db> ProtocolInstanceType<'db> {
             );
             checker
                 .check_type_satisfies_protocol(db, Type::object(), protocol)
-                .is_always_satisfied(db, &env)
+                .is_always_satisfied(db, &env, TypeVarSet::None)
         }
 
         is_equivalent_to_object_inner(db, self, ())
@@ -2044,13 +2042,9 @@ impl<'db> ProtocolInstanceType<'db> {
     ) -> Option<&'db OwnedConstraintSet<'db>> {
         let origin = target.class_origin(db)?;
         let interface = target.interface(db);
-        let non_recursive = non_recursive_protocol_interface(
-            db,
-            interface.base(),
-            origin,
-            Type::ProtocolInstance(target),
-        );
-        let target = ProtocolInterfaceView::new(non_recursive, interface.materialization_kind());
+        let non_recursive =
+            non_recursive_protocol_interface(db, interface, origin, Type::ProtocolInstance(target));
+        let target = interface.with_interface(non_recursive);
         if target.member_count(db) == 0 {
             return None;
         }
@@ -2094,14 +2088,14 @@ impl<'db> Protocol<'db> {
     /// Return the members of this protocol type
     fn interface(self, db: &'db dyn Db) -> ProtocolInterfaceView<'db> {
         match self {
-            Self::FromClass(class) => ProtocolInterfaceView::new(class.interface(db), None),
+            Self::FromClass(class) => class.interface_view(db),
             Self::Synthesized(synthesized) => {
                 ProtocolInterfaceView::new(synthesized.interface(), None)
             }
-            Self::Materialized(materialized) => ProtocolInterfaceView::new(
-                materialized.origin(db).unmaterialized_interface(db),
-                Some(materialized.materialization_kind(db)),
-            ),
+            Self::Materialized(materialized) => materialized
+                .origin(db)
+                .unmaterialized_interface(db)
+                .with_materialization(Some(materialized.materialization_kind(db))),
         }
     }
 
