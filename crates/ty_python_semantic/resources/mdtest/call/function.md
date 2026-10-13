@@ -348,7 +348,8 @@ class C:
     # parameter in a classmethod, and is always passed positionally at runtime,
     # We therefore understand both `cls` and `__x` here as positional-only; we do not
     # emit `[invalid-legacy-positional-parameter]` on the method.
-    def __new__(cls, __x: int): ...
+    def __new__(cls, __x: int):
+        return super().__new__(cls)
 
 # error: [positional-only-parameter-as-kwarg]
 C(42).method(__x=1)
@@ -1095,11 +1096,8 @@ def _(
     f1(*args6)
     f1(*args7)  # error: [invalid-argument-type]
 
-    # The reason for two errors here is because of the two fixed elements in the tuple of `args8`
-    # which are both `int`
-    # error: [invalid-argument-type]
-    # error: [invalid-argument-type]
-    f1(*args8)
+    # Both fixed elements have the same incompatible type, so we report the error once.
+    f1(*args8)  # error: [invalid-argument-type]
 
     f1(*args9)  # error: [invalid-argument-type]
     f1(*args10)  # error: [invalid-argument-type]
@@ -1205,6 +1203,48 @@ def f23(x: tuple[int, int] | tuple[int, int, int]) -> None:
 ```
 
 ### Tuple unions followed by positional arguments
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+A tuple union retains its minimum length when followed by another positional argument. Both members
+here supply at least one element, so the call always has too many arguments:
+
+```py
+def one(a: int) -> None: ...
+def _(args: tuple[int] | tuple[int, int]) -> None:
+    one(*args, 1)  # error: [too-many-positional-arguments] "expected 1, got 2"
+```
+
+The minimum can include several required elements:
+
+```py
+def two(a: int, b: int) -> None: ...
+def _(args: tuple[int, int] | tuple[int, int, int]) -> None:
+    two(*args, 1)  # error: [too-many-positional-arguments] "expected 2, got 3"
+```
+
+Type aliases preserve the same minimum:
+
+```py
+type Nonempty = tuple[int] | tuple[int, int]
+
+def _(args: Nonempty) -> None:
+    one(*args, 1)  # error: [too-many-positional-arguments] "expected 1, got 2"
+```
+
+An empty tuple member or an iterable of unknown length can leave room for the later argument:
+
+```py
+def optional(a: int, b: int = 0) -> None: ...
+def _(args: tuple[()] | tuple[int]) -> None:
+    optional(*args, 1)  # no diagnostic
+
+def _(args: list[int] | tuple[int]) -> None:
+    one(*args, 1)  # no diagnostic
+```
 
 When a tuple union is followed by another positional argument, we currently combine its element
 types before checking the call. Here, we treat the tuple as an iterable of `int | str`. This reports
