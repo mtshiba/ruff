@@ -1964,6 +1964,149 @@ class WithOverloadedMethod[T]:
 reveal_type(WithOverloadedMethod[int].method)
 ```
 
+## Ambiguous overloads preserve generic return types
+
+Here, a `Series[Any]` receiver matches both `__add__` overloads, whose return types are
+`Series[int]` and `Series[str]`. We preserve the common `Series` class and replace only its
+differing type argument with `Unknown`, so the result is `Series[Unknown]` instead of `Unknown`.
+
+Regression test for [#4055](https://github.com/astral-sh/ty/issues/4055).
+
+```py
+from __future__ import annotations
+
+from typing import Any, overload
+from ty_extensions._internal import Unknown
+
+class Series[T]:
+    @overload
+    def __add__(self: Series[int], other: int) -> Series[int]: ...
+    @overload
+    def __add__(self: Series[str], other: int) -> Series[str]: ...
+    def __add__(self, other: int): ...
+    def count(self) -> int:
+        return 0
+
+def gradual(series: Series[Any]):
+    reveal_type(series + 1)  # revealed: Series[Unknown]
+    reveal_type(series.__add__(1))  # revealed: Series[Unknown]
+    reveal_type(Series.__add__(series, 1))  # revealed: Series[Unknown]
+
+def unknown(series: Series[Unknown]):
+    reveal_type(series + 1)  # revealed: Series[Unknown]
+```
+
+Concrete receivers select the matching overload:
+
+```py
+def _(integers: Series[int], strings: Series[str]):
+    reveal_type(integers + 1)  # revealed: Series[int]
+    reveal_type(strings + 1)  # revealed: Series[str]
+```
+
+The returned instance supports known methods, and ty still rejects missing attributes:
+
+```py
+def _(series: Series[Any]):
+    result = series + 1
+    reveal_type(result.count())  # revealed: int
+    result.missing()  # error: [unresolved-attribute]
+```
+
+## Ambiguous overloads returning generic protocols
+
+Specializations of a single protocol preserve the protocol while differing type arguments become
+unknown.
+
+```py
+from typing import Any, Protocol, overload
+
+class P[T](Protocol):
+    @property
+    def value(self) -> T: ...
+
+@overload
+def same_protocol(x: int) -> P[int]: ...
+@overload
+def same_protocol(x: str) -> P[str]: ...
+def same_protocol(x): ...
+def _(x: Any):
+    reveal_type(same_protocol(x))  # revealed: P[Unknown]
+```
+
+The return types `P[int]` and `Q[int]` are equivalent, but neither is equivalent to `P[str]`. The
+returns do not all specialize the same protocol, so their ambiguous result is `Unknown` regardless
+of declaration order.
+
+```py
+class Q[T](Protocol):
+    @property
+    def value(self) -> T: ...
+
+@overload
+def p_first(x: int) -> P[int]: ...
+@overload
+def p_first(x: str) -> Q[int]: ...
+@overload
+def p_first(x: bytes) -> P[str]: ...
+def p_first(x): ...
+@overload
+def q_first(x: str) -> Q[int]: ...
+@overload
+def q_first(x: int) -> P[int]: ...
+@overload
+def q_first(x: bytes) -> P[str]: ...
+def q_first(x): ...
+def _(x: Any):
+    reveal_type(p_first(x))  # revealed: Unknown
+    reveal_type(q_first(x))  # revealed: Unknown
+```
+
+## Parameter packs in ambiguous overload returns
+
+Equivalent `ParamSpec` arguments are preserved while other type arguments are merged. Differing
+parameter packs currently make the entire ambiguous return type unknown:
+
+```py
+from typing import Any, overload
+
+class WithParams[T, **P]: ...
+
+@overload
+def same_parameters(x: int) -> WithParams[int, [bytes]]: ...
+@overload
+def same_parameters(x: str) -> WithParams[str, [bytes]]: ...
+def same_parameters(x): ...
+@overload
+def parameters(x: int) -> WithParams[int, [int]]: ...
+@overload
+def parameters(x: str) -> WithParams[int, [str]]: ...
+def parameters(x): ...
+def _(x: Any):
+    reveal_type(same_parameters(x))  # revealed: WithParams[Unknown, (bytes, /)]
+    reveal_type(parameters(x))  # revealed: Unknown
+```
+
+The same applies to `TypeVarTuple` arguments:
+
+```py
+class WithItems[T, *Ts]: ...
+
+@overload
+def same_items(x: int) -> WithItems[int, bytes, float]: ...
+@overload
+def same_items(x: str) -> WithItems[str, bytes, float]: ...
+def same_items(x): ...
+@overload
+def items(x: int) -> WithItems[int, bytes]: ...
+@overload
+def items(x: str) -> WithItems[int, float]: ...
+def items(x): ...
+def _(x: Any):
+    reveal_type(same_items(x))  # revealed: WithItems[Unknown, bytes, float]
+    reveal_type(items(x))  # revealed: Unknown
+```
+
 ## Instance attributes with substituted type variables
 
 Instance attributes are specialized once, even when the type arguments refer to the class's own type
@@ -2769,6 +2912,91 @@ class Narrow(Base[int]):
 
 class Incompatible(Base[int]):
     value: str  # error: [invalid-attribute-override]
+```
+
+## Specialized declarations after a dynamic base
+
+An annotation from a generic base is specialized even when the subclass has an earlier dynamic base.
+
+```py
+from typing import Any
+
+class Base[T]:
+    items: list[T]
+
+class Integers(Any, Base[int]):
+    items = []
+
+reveal_type(Integers.items)  # revealed: list[int]
+```
+
+An incompatible default is rejected:
+
+```py
+class Invalid(Any, Base[int]):
+    items = ["wrong"]  # error: [invalid-assignment]
+```
+
+A generic subclass retains its type parameter in the inherited annotation:
+
+```py
+class Child[T](Any, Base[T]):
+    items = []
+
+def check(child: Child[str]) -> None:
+    reveal_type(child.items)  # revealed: list[str]
+    child.items.append(1)  # error: [invalid-argument-type]
+```
+
+## Narrowing a bounded generic subclass
+
+An unrestricted type variable `S` cannot be used to specialize `Child`, whose type parameter is
+bounded by `str`. Specializing `Child` with `S & str` would also be incorrect: `Parent` is
+invariant, so `Parent[S]` does not imply `Parent[S & str]`. The runtime check therefore retains the
+original `Parent[S]` and narrows to `Child[Unknown]`. Member types can consequently become gradual.
+
+TODO: If we tracked `S <= str` as a flow-sensitive constraint in the branch, we could infer
+`Child[S]`.
+
+```py
+class Parent[T]:
+    def get(self) -> T:
+        raise NotImplementedError
+
+    def put(self, value: T) -> None:
+        pass
+
+class Child[T: str](Parent[T]): ...
+
+def narrow[S](value: Parent[S]) -> None:
+    if isinstance(value, Child):
+        reveal_type(value)  # revealed: Parent[S@narrow] & Child[Unknown]
+        reveal_type(value.get())  # revealed: S@narrow & Unknown
+        # TODO: `Parent[S]` still requires the argument to be assignable to `S`.
+        value.put(42)
+
+def narrow_bounded[S: str](value: Parent[S]) -> None:
+    if isinstance(value, Child):
+        reveal_type(value)  # revealed: Child[S@narrow_bounded]
+```
+
+The same applies when narrowing an intersection of two invariant generic bases.
+
+```py
+from ty_extensions import Intersection
+
+class Other[T]:
+    value: list[T]
+
+class ChildBoth[T: str](Parent[T], Other[T]): ...
+
+def narrow_intersection[S](value: Intersection[Parent[S], Other[S]]) -> None:
+    if isinstance(value, ChildBoth):
+        reveal_type(value)  # revealed: Parent[S@narrow_intersection] & Other[S@narrow_intersection] & ChildBoth[Unknown]
+
+def narrow_intersection_bounded[S: str](value: Intersection[Parent[S], Other[S]]) -> None:
+    if isinstance(value, ChildBoth):
+        reveal_type(value)  # revealed: ChildBoth[S@narrow_intersection_bounded]
 ```
 
 [crtp]: https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern

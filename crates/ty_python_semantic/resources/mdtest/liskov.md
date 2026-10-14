@@ -3711,6 +3711,40 @@ class PropertyChild(Base):
         return ""
 ```
 
+## Attribute contracts inherited from `object`
+
+Typeshed declares metadata such as `__module__: str` on `object`. Normally, this annotation would
+permit instance writes. But instances of `object` do not provide instance-attribute storage, so
+writability of these attributes is not guaranteed by `object`. This means that slotted subclasses
+can assign this metadata in their class bodies without violating an inherited write contract.
+
+```py
+class Slotted:
+    __slots__ = ()
+    __module__ = "custom"  # no diagnostic
+    __doc__ = None  # no diagnostic
+    __annotations__ = {}  # no diagnostic
+```
+
+Overrides must still preserve the declared read types.
+
+```py
+class InvalidRead:
+    __module__: int = 0  # error: [invalid-attribute-override]
+```
+
+Explicit declarations on user-defined bases still constrain overrides of `__module__`.
+
+```py
+from typing import Literal
+
+class Declared:
+    __module__: str = "custom"
+
+class Narrowed(Declared):
+    __module__: Literal["custom"] = "custom"  # error: [invalid-mutable-override]
+```
+
 ## Descriptor setters cannot narrow accepted writes
 
 An explicit descriptor annotation establishes its own write type. Its setter must accept every value

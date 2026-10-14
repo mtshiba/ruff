@@ -24,6 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec, smallvec_inline};
 
 use self::constructor::{ConstructorBinding, ConstructorContext};
+use super::ambiguous::merge_ambiguous_returns;
 use super::{Argument, CallArguments, CallError, CallErrorKind, InferContext, Signature, Type};
 use crate::db::Db;
 use crate::dunder_all::dunder_all_names;
@@ -2057,6 +2058,18 @@ impl<'db> Bindings<'db> {
                                 }
                             },
                         );
+                        // Unlike `strict=None`, `Field(frozen=None)` is an explicit value that
+                        // leaves the field mutable and overrides an earlier `frozen=True`.
+                        let frozen = get_argument_type("frozen", false).map_or(
+                            ConfigBoolean::Unspecified,
+                            |frozen| {
+                                if frozen.is_none(db) {
+                                    ConfigBoolean::Disabled
+                                } else {
+                                    ConfigBoolean::from_type(frozen)
+                                }
+                            },
+                        );
 
                         // `dataclasses.field` and field-specifier functions of commonly used
                         // libraries like `pydantic`, `attrs`, and `SQLAlchemy` all return
@@ -2196,7 +2209,7 @@ impl<'db> Bindings<'db> {
                         // to `T`. Otherwise, we would error on `name: str = field(default="")`.
                         overload.set_return_type(Type::KnownInstance(KnownInstanceType::Field(
                             FieldInstance::new(
-                                db, default_ty, init, kw_only, alias, converter, strict,
+                                db, default_ty, init, kw_only, alias, converter, strict, frozen,
                             ),
                         )));
                     }
@@ -3364,17 +3377,23 @@ impl<'db> Bindings<'db> {
                 }
             }
 
-            // Known method overrides can resolve ambiguous return types.
+            // Known method overrides can resolve ambiguity or change the shared return structure.
             if matches!(
                 binding.overload_call_result,
-                Some(OverloadCallResult::Ambiguous)
-            ) && binding
-                .matching_overloads()
-                .map(|(_, overload)| overload.return_type())
-                .all_equal_value()
-                .is_ok()
-            {
-                binding.overload_call_result = None;
+                Some(OverloadCallResult::Ambiguous(_))
+            ) {
+                binding.overload_call_result = if binding
+                    .matching_overloads()
+                    .map(|(_, overload)| overload.return_type())
+                    .all_equal_value()
+                    .is_ok()
+                {
+                    None
+                } else {
+                    Some(OverloadCallResult::Ambiguous(
+                        binding.merge_ambiguous_return_types(db, env),
+                    ))
+                };
             }
         }
 
@@ -3460,7 +3479,8 @@ pub(crate) struct CallableBinding<'db> {
     /// overloads for the expanded argument lists. We also retain the overloads selected for
     /// deprecation reporting without discarding the other matches used for argument inference.
     ///
-    /// For (2) and (3), the final return type is [`Unknown`].
+    /// For (2), shared structure in the return types is preserved, with differing parts replaced
+    /// by [`Unknown`]. For (3), the final return type is [`Unknown`].
     ///
     /// [`Unknown`]: crate::types::DynamicType::Unknown
     overload_call_result: Option<OverloadCallResult<'db>>,
@@ -4444,8 +4464,22 @@ impl<'db> CallableBinding<'db> {
 
         if !are_return_types_equivalent_for_all_matching_overloads {
             // Overload matching is ambiguous.
-            self.overload_call_result = Some(OverloadCallResult::Ambiguous);
+            self.overload_call_result = Some(OverloadCallResult::Ambiguous(
+                self.merge_ambiguous_return_types(db, env),
+            ));
         }
+    }
+
+    fn merge_ambiguous_return_types(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Type<'db> {
+        let return_types: SmallVec<[_; 4]> = self
+            .matching_overloads()
+            .map(|(_, overload)| overload.return_type())
+            .collect();
+        merge_ambiguous_returns(db, env, &return_types)
     }
 
     fn as_result(&self) -> Result<(), CallErrorKind> {
@@ -4564,7 +4598,7 @@ impl<'db> CallableBinding<'db> {
                     .cases
                     .iter()
                     .any(|case| case.selected_overloads.contains(index)),
-                OverloadCallResult::Ambiguous => true,
+                OverloadCallResult::Ambiguous(_) => true,
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
             }
         }))
@@ -4652,7 +4686,7 @@ impl<'db> CallableBinding<'db> {
             return match overload_call_result {
                 OverloadCallResult::ArgumentTypeExpansion(expanded) => expanded.return_type,
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => Type::unknown(),
-                OverloadCallResult::Ambiguous => Type::Dynamic(DynamicType::AmbiguousOverload),
+                OverloadCallResult::Ambiguous(return_type) => *return_type,
             };
         }
         if let Some((_, first_overload)) = self.matching_overloads().next() {
@@ -4908,8 +4942,10 @@ enum OverloadCallResult<'db> {
     ArgumentTypeExpansion(Box<ExpandedOverloadCall<'db>>),
     /// Argument expansion stopped at this argument's expansion limit.
     ArgumentTypeExpansionLimitReached(usize),
-    /// Several overloads remain with non-equivalent return types.
-    Ambiguous,
+    /// Several overloads remain with non-equivalent return types. Their shared structure is
+    /// preserved, with each differing part replaced by `DynamicType::AmbiguousOverload`, which
+    /// displays as `Unknown`.
+    Ambiguous(Type<'db>),
 }
 
 /// The combined return type and selected overloads from successful argument expansion.
@@ -10568,6 +10604,55 @@ def swap(value: int | str) -> int | str:
         let int = KnownClass::Int.to_instance(db, &env);
         let str = KnownClass::Str.to_instance(db, &env);
 
+        assert_eq!(
+            paths.iter().map(AsRef::as_ref).collect::<FxHashSet<_>>(),
+            FxHashSet::from_iter([
+                [Some(Resolved(int)), Some(Resolved(str))].as_slice(),
+                [Some(Resolved(str)), Some(Resolved(int))].as_slice(),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intersection_argument_retains_correlated_inference() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+from ty_extensions import Intersection
+
+class Source[T]:
+    def get(self) -> T:
+        raise NotImplementedError
+
+class IntStrSource(Source[tuple[int, str]]): ...
+class StrIntSource(Source[tuple[str, int]]): ...
+
+def infer_pair[T, U](source: Source[tuple[T, U]]) -> tuple[T, U]:
+    return source.get()
+
+source: Intersection[IntStrSource, StrIntSource]
+"#,
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/a.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let callable = global_symbol(db, file, "infer_pair").place.expect_type();
+        let argument = global_symbol(db, file, "source").place.expect_type();
+        let inference = call_inference(db, callable, [argument], TypeContext::default())?;
+        let TypeVarInferenceSolutions::Alternatives(paths) = inference.solutions(db) else {
+            anyhow::bail!(
+                "expected correlated alternatives, got {:?}",
+                inference.solutions(db)
+            );
+        };
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+
+        // Each intersection member supplies a complete pair; collecting its tuple elements
+        // independently would introduce the unsupported (int, int) and (str, str) alternatives.
         assert_eq!(
             paths.iter().map(AsRef::as_ref).collect::<FxHashSet<_>>(),
             FxHashSet::from_iter([
