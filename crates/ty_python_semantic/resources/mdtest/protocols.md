@@ -3094,8 +3094,6 @@ class WritableSelfAttr:
 class RecursiveWritableSelfAttr(Protocol):
     x: Self
 
-# TODO: Add an equivalent property protocol and an `is_equivalent_to` assertion once `Self` types
-# are supported in protocol member comparisons.
 class HasWritableSelfAttr(Protocol):
     @property
     def x(self) -> WritableSelfAttr: ...
@@ -3162,6 +3160,170 @@ class HasConcretePropertySetter(Protocol):
 
 static_assert(is_subtype_of(PropertyWithSelfSetter, HasConcretePropertySetter))
 static_assert(is_assignable_to(PropertyWithSelfSetter, HasConcretePropertySetter))
+```
+
+## `Self` in protocol attributes
+
+Attribute and property annotations bind `Self` to the implementation type. An inherited attribute
+keeps that meaning when a subclass supplies an unannotated default:
+
+```py
+from typing import Protocol
+from typing_extensions import Self
+from ty_extensions import static_assert
+from ty_extensions._internal import is_equivalent_to
+
+class Attribute(Protocol):
+    value: Self | None
+
+class WithDefault(Attribute, Protocol):
+    value = None
+
+class Property(Protocol):
+    @property
+    def value(self) -> Self | None: ...
+    @value.setter
+    def value(self, value: Self | None) -> None: ...
+
+static_assert(is_equivalent_to(Attribute, Property))
+static_assert(is_equivalent_to(WithDefault, Property))
+```
+
+## `Self` in conditional protocol members
+
+`Self` still binds to the implementation type when an attribute has multiple definitions. The
+identical branches below give the inherited attribute multiple default assignments without changing
+its type:
+
+```py
+from typing import Protocol
+from typing_extensions import Self
+from ty_extensions import static_assert
+from ty_extensions._internal import is_equivalent_to
+
+class Attribute(Protocol):
+    value: Self | None
+
+class Property(Protocol):
+    @property
+    def value(self) -> Self | None: ...
+    @value.setter
+    def value(self, value: Self | None) -> None: ...
+
+def condition() -> bool:
+    return True
+
+class WithDefault(Attribute, Protocol):
+    if condition():
+        value = None
+    else:
+        value = None
+
+static_assert(is_equivalent_to(WithDefault, Property))
+```
+
+The inherited annotation can also have multiple definitions. Both branches declare the same type, so
+`Self` binding still has the same result:
+
+```py
+class ConditionalAttribute(Protocol):
+    if condition():
+        value: Self | None
+    else:
+        value: Self | None
+
+class InheritedConditionalAttribute(ConditionalAttribute, Protocol):
+    value = None
+
+static_assert(is_equivalent_to(InheritedConditionalAttribute, Property))
+```
+
+## Writable `__class__` members
+
+A writable `__class__: type[object]` excludes proper subclasses of `object`: their inherited setter
+accepts only `type[Self]`.
+
+```py
+from typing import Protocol
+from ty_extensions import static_assert
+from ty_extensions._internal import is_equivalent_to
+
+class JustObject(Protocol):
+    __class__: type[object]
+
+class C: ...
+
+def takes_instance(value: JustObject) -> None: ...
+def takes_class(value: type[JustObject]) -> None: ...
+
+takes_instance(object())  # no diagnostic
+takes_class(object)  # no diagnostic
+
+takes_instance(C())  # error: [invalid-argument-type]
+takes_class(C)  # error: [invalid-argument-type]
+takes_instance(C)  # error: [invalid-argument-type]
+
+static_assert(not is_equivalent_to(JustObject, object))
+```
+
+Inherited declarations impose the same requirement:
+
+```py
+class InheritedJustObject(JustObject, Protocol): ...
+
+inherited: InheritedJustObject = C()  # error: [invalid-assignment]
+```
+
+Writable contracts that accept only `type[Self]` or `Never` do not require accepting another
+object's class. These protocols remain equivalent to `object`:
+
+```py
+from typing_extensions import Never, Self
+
+class SelfClass(Protocol):
+    @property
+    def __class__(self) -> type[Self]: ...
+    @__class__.setter
+    def __class__(self, value: type[Self]) -> None: ...
+
+class NeverClass(Protocol):
+    @property
+    def __class__(self) -> type[object]: ...
+    @__class__.setter
+    def __class__(self, value: Never) -> None: ...
+
+static_assert(is_equivalent_to(SelfClass, object))
+static_assert(is_equivalent_to(NeverClass, object))
+```
+
+An attribute annotation expresses the same `Self` requirement, including when inherited:
+
+```py
+class SelfClassAttribute(Protocol):
+    __class__: type[Self]
+
+class InheritedSelfClassAttribute(SelfClassAttribute, Protocol): ...
+
+static_assert(is_equivalent_to(SelfClassAttribute, object))
+static_assert(is_equivalent_to(InheritedSelfClassAttribute, object))
+```
+
+## `Self` in universal protocol methods
+
+Returning a subtype of `object` does not guarantee returning `Self` for every receiver. Although
+`object.__eq__` returns `bool`, it does not satisfy a universal requirement to return `Self`:
+
+```py
+from typing import Protocol
+from typing_extensions import Self
+from ty_extensions import static_assert
+from ty_extensions._internal import is_equivalent_to
+
+class ReturnsSelf(Protocol):
+    # error: [invalid-method-override]
+    def __eq__(self, other: object) -> Self: ...
+
+static_assert(not is_equivalent_to(ReturnsSelf, object))
 ```
 
 ## Enum members and writable protocol members
@@ -7125,9 +7287,9 @@ static_assert(is_constraint_set_assignable_to(Consumer[Consumer[int]], Consumer[
 ### Recursive members in the source specialization
 
 A protocol member can contain the same protocol in the source specialization but remain finite in
-the target specialization. Its structural requirements must still contribute all valid solutions,
-even when nominal inheritance alone would infer a narrower type. The same members also establish
-assignability when no type variables need to be inferred.
+the target specialization. Its structural requirements still contribute to inference, and each
+retained specialization must accept the original argument. Here, `extract` infers `Consumer[int]`
+for `T`. The same members also establish assignability when no type variables need to be inferred.
 
 ```toml
 [environment]
@@ -7153,8 +7315,7 @@ def extract[T](consumer: Consumer[T]) -> T:
     raise NotImplementedError
 
 def check(value: Consumer[Consumer[int]]) -> None:
-    # TODO: Validate and refine individual specializations to reveal Consumer[int].
-    reveal_type(extract(value))  # revealed: Consumer[int] | int
+    reveal_type(extract(value))  # revealed: Consumer[int]
 ```
 
 An explicit receiver annotation introduces constraints when comparing a bound method with a
@@ -7508,8 +7669,9 @@ bad_assignment: Node[int] = Mismatched(1)  # error: [invalid-assignment]
 def extract[U](node: Node[U]) -> U:
     raise NotImplementedError
 
-# TODO: Refine the structural and inherited specializations separately to reveal str | Literal[1].
-reveal_type(extract(Mismatched(1)))  # revealed: object
+# The structural solution includes both `value`'s `Literal[1]` and `child`'s `str`.
+# Intersecting it with the inherited `Node[object]` solution preserves that precision.
+reveal_type(extract(Mismatched(1)))  # revealed: str | Literal[1]
 ```
 
 ### Recursive legacy generic protocol
