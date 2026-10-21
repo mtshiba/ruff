@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::iter;
 use std::rc::Rc;
 use std::time::Duration;
@@ -106,8 +106,8 @@ pub use crate::types::type_alias::TypeAliasType;
 pub use crate::types::type_form::TypeFormType;
 pub(crate) use crate::types::typed_dict::TypedDictType;
 pub(crate) use crate::types::typevar::{
-    BindingContext, BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarBoundOrConstraints,
-    TypeVarNonce,
+    BindingContext, BoundTypeVarIdentity, ParamSpecAttrKind, SelfTypeVarOrigin,
+    TypeVarBoundOrConstraints, TypeVarNonce,
 };
 pub use crate::types::typevar::{BoundTypeVarInstance, TypeVarKind};
 use crate::types::typevar::{TypeVarInstance, TypeVarSet};
@@ -506,6 +506,13 @@ struct ApplyMaterializationEquivalence;
 type MaterializationEquivalenceVisitor<'db> =
     Rc<CycleDetector<'db, ApplyMaterializationEquivalence, (Type<'db>, Type<'db>), bool, 1>>;
 
+type MaterializationDependency<'db> = (Type<'db>, MaterializationKind);
+
+struct DependentMaterialization<'db> {
+    result: Type<'db>,
+    dependencies: Box<[MaterializationDependency<'db>]>,
+}
+
 /// A [`TypeTransformer`] that is used in `apply_type_mapping` methods.
 ///
 /// Some recursive transformations visit the same type under more than one mapping mode within a
@@ -524,6 +531,9 @@ pub(crate) struct ApplyTypeMappingVisitor<'env, 'db> {
     promotion: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     skip_promotion: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     materialization_equivalence: OnceCell<MaterializationEquivalenceVisitor<'db>>,
+    materialization_dependencies: RefCell<Vec<MaterializationDependency<'db>>>,
+    dependent_materializations:
+        RefCell<FxHashMap<MaterializationDependency<'db>, DependentMaterialization<'db>>>,
 }
 
 impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
@@ -540,6 +550,8 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             promotion: OnceCell::default(),
             skip_promotion: OnceCell::default(),
             materialization_equivalence: OnceCell::default(),
+            materialization_dependencies: RefCell::default(),
+            dependent_materializations: RefCell::default(),
         }
     }
 
@@ -582,9 +594,70 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             TypeMapping::Promote(PromotionMode::Off, _) => &self.skip_promotion,
             _ => &self.default,
         };
-        type_transformer
-            .get_or_init(Box::default)
-            .visit_type(db, ty, func)
+        let type_transformer = type_transformer.get_or_init(Box::default);
+        let TypeMapping::Materialize(kind) = type_mapping else {
+            return type_transformer.visit_type(db, ty, func);
+        };
+        let key = (ty, *kind);
+        if let Some(cached) = self.dependent_materializations.borrow().get(&key) {
+            self.materialization_dependencies
+                .borrow_mut()
+                .extend_from_slice(&cached.dependencies);
+            return cached.result;
+        }
+        let dependencies_start = self.materialization_dependencies.borrow().len();
+        type_transformer.visit_type_with_cycle_fallback(
+            db,
+            ty,
+            func,
+            |active| {
+                // A recursive alias can expand to an active callable before its
+                // materialization is known. Let the alias's guard close the cycle:
+                // returning the unchanged callable would leave that alias gradual.
+                if matches!(ty, Type::Callable(_)) {
+                    None
+                } else {
+                    self.materialization_dependencies
+                        .borrow_mut()
+                        .push((active, *kind));
+                    Some(ty)
+                }
+            },
+            |result| {
+                // A fallback leaves a recursive reference unchanged. Intermediate results
+                // depend on that active guard, even across a variance change. Once the
+                // guard itself finishes, its result can be reused outside that cycle.
+                let mut dependencies = self.materialization_dependencies.borrow_mut();
+                let mut seen = FxHashSet::default();
+                dependencies
+                    .extract_if(dependencies_start.., |dependency| {
+                        !seen.insert(*dependency) || *dependency == key
+                    })
+                    .for_each(drop);
+                let mut dependent_materializations = self.dependent_materializations.borrow_mut();
+                // Only scan when this guard was used as a dependency. Most children of a
+                // recursive alias depend only on the alias, so scanning each is quadratic.
+                if seen.contains(&key) {
+                    dependent_materializations
+                        .retain(|_, cached| !cached.dependencies.contains(&key));
+                }
+                if dependencies.len() == dependencies_start {
+                    true
+                } else {
+                    // Reuse partial results while all their guards remain active. Without
+                    // this cache, shared callables inside a recursive alias take exponential
+                    // work. Finishing any dependency above evicts the partial result.
+                    dependent_materializations.insert(
+                        key,
+                        DependentMaterialization {
+                            result,
+                            dependencies: dependencies[dependencies_start..].into(),
+                        },
+                    );
+                    false
+                }
+            },
+        )
     }
 
     fn is_equivalent_to_materialization(
@@ -9707,9 +9780,18 @@ impl<'db> Type<'db> {
 
             Type::KnownBoundMethod(KnownBoundMethodType::DunderCall(callable)) => {
                 let callable = match callable.inner(db) {
-                    Type::FunctionLiteral(function) => Type::FunctionLiteral(
-                        function.apply_type_mapping_impl(db, type_mapping, tcx, visitor),
-                    ),
+                    // Materialization needs the function's recursion guard because its
+                    // signature can refer back to this `__call__` method.
+                    Type::FunctionLiteral(function)
+                        if !matches!(type_mapping, TypeMapping::Materialize(_)) =>
+                    {
+                        Type::FunctionLiteral(function.apply_type_mapping_impl(
+                            db,
+                            type_mapping,
+                            tcx,
+                            visitor,
+                        ))
+                    }
                     callable => callable.apply_type_mapping_impl(db, type_mapping, tcx, visitor),
                 };
                 Type::KnownBoundMethod(KnownBoundMethodType::DunderCall(InternedType::new(
@@ -9918,7 +10000,9 @@ impl<'db> Type<'db> {
     ) {
         let matching_typevar = |bound_typevar: &BoundTypeVarInstance<'db>| {
             match bound_typevar.typevar(db).kind(db) {
-                TypeVarKind::LegacyTypeVar | TypeVarKind::Pep613Alias | TypeVarKind::TypingSelf
+                TypeVarKind::LegacyTypeVar
+                | TypeVarKind::Pep613Alias
+                | TypeVarKind::TypingSelf { .. }
                     if binding_context.is_none_or(|binding_context| {
                         bound_typevar.binding_context(db)
                             == BindingContext::Definition(binding_context)
@@ -11064,17 +11148,17 @@ pub enum PromotionKind {
     SingletonsOnly,
 }
 
-/// Returns the [`ClassLiteral`] that "owns" a `Self` typevar (i.e., the class from its upper bound).
-fn self_typevar_owner_class_literal<'db>(
+/// Returns the class recorded in a `Self` typevar's origin.
+fn self_typevar_origin_class_literal<'db>(
     db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
     bound_typevar: BoundTypeVarInstance<'db>,
 ) -> Option<ClassLiteral<'db>> {
-    bound_typevar
-        .typevar(db)
-        .upper_bound(db, env)
-        .and_then(|ty| ty.nominal_class(db, env))
-        .map(|class| class.class_literal(db))
+    match bound_typevar.kind(db) {
+        TypeVarKind::TypingSelf {
+            origin: SelfTypeVarOrigin::Class(class),
+        } => Some(class),
+        _ => None,
+    }
 }
 
 #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
@@ -11091,8 +11175,8 @@ fn class_mro_literals<'db>(
 
 /// Information needed to bind `Self` typevars to a concrete type.
 ///
-/// Uses MRO-based matching: a `Self` typevar is bound only if its owner class
-/// is in the MRO of the self type's class.
+/// Uses the binding context and MRO-based matching against the class recorded in a `Self`
+/// typevar's origin.
 #[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
 pub struct SelfBinding<'db> {
     ty: Type<'db>,
@@ -11119,7 +11203,7 @@ impl<'db> SelfBinding<'db> {
     ) -> Self {
         let class_literal = match self_type {
             Type::TypeVar(typevar) if typevar.typevar(db).is_self(db) => {
-                self_typevar_owner_class_literal(db, env, typevar)
+                self_typevar_origin_class_literal(db, typevar)
             }
             _ => self_type
                 .nominal_class(db, env)
@@ -11134,12 +11218,7 @@ impl<'db> SelfBinding<'db> {
     }
 
     /// Returns whether `bound_typevar` should be replaced by this binding's concrete self type.
-    fn should_bind(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        bound_typevar: BoundTypeVarInstance<'db>,
-    ) -> bool {
+    fn should_bind(&self, db: &'db dyn Db, bound_typevar: BoundTypeVarInstance<'db>) -> bool {
         if !bound_typevar.typevar(db).is_self(db) {
             return false;
         }
@@ -11150,12 +11229,12 @@ impl<'db> SelfBinding<'db> {
             return true;
         }
 
-        // Check that the Self typevar's owner class is in the MRO of the self type's class.
-        // If we can't determine either class, conservatively don't bind.
+        // Check that Self's originating class is in the receiver's MRO. Receiver placeholders
+        // and synthesized TypedDict schemas have no class to restrict matching.
         self.class_literal.is_some_and(|class_literal| {
             let class_mro = class_mro_literals(db, class_literal);
-            self_typevar_owner_class_literal(db, env, bound_typevar)
-                .is_none_or(|owner_class| class_mro.contains(&owner_class))
+            self_typevar_origin_class_literal(db, bound_typevar)
+                .is_none_or(|origin_class| class_mro.contains(&origin_class))
         })
     }
 }
@@ -11192,8 +11271,11 @@ pub enum TypeMapping<'a, 'db> {
     },
     /// Binds any `typing.Self` typevar with a particular `self` class.
     BindSelf(SelfBinding<'db>),
-    /// Replaces occurrences of `typing.Self` with a new `Self` type variable with the given upper bound.
-    ReplaceSelf { new_upper_bound: Type<'db> },
+    /// Replaces `typing.Self` when adapting a synthesized method to another class or schema.
+    ReplaceSelf {
+        new_origin: SelfTypeVarOrigin<'db>,
+        new_upper_bound: Type<'db>,
+    },
     /// Create the top or bottom materialization of a type.
     Materialize(MaterializationKind),
     /// Replace default types in parameters of callables with `Unknown`. This is used to avoid infinite
@@ -11276,23 +11358,25 @@ impl<'db> TypeMapping<'_, 'db> {
                     Some(context)
                 }
             }
-            TypeMapping::ReplaceSelf { new_upper_bound } => {
-                Some(GenericContext::from_typevar_instances(
-                    db,
-                    env,
-                    context.variables(db).map(|typevar| {
-                        if typevar.typevar(db).is_self(db) {
-                            BoundTypeVarInstance::synthetic_self(
-                                db,
-                                *new_upper_bound,
-                                typevar.binding_context(db),
-                            )
-                        } else {
-                            typevar
-                        }
-                    }),
-                ))
-            }
+            TypeMapping::ReplaceSelf {
+                new_origin,
+                new_upper_bound,
+            } => Some(GenericContext::from_typevar_instances(
+                db,
+                env,
+                context.variables(db).map(|typevar| {
+                    if typevar.typevar(db).is_self(db) {
+                        BoundTypeVarInstance::synthetic_self(
+                            db,
+                            *new_origin,
+                            *new_upper_bound,
+                            typevar.binding_context(db),
+                        )
+                    } else {
+                        typevar
+                    }
+                }),
+            )),
         }
     }
 
@@ -12570,24 +12654,21 @@ impl<'db> TypeGuardLike<'db> for TypeGuardType<'db> {
 }
 
 /// Walk the MRO of this class and return the last class just before the specified known base.
-/// This can be used to determine upper bounds for `Self` type variables on methods that are
-/// being added to the given class.
+/// This determines the owner and upper bound of `Self` on synthesized fallback methods.
 ///
 /// Preserve the class's specialization so that a method on `Child[int]` has a bound such as
 /// `Base[int]`, rather than retaining the type variable in `Base[T@Child]`.
-pub(super) fn determine_upper_bound<'db>(
+pub(super) fn determine_self_class<'db>(
     db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
     class: ClassType<'db>,
     is_known_base: impl Fn(ClassBase<'db>) -> bool,
-) -> Type<'db> {
-    let upper_bound = class
+) -> ClassType<'db> {
+    class
         .iter_mro(db)
         .take_while(|base| !is_known_base(*base))
         .filter_map(ClassBase::into_class)
         .last()
-        .unwrap_or(class);
-    Type::instance(db, env, upper_bound)
+        .unwrap_or(class)
 }
 
 // Make sure that the `Type` enum does not grow unexpectedly.

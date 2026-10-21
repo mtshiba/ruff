@@ -39,9 +39,10 @@ use crate::types::visitor::{
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType, CallableTypes,
     ClassLiteral, ErrorContext, FindLegacyTypeVarsVisitor, IntersectionType, KnownClass,
-    KnownInstanceType, MaterializationKind, RecursiveType, SubclassOfInner, Type, TypeAliasType,
-    TypeContext, TypeMapping, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance,
-    UnionAccumulator, UnionType, binding_type, infer_definition_types, inferred_declaration,
+    KnownInstanceType, MaterializationKind, RecursiveType, SelfTypeVarOrigin, SubclassOfInner,
+    Type, TypeAliasType, TypeContext, TypeMapping, TypeVarBoundOrConstraints, TypeVarKind,
+    TypeVarVariance, UnionAccumulator, UnionType, binding_type, infer_definition_types,
+    inferred_declaration,
 };
 use crate::{Db, FxIndexMap, FxOrderMap, FxOrderSet};
 use ty_python_core::definition::{Definition, DefinitionKind};
@@ -171,7 +172,7 @@ fn find_typevar_binding<'db>(
     // We also match `FunctionTypeParameters` as a valid inner scope because for generic methods
     // (e.g., `def foo[T](self) -> Self`), the type-params scope sits between the function body
     // and the class body in the ancestor chain.
-    if matches!(typevar.kind(db), TypeVarKind::TypingSelf) {
+    if matches!(typevar.kind(db), TypeVarKind::TypingSelf { .. }) {
         for ((_, inner), (_, outer)) in index.ancestor_scopes(containing_scope).tuple_windows() {
             if outer.kind().is_class() {
                 match inner.node() {
@@ -275,7 +276,9 @@ pub(crate) fn typing_self<'db>(
         // https://github.com/astral-sh/ty/issues/2514. So we just pass `None`
         // for the definition field here.
         None,
-        TypeVarKind::TypingSelf,
+        TypeVarKind::TypingSelf {
+            origin: SelfTypeVarOrigin::Class(class),
+        },
     );
     let bounds = TypeVarBoundOrConstraints::UpperBound(Type::instance(
         db,
@@ -2194,11 +2197,15 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
                     // These variables stand for specializations we have yet to choose. Keep
                     // their declared domains intact: materializing `T: Any` to `T: Never`
                     // would incorrectly rule out the valid choice `T = str`.
+                    let mut checker = self.as_relation_checker(TypeRelation::Subtyping);
+                    // Nested overlap checks can recurse through materialization equivalence.
+                    // Retain that guard while starting fresh transformation caches.
                     let materialization_visitor = ApplyTypeMappingVisitor {
                         materialize_typevar_bounds_and_defaults: false,
-                        ..ApplyTypeMappingVisitor::new(self.env)
+                        ..checker
+                            .materialization_visitor
+                            .for_new_materialization_root()
                     };
-                    let mut checker = self.as_relation_checker(TypeRelation::Subtyping);
                     checker.typevar_evaluation = TypeVarEvaluation::Lazy;
                     checker.materialization_visitor = &materialization_visitor;
                     let result = self

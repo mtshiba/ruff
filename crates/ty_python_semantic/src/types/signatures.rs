@@ -44,10 +44,10 @@ use crate::types::typevar::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarIdentity, BoundTypeVarInstance,
-    CallableType, ErrorContext, ErrorContextTree, FindLegacyTypeVarsVisitor, MaterializationKind,
-    ParamSpecAttrKind, ParameterDescription, SelfBinding, TypeContext, TypeMapping,
-    TypeVarBoundOrConstraints, TypeVarNonce, TypedDictType, UnionBuilder, VarianceInferable,
-    VarianceTerm, infer_complete_scope_types, todo_type,
+    CallableType, ClassLiteral, ErrorContext, ErrorContextTree, FindLegacyTypeVarsVisitor,
+    MaterializationKind, ParamSpecAttrKind, ParameterDescription, SelfBinding, SelfTypeVarOrigin,
+    TypeContext, TypeMapping, TypeVarBoundOrConstraints, TypeVarNonce, TypedDictType, UnionBuilder,
+    VarianceInferable, VarianceTerm, infer_complete_scope_types, todo_type,
 };
 use crate::{Db, FxOrderSet};
 use ruff_db::parsed::parsed_module;
@@ -1259,6 +1259,51 @@ impl<'db> Signature<'db> {
         &self.parameters
     }
 
+    pub(super) fn with_nominal_protocol_receiver(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        origin: ClassLiteral<'db>,
+        self_type: Type<'db>,
+    ) -> Option<Self> {
+        if !self.has_explicit_positional_receiver_annotation() {
+            return None;
+        }
+        let receiver = self
+            .parameters
+            .get(0)?
+            .annotated_type()
+            .resolve_type_alias(db);
+        let protocol = receiver.as_protocol_instance()?;
+        if protocol.materialization_kind(db).is_some()
+            || protocol.class_origin(db)?.class_literal(db) != origin
+        {
+            return None;
+        }
+        // The receiver is implicit at call sites, so its name and default do not participate
+        // in signature compatibility.
+        let receiver = Parameter::positional_only(None)
+            .with_annotated_type(Type::NominalInstance(protocol.nominal_origin_instance(db)?));
+        let parameters = self.parameters.with_transformed_parameters(
+            std::iter::once(receiver).chain(self.parameters.iter().skip(1).cloned()),
+        );
+        Some(
+            self.clone()
+                .with_parameters(parameters)
+                .apply_type_mapping_impl(
+                    db,
+                    &TypeMapping::BindSelf(SelfBinding::new(
+                        db,
+                        env,
+                        self_type,
+                        self.definition.map(BindingContext::Definition),
+                    )),
+                    TypeContext::default(),
+                    &ApplyTypeMappingVisitor::new(env),
+                ),
+        )
+    }
+
     /// Adds an implicit annotation to the first parameter of this signature, if that parameter is
     /// positional and does not already have an annotation. We do not check whether that's the
     /// right thing to do! The caller must determine whether the first parameter is actually a
@@ -1385,6 +1430,7 @@ impl<'db> Signature<'db> {
                 let receiver = receiver_type.unwrap_or_else(|| {
                     Type::TypeVar(BoundTypeVarInstance::synthetic_self(
                         db,
+                        SelfTypeVarOrigin::ReceiverPlaceholder,
                         Type::object(),
                         BindingContext::Synthetic(env.program(db)),
                     ))
