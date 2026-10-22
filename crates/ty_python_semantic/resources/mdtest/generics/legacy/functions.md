@@ -1731,10 +1731,10 @@ from typing import TypeVar, Generic
 T = TypeVar("T")
 
 class P(Generic[T]):
-    x: T
+    p: T
 
 class Q(Generic[T]):
-    x: T
+    q: T
 
 def extract_t(x: P[T] | Q[T]) -> T:
     raise NotImplementedError
@@ -2100,6 +2100,44 @@ def infer_list_bound(value: list[ListBoundT] | Other) -> ListBoundT:
 
 reveal_type(infer_any_bound(list[str]()))  # revealed: str
 reveal_type(infer_list_bound(list[list[str]]()))  # revealed: list[str]
+```
+
+## Gradual specializations in callable union returns
+
+A callable's return type only needs to match one member of an expected union, even when the match
+relies on a gradual type argument. If several declared constraints remain possible, inference
+preserves the gradual type argument.
+
+```py
+from typing import Any, Callable, Generic, TypeVar
+
+T = TypeVar("T", str, bytes)
+
+class Box(Generic[T]):
+    value: T
+
+def infer(callback: Callable[[], T | Box[T]]) -> T:
+    raise NotImplementedError
+
+unknown = Box()
+any_ = Box[Any]()
+
+unknown_result = infer(lambda: unknown)  # no diagnostic
+reveal_type(unknown_result)  # revealed: Unknown
+any_result = infer(lambda: any_)  # no diagnostic
+reveal_type(any_result)  # revealed: Any
+```
+
+Other arguments must still satisfy the type variable's declared constraints. Gradual evidence from a
+callback does not make an incompatible argument valid:
+
+```py
+def consume(callback: Callable[[], Box[T]], other: T) -> None: ...
+
+# The callback returns a box, as required by `Box[T]`. The second argument must instead
+# be `str` or `bytes`, but is also a box: only its type argument is gradual.
+consume(lambda: unknown, unknown)  # error: [invalid-argument-type] "does not satisfy constraints"
+consume(lambda: any_, any_)  # error: [invalid-argument-type] "does not satisfy constraints"
 ```
 
 ## Invalid bounds in generic union members
@@ -3793,7 +3831,8 @@ make independently valid specializations incompatible: a fresh `[]` can be typed
 `Never`, which would incorrectly imply that allocating the list cannot return.
 
 We handle this conservatively: if an invariant component differs across valid specializations, we do
-not intersect their return types.
+not intersect their return types. (But if one valid specialization results in a return type that is
+a subtype of all others, we select that one.)
 
 ### Mutable returns from intersection arguments
 
@@ -4000,6 +4039,36 @@ def _(
     reveal_type(invoke_all(reordered, All()))  # revealed: tuple[B, list[int]] | tuple[A, list[int]] | int
 ```
 
+The call to `invoke_all` below can infer three different types for `R`, one from each callback
+signature. Each choice gives a possible return type for the call. Inference selects `list[B]`
+because it is a subtype of both other return types, `list[A] | list[B]` and `list[B] | list[C]`:
+
+```py
+def _(
+    callback: Intersection[
+        Callable[[A], list[A] | list[B]],
+        Callable[[B], list[B] | list[C]],
+        Callable[[C], list[B]],
+    ],
+) -> None:
+    reveal_type(invoke_all(callback, All()))  # revealed: list[B]
+```
+
+Being a subtype of just one other return type is insufficient. Here `list[A]` and `list[B]` are both
+subtypes of `list[A] | list[B]`, but neither is a subtype of the other. Inference retains
+`list[A] | list[B]`:
+
+```py
+def _(
+    callback: Intersection[
+        Callable[[A], list[A] | list[B]],
+        Callable[[B], list[A]],
+        Callable[[C], list[B]],
+    ],
+) -> None:
+    reveal_type(invoke_all(callback, All()))  # revealed: list[A] | list[B]
+```
+
 For generic classes with both covariant and invariant parameters, refinement depends on which
 parameters vary. `Wrapper` only produces `T`, while its writable `value` attribute makes `U`
 invariant:
@@ -4027,6 +4096,55 @@ def _(
 ) -> None:
     reveal_type(invoke(fixed, object()))  # revealed: Wrapper[A, int] & Wrapper[B, int]
     reveal_type(invoke(varying, object()))  # revealed: Wrapper[A, int] | Wrapper[B, str]
+```
+
+### Returning values from mixed-variance unions
+
+Inference finds two valid specializations for the call to `first_value` below, returning `V@forward`
+and `V@forward | Invariant[V@forward]`. The first return type is a subtype of the second, so
+inference selects `V@forward`:
+
+```py
+from typing import Callable, Generic, TypeVar
+
+V = TypeVar("V")
+V_co = TypeVar("V_co", covariant=True)
+
+class Covariant(Generic[V_co]):
+    def get(self) -> V_co:
+        raise NotImplementedError
+
+class Invariant(Generic[V]):
+    value: V
+
+def first_value(mapping: Callable[[], V | Invariant[V] | Covariant[V]]) -> V:
+    raise NotImplementedError
+
+def forward(mapping: V | Invariant[V] | Covariant[V]) -> V:
+    value = first_value(lambda: mapping)
+    reveal_type(value)  # revealed: V@forward
+    return value
+```
+
+The comparison uses the complete return types after substituting the inferred type arguments. For
+`make_list`, the two choices produce `list[V]` and `list[V | Invariant[V]]`. Neither is a subtype of
+the other, because lists are invariant, so inference keeps the merged result below.
+
+For `make_sink`, a callable accepting `V | Invariant[V]` is a subtype of one accepting only `V`: it
+accepts every input the latter accepts. The wider parameter type therefore produces the narrower
+callable type, which inference selects:
+
+```py
+def make_list(mapping: Callable[[], V | Invariant[V] | Covariant[V]]) -> list[V]:
+    return []
+
+def make_sink(mapping: Callable[[], V | Invariant[V] | Covariant[V]]) -> Callable[[V], None]:
+    return lambda value: None
+
+def wrapped_returns(mapping: V | Invariant[V] | Covariant[V]) -> None:
+    # revealed: list[V@wrapped_returns | Covariant[V@wrapped_returns] | Invariant[V@wrapped_returns]]
+    reveal_type(make_list(lambda: mapping))
+    reveal_type(make_sink(lambda: mapping))  # revealed: (Invariant[V@wrapped_returns] | V@wrapped_returns, /) -> None
 ```
 
 ### Inferred TypedDict return alternatives

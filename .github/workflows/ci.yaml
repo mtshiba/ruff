@@ -422,8 +422,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: "Install Rust toolchain"
         run: rustup show
-      - name: "Install mold"
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - name: "Install uv"
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
@@ -506,8 +504,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: "Install Rust toolchain"
         run: rustup show
-      - name: "Install mold"
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - name: "Install uv"
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
@@ -628,8 +624,6 @@ jobs:
         env:
           MSRV: ${{ steps.msrv.outputs.value }}
         run: rustup default "${MSRV}"
-      - name: "Install mold"
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - name: "Build tests"
         env:
           MSRV: ${{ steps.msrv.outputs.value }}
@@ -651,8 +645,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: "Install Rust toolchain"
         run: rustup show
-      - name: "Install mold"
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           # renovate: datasource=github-release-attachments depName=astral-sh/uv
@@ -687,8 +679,6 @@ jobs:
           save-if: false
       - name: "Install Rust toolchain"
         run: rustup show
-      - name: "Install mold"
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - name: Build Ruff binary
         env:
           # Line-tables-only debug info: faster builds, backtraces still work.
@@ -783,9 +773,6 @@ jobs:
       - name: "Install Rust toolchain"
         run: rustup show
 
-      - name: "Install mold"
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ruff-linux-debug
@@ -860,8 +847,6 @@ jobs:
           cat ecosystem-result-format-preview >> ecosystem-result
           echo "" >> ecosystem-result
 
-      # NOTE: astral-sh-bot uses this artifact to post comments on PRs.
-      # Make sure to update the bot if you rename the artifact.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         name: Upload Results
         with:
@@ -874,6 +859,26 @@ jobs:
           if grep -q "project error" ecosystem-result; then
             exit 1
           fi
+
+  publish-ecosystem-report:
+    needs: ecosystem
+    if: >-
+      !cancelled() && github.event_name == 'pull_request' &&
+      github.repository == 'astral-sh/ruff' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (needs.ecosystem.result == 'success' || needs.ecosystem.result == 'failure')
+    uses: astral-sh/ruff/.github/workflows/publish-pull-request-report.yml@main # zizmor: ignore[unpinned-uses]
+    secrets:
+      KV_API_URL: ${{ secrets.KV_API_URL }}
+      STS_API_URL: ${{ secrets.STS_API_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      report: ruff-ecosystem
+      artifact: ecosystem-result
+      filename: ecosystem-result
+      title: "`ruff-ecosystem` results"
 
   fuzz-ty:
     name: "Fuzz for new ty panics/timeouts"
@@ -909,8 +914,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: "Install Rust toolchain"
         run: rustup show
-      - name: "Install mold"
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - name: Fuzz
         env:
           FORCE_COLOR: 1
@@ -1008,8 +1011,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: "Install Rust toolchain"
         run: rustup show
-      - name: "Install mold"
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - name: "Run ty completion evaluation"
         run: cargo run --profile profiling --package ty_completion_eval -- all --threshold 0.4 --tasks /tmp/completion-evaluation-tasks.csv
       - name: "Ensure there are no changes"
@@ -1309,21 +1310,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: micro-a-l
+          # The r benchmarks dominate runtime, so group them with a-c to balance both modes.
+          - name: micro-1
             target: ty
-            filter: 'ty_micro\[[a-l]'
+            filter: 'ty_micro\[[a-cr]'
             mode: simulation
-          - name: micro-m-z
+          - name: micro-2
             target: ty
-            filter: 'ty_micro\[[^a-l]'
+            filter: 'ty_micro\[[^a-cr]'
             mode: simulation
-          - name: micro-a-l
+          - name: micro-1
             target: ty
-            filter: 'ty_micro\[[a-l]'
+            filter: 'ty_micro\[[a-cr]'
             mode: memory
-          - name: micro-m-z
+          - name: micro-2
             target: ty
-            filter: 'ty_micro\[[^a-l]'
+            filter: 'ty_micro\[[^a-cr]'
             mode: memory
           - name: constraint_set
             target: ty_constraint_set
