@@ -581,6 +581,53 @@ info: Type variable defined here
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
 ```
 
+## Constrained type variables in bound method receivers
+
+The argument to `list.extend` must be valid for every possible element type of the receiver.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T", int, str)
+
+def extend(values: list[T], other: list[T]) -> None:
+    values.extend(other)
+
+    # error: [invalid-argument-type] "Expected `Iterable[T@extend]`, found `list[int]`"
+    values.extend([1])
+```
+
+## Generic callbacks in bound method calls
+
+A callback registered for an arbitrary `T` must return that `T` for every input. The identity
+function returns its input, which can be any `object`, so it is not a valid callback here.
+
+```py
+from collections.abc import Callable
+from typing import TypeVar
+
+V = TypeVar("V")
+T = TypeVar("T")
+
+def identity(value: V) -> V:
+    return value
+
+def register(callbacks: list[Callable[[object], T]], callback: Callable[[object], T]) -> None:
+    callbacks.append(callback)  # no diagnostic
+    # TODO: should report invalid-argument-type (https://github.com/astral-sh/ty/issues/3114)
+    callbacks.append(identity)
+```
+
+When a dictionary lookup uses `identity` as its default, it can return either kind of callback.
+
+```py
+Callback = Callable[[object], T]
+
+def lookup(callbacks: dict[str, Callback[T]]) -> None:
+    # TODO: The result should be a union of the stored callback type and the type of `identity`.
+    reveal_type(callbacks.get("key", identity))  # revealed: (object, /) -> T@lookup
+```
+
 ## Inferring a constrained typevar from a callback parameter
 
 A callback must accept every value of at least one declared constraint. A callback accepting only
@@ -4844,6 +4891,33 @@ def identity_callback(value: I) -> Callable[[I], I]:
 def optional_callback(value: O) -> Callable[[O | None], O | None]:
     # revealed: (O@optional_callback | None, /) -> O@optional_callback | None
     return reveal_type(identity_callback(value))
+```
+
+## Inferring a recursive protocol from a factory's return context
+
+The annotated assignment supplies `Stream[int]` as the type argument to `make_result`. Comparing the
+return types of `first_or` reaches `Stream`, whose `window` method adds the layer of nesting that
+`flatten` removes.
+
+```py
+from typing import Protocol, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+T = TypeVar("T")
+U = TypeVar("U")
+
+class Result(Protocol[T_co]):
+    def first_or(self, default: U) -> T_co | U: ...
+
+class Stream(Protocol[T_co]):
+    def flatten(self: "Stream[Stream[U]]") -> "Stream[U]": ...
+    def window(self) -> "Stream[Stream[T_co]]": ...
+
+def make_result() -> Result[T]:
+    raise NotImplementedError
+
+result: Result[Stream[int]] = make_result()
+reveal_type(result)  # revealed: Result[Stream[int]]
 ```
 
 ## Generic property setter overrides

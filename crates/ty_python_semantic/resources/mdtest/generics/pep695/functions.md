@@ -4020,6 +4020,53 @@ box.accept("invalid", other=1)
 box.accept(1, other="invalid")
 ```
 
+## Constrained type variables in bound method receivers
+
+The argument to `list.extend` must be valid for every possible element type of the receiver,
+including when a type alias refers to that element type.
+
+```py
+def extend[T: (int, str)](values: list[T], other: list[T]) -> None:
+    values.extend(other)
+
+    # error: [invalid-argument-type] "Expected `Iterable[T@extend]`, found `list[int]`"
+    values.extend([1])
+
+    type Item = T
+    aliased: list[Item] = values
+    # error: 20 [invalid-argument-type] "Expected `Iterable[Item]`, found `list[int]`"
+    aliased.extend([1])
+```
+
+## Generic callbacks in bound method calls
+
+A callback registered for an arbitrary `T` must return that `T` for every input. The identity
+function returns its input, which can be any `object`, so it is not a valid callback here.
+
+```py
+from collections.abc import Callable
+
+def identity[V](value: V) -> V:
+    return value
+
+def register[T](callbacks: list[Callable[[object], T]], callback: Callable[[object], T]) -> None:
+    callbacks.append(callback)  # no diagnostic
+    # TODO: should report invalid-argument-type (https://github.com/astral-sh/ty/issues/3114)
+    callbacks.append(identity)
+
+    type Callback = Callable[[object], T]
+    aliased: list[Callback] = callbacks
+    aliased.append(identity)  # TODO: should report invalid-argument-type
+```
+
+When a dictionary lookup uses `identity` as its default, it can return either kind of callback.
+
+```py
+def lookup[T](callbacks: dict[str, Callable[[object], T]]) -> None:
+    # TODO: The result should be a union of the stored callback type and the type of `identity`.
+    reveal_type(callbacks.get("key", identity))  # revealed: (object, /) -> T@lookup
+```
+
 ## `~T` is never assignable to `T`
 
 ```py
@@ -5288,6 +5335,29 @@ def identity_callback[I](value: I) -> Callable[[I], I]:
 def optional_callback[O](value: O) -> Callable[[O | None], O | None]:
     # revealed: (O@optional_callback | None, /) -> O@optional_callback | None
     return reveal_type(identity_callback(value))
+```
+
+## Inferring a recursive protocol from a factory's return context
+
+The annotated assignment supplies `Stream[int]` as the type argument to `make_result`. Comparing the
+return types of `first_or` reaches `Stream`, whose `window` method adds the layer of nesting that
+`flatten` removes.
+
+```py
+from typing import Protocol
+
+class Result[T](Protocol):
+    def first_or[U](self, default: U) -> T | U: ...
+
+class Stream[T](Protocol):
+    def flatten[U](self: "Stream[Stream[U]]") -> "Stream[U]": ...
+    def window(self) -> "Stream[Stream[T]]": ...
+
+def make_result[T]() -> Result[T]:
+    raise NotImplementedError
+
+result: Result[Stream[int]] = make_result()
+reveal_type(result)  # revealed: Result[Stream[int]]
 ```
 
 ## Generic property setter overrides
