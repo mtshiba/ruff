@@ -606,6 +606,25 @@ impl<'db> CallableSignature<'db> {
             .map(|bound_typevar| (bound_typevar, signature))
     }
 
+    /// A `false` result guarantees that an eager comparison of these callables would produce
+    /// an empty error context.
+    ///
+    /// The checker suppresses notes while trying individual source overloads. For a target such
+    /// as `Callable[[int | bytes], str]`, the aggregate check can still explain which member of
+    /// the overloads' combined return type is incompatible with `str`.
+    pub(super) fn may_explain_relation_to(&self, target: &Self) -> bool {
+        if self.overloads.len() <= 1 {
+            return true;
+        }
+
+        target.iter().any(|signature| {
+            signature.supports_overload_aggregation()
+                && signature
+                    .single_required_positional_parameter_type()
+                    .is_some_and(Type::is_union)
+        }) && self.iter().all(Signature::supports_overload_aggregation)
+    }
+
     pub(crate) fn when_constraint_set_assignable_to<'c>(
         &self,
         db: &'db dyn Db,
@@ -1297,6 +1316,21 @@ impl<'db> Signature<'db> {
     /// Return the parameters in this signature.
     pub(crate) fn parameters(&self) -> &Parameters<'db> {
         &self.parameters
+    }
+
+    fn single_required_positional_parameter_type(&self) -> Option<Type<'db>> {
+        match self.parameters.as_slice() {
+            [parameter] if parameter.is_positional() && !parameter.has_default() => {
+                Some(parameter.annotated_type())
+            }
+            _ => None,
+        }
+    }
+
+    /// Aggregation compares parameter and return types. A receiver constraint imposes an
+    /// additional obligation, and a `ParamSpec` value has no meaningful return type.
+    fn supports_overload_aggregation(&self) -> bool {
+        self.receiver_constraints().is_none() && !self.is_paramspec_value()
     }
 
     pub(super) fn with_nominal_protocol_receiver(
@@ -2495,36 +2529,15 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         source_signatures: &[Signature<'db>],
         target_signature: &Signature<'db>,
     ) -> Option<ConstraintSet<'db, 'c>> {
-        // Aggregation summarizes visible parameters and return types, but receiver bindings are
-        // additional per-signature obligations and `ParamSpec` values have no meaningful return
-        // type. Leave those signatures to the ordinary relation.
-        if target_signature.receiver_constraints().is_some()
-            || target_signature.is_paramspec_value()
-            || source_signatures.iter().any(|signature| {
-                signature.receiver_constraints().is_some() || signature.is_paramspec_value()
-            })
+        if !target_signature.supports_overload_aggregation()
+            || !source_signatures
+                .iter()
+                .all(Signature::supports_overload_aggregation)
         {
             return None;
         }
 
-        let single_required_positional_parameter_type = |signature: &Signature<'db>| {
-            if signature.parameters().len() != 1 {
-                return None;
-            }
-            let parameter = signature.parameters().get(0)?;
-
-            match parameter.kind() {
-                ParameterKind::PositionalOnly {
-                    default_type: None, ..
-                }
-                | ParameterKind::PositionalOrKeyword {
-                    default_type: None, ..
-                } => Some(parameter.annotated_type()),
-                _ => None,
-            }
-        };
-
-        let other_parameter_type = single_required_positional_parameter_type(target_signature)?;
+        let other_parameter_type = target_signature.single_required_positional_parameter_type()?;
         // Keep this aggregate path narrowly scoped to unary target callables whose parameter
         // domain is an explicit union.
         //
@@ -2552,7 +2565,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         let mut has_overlapping_domain = false;
 
         for self_signature in source_signatures {
-            let self_parameter_type = single_required_positional_parameter_type(self_signature)?;
+            let self_parameter_type = self_signature.single_required_positional_parameter_type()?;
             if !is_unary_overload_aggregate_candidate_type(self_parameter_type)
                 || !is_unary_overload_aggregate_candidate_type(self_signature.return_ty)
             {
@@ -4960,11 +4973,12 @@ impl<'db> Parameters<'db> {
     /// [`Self::from_annotation`] when the kind should be inferred from annotations; preserve the
     /// existing kind when transforming a parameter list.
     fn new(value: impl Into<Box<[Parameter<'db>]>>, kind: ParametersKind<'db>) -> Self {
+        let value = value.into();
+        if value.is_empty() && kind == ParametersKind::Standard {
+            return Self::empty();
+        }
         Self {
-            data: Arc::new(ParametersData {
-                value: value.into(),
-                kind,
-            }),
+            data: Arc::new(ParametersData { value, kind }),
         }
     }
 
@@ -5112,7 +5126,17 @@ impl<'db> Parameters<'db> {
 
     /// Create an empty parameter list.
     pub(crate) fn empty() -> Self {
-        Self::standard([])
+        // Binding a receiver often leaves no parameters. Give each worker its own empty list
+        // so that cloning these signatures does not contend on one shared reference count.
+        thread_local! {
+            static EMPTY: Parameters<'static> = Parameters {
+                data: Arc::new(ParametersData {
+                    value: Box::default(),
+                    kind: ParametersKind::Standard,
+                }),
+            };
+        }
+        EMPTY.with(Clone::clone)
     }
 
     /// Create a standard parameter list without inferring its kind or normalizing annotations.
@@ -5870,7 +5894,7 @@ impl<'db> std::ops::Index<usize> for Parameters<'db> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, get_size2::GetSize)]
 pub(crate) struct ParameterDisplayName<N> {
     name: N,
     prefix: ParameterNamePrefix,
@@ -5892,7 +5916,7 @@ impl<N: AsRef<str>> fmt::Display for ParameterDisplayName<N> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, get_size2::GetSize)]
 enum ParameterNamePrefix {
     None,
     Variadic,
