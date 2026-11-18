@@ -940,7 +940,7 @@ as a wrapper around a callback that accepts no arguments.
 
 ```py
 def erase_parameters(job: Job[P]) -> Job[[]]:
-    return job  # error: [invalid-return-type]
+    return job  # error: [invalid-explicit-return]
 ```
 
 The same restriction applies in the other direction when a class consumes callbacks. A consumer of
@@ -953,7 +953,7 @@ class CallbackConsumer(Generic[P_co]):
     def consume(self, callback: Callable[P_co, None]) -> None: ...
 
 def broaden_parameters(consumer: CallbackConsumer[[]]) -> CallbackConsumer[P_co]:
-    return consumer  # error: [invalid-return-type]
+    return consumer  # error: [invalid-explicit-return]
 ```
 
 ## Inferring an invariant `ParamSpec` through `Concatenate`
@@ -1332,7 +1332,7 @@ class Base:
 
 class Invalid(Base):
     @override
-    def __new__(cls, value: str) -> Self:  # error: [invalid-method-override]
+    def __new__(cls, value: str) -> Self:  # error: [incompatible-method-override]
         raise NotImplementedError
 ```
 
@@ -1397,6 +1397,47 @@ wrapped(1)
 wrapped(1, label="label", enabled=True)
 wrapped(1, enabled="yes")  # error: [invalid-argument-type]
 wrapped()  # error: [missing-argument]
+```
+
+### Assignability to a callable with a gradual tail
+
+If the target requires an initial `int`, the callback must accept it before `P`. The caller can
+specialize `P` to an empty parameter list.
+
+```py
+from typing import Callable, Concatenate, ParamSpec
+
+P = ParamSpec("P")
+
+def takes_int(callback: Callable[Concatenate[int, ...], None]) -> None: ...
+def check(
+    bare: Callable[P, None],
+    accepts_int: Callable[Concatenate[int, P], None],
+    accepts_str: Callable[Concatenate[str, P], None],
+) -> None:
+    takes_int(bare)  # error: [invalid-argument-type]
+    takes_int(accepts_int)  # ok
+    takes_int(accepts_str)  # error: [invalid-argument-type]
+```
+
+### Matching overloads by prefix length
+
+Only the second overload applies when the callback guarantees one positional parameter.
+
+```py
+from typing import Callable, Concatenate, ParamSpec, overload
+
+P = ParamSpec("P")
+
+@overload
+def pick(f: Callable[Concatenate[str, str, P], None]) -> str: ...
+@overload
+def pick(f: Callable[Concatenate[str, P], None]) -> None: ...
+def pick(f):
+    raise NotImplementedError
+
+def check(callback: Callable[Concatenate[str, P], None]) -> None:
+    reveal_type(pick(callback))  # revealed: None
 ```
 
 ### Parameter lists inferred from consumers
@@ -1541,6 +1582,26 @@ def use(shape: Callable[P, None], consumer: Consumer[Callable[[T], None]], value
 def empty() -> None: ...
 def _(consumer: Consumer[Callable[[object], None]]):
     reveal_type(use(empty, consumer, 1))  # revealed: object
+```
+
+### Return context respects a callback's parameter type
+
+The declared result allows `list[object]`, but the callback only accepts `int`.
+
+```py
+from typing import Callable, Concatenate, ParamSpec, Sequence, TypeVar
+
+P = ParamSpec("P")
+T = TypeVar("T")
+U = TypeVar("U")
+
+def f(callback: Callable[Concatenate[T, P], None], x: U) -> tuple[list[T], list[U]]:
+    raise NotImplementedError
+
+def takes_int(x: int) -> None: ...
+
+result: tuple[list[object] | list[int], list[str] | Sequence[int]] = f(takes_int, 0)
+reveal_type(result)  # revealed: tuple[list[int], list[int]]
 ```
 
 ### Repeated parameter lists combine callback constraints
@@ -1956,6 +2017,39 @@ class Factory(Generic[P]):
 Factory.for_protocol(Protocol)  # ok
 ```
 
+### A decorator's unsolved parameter list
+
+The parameter list of `identity` is local to that function. When there is no callback to specialize
+it, ty infers `Unknown` for the result of `return_type_of(identity)`.
+
+```py
+from typing import Callable, ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def identity(f: Callable[P, str]) -> Callable[P, str]:
+    return f
+
+def return_type_of(f: Callable[..., R]) -> R:
+    raise NotImplementedError
+
+reveal_type(return_type_of(identity))  # revealed: Unknown
+```
+
+Since `Word` always denotes `str`, its parameter list has no effect on the result.
+
+```py
+from typing_extensions import TypeAliasType
+
+Word = TypeAliasType("Word", str, type_params=(P,))
+
+def word(f: Callable[P, str]) -> Word[P]:
+    return "word"
+
+reveal_type(return_type_of(word))  # revealed: str
+```
+
 ### Captured and fixed variables in a return type
 
 Capturing a callable's type variable does not permit a second, enclosing variable in its return type
@@ -2226,4 +2320,29 @@ def concrete(a: Box[str], b: Box[int], cond: bool):
     # error: [missing-argument]
     # error: [missing-argument]
     box.invoke(callback, 1)
+```
+
+## Method specialization preserves a callable's parameter list
+
+The callback stored in the owner's type argument can accept different parameters from the callback
+passed to its method.
+
+```py
+from typing import Callable, Generic, ParamSpec, TypeVar
+
+C = TypeVar("C")
+P = ParamSpec("P")
+
+class Box(Generic[C]):
+    @staticmethod
+    def get(f: Callable[P, int]) -> C:
+        def check(other: Box[Callable[P, int]], f: Callable[[int], int]) -> None:
+            callback = other.get(f)
+            # revealed: (**P@get) -> int
+            reveal_type(callback)
+            # error: [missing-argument]
+            # error: [invalid-argument-type]
+            callback(1)
+
+        raise NotImplementedError
 ```

@@ -35,9 +35,9 @@
 //! operations on literal strings/bytes. For normal unions, it's most efficient to just store the
 //! member types in a vector, and do O(n^2) redundancy checks to maintain the union in simplified
 //! form. But literal unions can grow to a size where this becomes a performance problem. For this
-//! reason, we group literal types in `UnionBuilder`. Since every different string literal type
-//! shares exactly the same possible super-types, and none of them are subtypes of each other
-//! (unless exactly the same literal type), we can avoid many unnecessary redundancy checks.
+//! reason, we group literal types in `UnionBuilder`. For example, every string literal is a
+//! subtype of `str`, so checking one member suffices to remove the entire group. When a type can
+//! distinguish individual literals, we check each member of the group.
 
 use std::convert::Infallible;
 use std::hint::cold_path;
@@ -416,6 +416,12 @@ impl<'db> Type<'db> {
             //     Y = 1
             // ```
             (Type::AlwaysFalsy | Type::AlwaysTruthy, _) => true,
+            // A protocol can distinguish enum members by `name`, integers by `numerator`,
+            // and strings and bytes by `__len__`.
+            (Type::ProtocolInstance(_), _) => true,
+            // A recursive type or an alias nested in an intersection can hide a protocol
+            // or a literal of this kind.
+            (ty, _) if ty.is_alias_like() => true,
             (Type::LiteralValue(literal), _) => match (literal.kind(), kind) {
                 (LiteralValueTypeKind::String(_), LiteralKind::String) => true,
                 (LiteralValueTypeKind::Bytes(_), LiteralKind::Bytes) => true,
@@ -481,6 +487,7 @@ impl<'db> UnionElement<'db> {
         env: &ProgramEnvironment<'db>,
         other_type: Type<'db>,
         cycle_recovery: bool,
+        unpack_aliases: bool,
     ) -> ReduceResult<'db> {
         if let UnionElement::Type(existing) = self {
             return ReduceResult::Type(*existing);
@@ -508,6 +515,12 @@ impl<'db> UnionElement<'db> {
                 ),
                 UnionElement::Type(_) => unreachable!("ordinary types are handled before recovery"),
             };
+        }
+
+        // Keep preserved aliases alongside literal groups until we expand the union.
+        // Even negating a single alias can be costly if it stands for thousands of literals.
+        if !unpack_aliases && other_type.is_alias_like() {
+            return ReduceResult::KeepIf(true);
         }
 
         let mut other_type_negated_cache = None;
@@ -799,6 +812,10 @@ impl<'db> UnionBuilder<'db> {
     fn add_in_place_impl(&mut self, ty: Type<'db>, seen_aliases: &mut Vec<Type<'db>>) {
         let db = self.db;
         let cycle_recovery = self.cycle_recovery;
+        // When preserving aliases in an annotation, defer comparisons with their bodies
+        // until the union is expanded. The expanded body may subsume a whole literal group.
+        let can_compare_with_literals =
+            |ty: Type<'db>| !cycle_recovery && (self.unpack_aliases || !ty.is_alias_like());
         let should_widen = |literals, recursively_defined: RecursivelyDefined| {
             if recursively_defined.is_yes() && cycle_recovery {
                 literals >= MAX_RECURSIVE_UNION_LITERALS
@@ -873,7 +890,9 @@ impl<'db> UnionBuilder<'db> {
                                 {
                                     return;
                                 }
-                                UnionElement::Type(existing) if !cycle_recovery => {
+                                UnionElement::Type(existing)
+                                    if can_compare_with_literals(*existing) =>
+                                {
                                     // e.g. `existing` could be `Literal[""] & Any`,
                                     // and `ty` could be `Literal[""]`
                                     if ty.is_redundant_with(db, &self.env, *existing) {
@@ -928,7 +947,9 @@ impl<'db> UnionBuilder<'db> {
                                 {
                                     return;
                                 }
-                                UnionElement::Type(existing) if !cycle_recovery => {
+                                UnionElement::Type(existing)
+                                    if can_compare_with_literals(*existing) =>
+                                {
                                     if ty.is_redundant_with(db, &self.env, *existing) {
                                         return;
                                     }
@@ -985,7 +1006,9 @@ impl<'db> UnionBuilder<'db> {
                                 {
                                     return;
                                 }
-                                UnionElement::Type(existing) if !cycle_recovery => {
+                                UnionElement::Type(existing)
+                                    if can_compare_with_literals(*existing) =>
+                                {
                                     if ty.is_redundant_with(db, &self.env, *existing) {
                                         return;
                                     }
@@ -1062,7 +1085,9 @@ impl<'db> UnionBuilder<'db> {
                                 {
                                     return;
                                 }
-                                UnionElement::Type(existing) if !cycle_recovery => {
+                                UnionElement::Type(existing)
+                                    if can_compare_with_literals(*existing) =>
+                                {
                                     if ty.is_redundant_with(db, &self.env, *existing) {
                                         return;
                                     }
@@ -1121,6 +1146,55 @@ impl<'db> UnionBuilder<'db> {
         }
     }
 
+    /// Return whether two distinct types can skip union redundancy and complement checks.
+    ///
+    /// A `true` result guarantees that neither type subsumes the other under union redundancy,
+    /// and that their union cannot cover `object`. The caller must handle equal types first.
+    /// A `false` result leaves the decision to the general relation checks.
+    ///
+    /// Distinct class and module literals identify different objects. Methods bound to distinct
+    /// singleton literals also remain distinct because `__self__` exposes their captured receiver:
+    ///
+    /// ```python
+    /// from typing import Literal, LiteralString, reveal_type
+    ///
+    /// def select(s: Literal["a", "b"], other: LiteralString, flag: bool):
+    ///     method = s.isalpha
+    ///     reveal_type(method.__self__)  # Literal["a", "b"]
+    ///
+    ///     mixed = method if flag else other.isalpha
+    ///     reveal_type(mixed.__self__)  # LiteralString
+    /// ```
+    ///
+    /// `LiteralString` is excluded because it is not a singleton: its bound method can subsume
+    /// methods bound to particular strings, as in `mixed` above.
+    ///
+    /// Dynamic types remain alongside non-`object` nominal instances: assignability to `Any`
+    /// does not make a union element redundant. `object` is excluded because it subsumes every
+    /// other type.
+    fn is_incomparable_for_union(db: &'db dyn Db, left: Type<'db>, right: Type<'db>) -> bool {
+        match (left, right) {
+            (Type::ClassLiteral(_), Type::ClassLiteral(_))
+            | (Type::ModuleLiteral(_), Type::ModuleLiteral(_)) => true,
+            (Type::Dynamic(_), Type::NominalInstance(instance))
+            | (Type::NominalInstance(instance), Type::Dynamic(_))
+                if !instance.is_object() =>
+            {
+                true
+            }
+            (Type::BoundMethod(left), Type::BoundMethod(right))
+                if let (Type::LiteralValue(left), Type::LiteralValue(right)) =
+                    (left.self_instance(db), right.self_instance(db))
+                    && !left.is_literal_string()
+                    && !right.is_literal_string()
+                    && left.kind() != right.kind() =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn push_type(&mut self, ty: Type<'db>, seen_aliases: &mut Vec<Type<'db>>) {
         let db = self.db;
         let mut ty = ty;
@@ -1141,7 +1215,13 @@ impl<'db> UnionBuilder<'db> {
         let mut to_remove = SmallVec::<[usize; 2]>::new();
 
         for (i, element) in self.elements.iter_mut().enumerate() {
-            let element_type = match element.try_reduce(db, &self.env, ty, self.cycle_recovery) {
+            let element_type = match element.try_reduce(
+                db,
+                &self.env,
+                ty,
+                self.cycle_recovery,
+                self.unpack_aliases,
+            ) {
                 ReduceResult::KeepIf(keep) => {
                     if !keep {
                         to_remove.push(i);
@@ -1160,6 +1240,10 @@ impl<'db> UnionBuilder<'db> {
 
             if ty == element_type {
                 return;
+            }
+
+            if Self::is_incomparable_for_union(db, ty, element_type) {
+                continue;
             }
 
             // `object` already contains every possible union element.
@@ -1228,6 +1312,13 @@ impl<'db> UnionBuilder<'db> {
             }
 
             if should_simplify_full && !element_type.is_alias_like() {
+                if let (Type::NominalInstance(left), Type::NominalInstance(right)) =
+                    (ty, element_type)
+                    && left.has_unrelated_class(db, right)
+                {
+                    continue;
+                }
+
                 // Preserving aliases also excludes comparisons that expand aliases nested in
                 // type arguments. A recursive alias can rebuild this union during specialization.
                 if !self.unpack_aliases

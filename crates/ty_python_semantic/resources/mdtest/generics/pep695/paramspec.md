@@ -510,7 +510,7 @@ as a wrapper around a callback that accepts no arguments.
 
 ```py
 def erase_parameters[**P](job: Job[P]) -> Job[[]]:
-    return job  # error: [invalid-return-type]
+    return job  # error: [invalid-explicit-return]
 ```
 
 The same restriction applies in the other direction when a class consumes callbacks. A consumer of
@@ -521,7 +521,7 @@ class CallbackConsumer[**P]:
     def consume(self, callback: Callable[P, None]) -> None: ...
 
 def broaden_parameters[**P](consumer: CallbackConsumer[[]]) -> CallbackConsumer[P]:
-    return consumer  # error: [invalid-return-type]
+    return consumer  # error: [invalid-explicit-return]
 ```
 
 ## `ParamSpec` cannot specialize a `TypeVar`, and vice versa
@@ -764,6 +764,22 @@ def use[**P, T](shape: Callable[P, None], consumer: Consumer[Callable[[T], None]
 def empty() -> None: ...
 def _(consumer: Consumer[Callable[[object], None]]):
     reveal_type(use(empty, consumer, 1))  # revealed: object
+```
+
+### Return context respects a callback's parameter type
+
+The declared result allows `list[object]`, but the callback only accepts `int`.
+
+```py
+from typing import Callable, Concatenate, Sequence
+
+def f[T, U, **P](callback: Callable[Concatenate[T, P], None], x: U) -> tuple[list[T], list[U]]:
+    raise NotImplementedError
+
+def takes_int(x: int) -> None: ...
+
+result: tuple[list[object] | list[int], list[str] | Sequence[int]] = f(takes_int, 0)
+reveal_type(result)  # revealed: tuple[list[int], list[int]]
 ```
 
 ### Parameter lists inferred from callback collections
@@ -1391,6 +1407,34 @@ class Factory[P: Protocol]:
         raise NotImplementedError
 
 Factory.for_protocol(Protocol)  # ok
+```
+
+### A decorator's unsolved parameter list
+
+The parameter list of `identity` is local to that function. When there is no callback to specialize
+it, ty infers `Unknown` for the result of `return_type_of(identity)`.
+
+```py
+from typing import Callable
+
+def identity[**P](f: Callable[P, str]) -> Callable[P, str]:
+    return f
+
+def return_type_of[R](f: Callable[..., R]) -> R:
+    raise NotImplementedError
+
+reveal_type(return_type_of(identity))  # revealed: Unknown
+```
+
+Since `Word` always denotes `str`, its parameter list has no effect on the result.
+
+```py
+type Word[**P] = str
+
+def word[**P](f: Callable[P, str]) -> Word[P]:
+    return "word"
+
+reveal_type(return_type_of(word))  # revealed: str
 ```
 
 ### Captured and fixed variables in a return type
@@ -2125,7 +2169,7 @@ class Base:
 
 class Invalid(Base):
     @override
-    def __new__(cls, value: str) -> Self:  # error: [invalid-method-override]
+    def __new__(cls, value: str) -> Self:  # error: [incompatible-method-override]
         raise NotImplementedError
 ```
 
@@ -2710,7 +2754,7 @@ class Container[**P]:
         return f
 
     def try_assign[**Q](self, f: Callable[Q, None]) -> Callable[Q, None]:
-        # error: [invalid-return-type] "Return type does not match returned value: expected `(**Q@try_assign) -> None`, found `(**P@Container) -> None`"
+        # error: [invalid-explicit-return] "Return type does not match returned value: expected `(**Q@try_assign) -> None`, found `(**P@Container) -> None`"
         # error: [invalid-argument-type] "Argument to bound method `Container.method` is incorrect: Expected `(**P@Container) -> None`, found `(**Q@try_assign) -> None`"
         return self.method(f)
 ```
@@ -3118,4 +3162,26 @@ def concrete(a: Box[str], b: Box[int], cond: bool):
     # error: [missing-argument]
     # error: [missing-argument]
     box.invoke(callback, 1)
+```
+
+## Method specialization preserves a callable's parameter list
+
+The callback stored in the owner's type argument can accept different parameters from the callback
+passed to its method.
+
+```py
+from collections.abc import Callable
+
+class Box[C]:
+    @staticmethod
+    def get[**P](f: Callable[P, int]) -> C:
+        def check(other: Box[Callable[P, int]], f: Callable[[int], int]) -> None:
+            callback = other.get(f)
+            # revealed: (**P@get) -> int
+            reveal_type(callback)
+            # error: [missing-argument]
+            # error: [invalid-argument-type]
+            callback(1)
+
+        raise NotImplementedError
 ```

@@ -151,6 +151,12 @@ impl ProjectDatabase {
         project.freeze_open_files(self);
     }
 
+    /// Skips dropping cached Salsa data when the CLI is about to exit. The remaining fields
+    /// drop normally so the uv worker pool receives its shutdown signal.
+    pub fn forget_storage_on_exit(self) {
+        std::mem::forget(self.storage);
+    }
+
     fn new<S, Strategy: MisconfigurationStrategy>(
         project_metadata: ProjectMetadata,
         system: S,
@@ -220,8 +226,8 @@ impl ProjectDatabase {
 
     /// Checks the files in the project and its dependencies as per the project's check mode.
     ///
-    /// Uses current settings and environments without starting or waiting for uv. Callers that
-    /// require synchronized environments must request synchronization and apply its results first.
+    /// Uses current settings and environments without starting or waiting for uv. Returns no
+    /// diagnostics for a script while its initial environment synchronization is pending.
     ///
     /// Use [`set_check_mode`] to update the check mode.
     ///
@@ -244,6 +250,7 @@ impl ProjectDatabase {
     }
 
     /// Checks `file` using its current settings and available environment.
+    /// Reports no diagnostics for a script while its first uv sync is pending.
     ///
     /// Uses the same environment synchronization behavior as [`check`](Self::check).
     #[tracing::instrument(level = "debug", skip(self))]

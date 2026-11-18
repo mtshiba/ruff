@@ -1,6 +1,7 @@
 use crate::ProgramEnvironment;
 use itertools::Either;
 use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
 use std::convert::Infallible;
 
@@ -65,7 +66,9 @@ impl<'db> OrderedUnionInput<'db> {
                 .build()
         }
 
-        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _| None, heap_size=ruff_memory_usage::heap_size)]
+        // A provisional redundancy check can drop a union member on one iteration and retain it
+        // on the next. Build the union in the caller when normalization participates in a cycle.
+        #[salsa::tracked(returns(copy), cycle_result=|_, _, _| None, heap_size=ruff_memory_usage::heap_size)]
         fn normalized<'db>(db: &'db dyn Db, input: OrderedUnionInput<'db>) -> Option<Type<'db>> {
             Some(build(db, input))
         }
@@ -159,6 +162,24 @@ impl<'db> UnionType<'db> {
         union_from_two_elements(db, TypePair::new(db, env.program(db), a, b))
     }
 
+    /// Normalize a pair without unpacking aliases. Repeated annotations often share the
+    /// same operand types even when their enclosing function signatures differ.
+    pub(crate) fn from_two_elements_leave_aliases(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        left: Type<'db>,
+        right: Type<'db>,
+    ) -> Type<'db> {
+        OrderedUnionInput::new(
+            db,
+            env.program(db),
+            [left, right].as_slice(),
+            false,
+            RecursivelyDefined::No,
+        )
+        .normalize(db)
+    }
+
     /// Create a union from a list of elements without unpacking type aliases.
     pub(crate) fn from_elements_leave_aliases<I, T>(
         db: &'db dyn Db,
@@ -186,6 +207,24 @@ impl<'db> UnionType<'db> {
             builder.add_in_place(element.into());
         }
         builder.build()
+    }
+
+    /// Returns `true` if the union contains exactly the provided type as a member.
+    ///
+    /// Note that this method constructs and Salsa-memoizes an index for large unions to avoid
+    /// repeated linear scans.
+    pub(super) fn contains_member(self, db: &'db dyn Db, ty: Type<'db>) -> bool {
+        #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+        fn element_set<'db>(db: &'db dyn Db, union: UnionType<'db>) -> FxHashSet<Type<'db>> {
+            union.elements(db).iter().copied().collect()
+        }
+
+        let elements = self.elements(db);
+        if elements.len() >= WIDE_UNION {
+            element_set(db, self).contains(&ty)
+        } else {
+            elements.contains(&ty)
+        }
     }
 
     /// Returns `true` if any direct element of this union is a type alias.
@@ -1288,6 +1327,21 @@ impl<'db> IntersectionType<'db> {
             builder.add_negative_in_place(*ty);
         }
         builder.build()
+    }
+
+    /// Filter-map the positive members and intersect the results. Return `None` if no members
+    /// map successfully or the intersection exceeds the expansion budget.
+    pub(crate) fn bounded_filter_map_positive(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        transform_fn: impl FnMut(Type<'db>) -> Option<Type<'db>>,
+    ) -> Option<Type<'db>> {
+        let mapped: SmallVec<[_; 1]> = self.iter_positive(db).filter_map(transform_fn).collect();
+        if mapped.is_empty() {
+            return None;
+        }
+        Self::bounded_from_elements(db, env, mapped.iter().copied())
     }
 
     /// Compute the `__class__` type for class-backed protocols and `TypedDict` instances,

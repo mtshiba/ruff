@@ -125,45 +125,48 @@ fn resolve_default_files(files: Vec<PathBuf>, is_stdin: bool) -> Vec<PathBuf> {
     }
 }
 
-pub fn run(
-    Args {
-        command,
-        global_options,
-    }: Args,
-) -> Result<ExitStatus> {
+pub fn run(args: Args) -> Result<ExitStatus> {
     // Set color before so all outputs are properly colored
-    let color = TerminalColor::resolve(global_options.color);
+    let color = TerminalColor::resolve(args.global_options.color);
     colored::control::set_override(color.should_colorize(&io::stdout()));
 
     {
         ruff_db::set_program_version(crate::version::version().to_string()).unwrap();
         let default_panic_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            #[expect(clippy::print_stderr)]
-            {
-                eprintln!(
-                    r#"
+            writeln!(
+                io::stderr().lock(),
+                r#"
 {}{} {} If you could open an issue at:
 
     https://github.com/astral-sh/ruff/issues/new?title=%5BPanic%5D
 
 ...quoting the executed command, along with the relevant file contents and `pyproject.toml` settings, we'd be very appreciative!
 "#,
-                    "error".red().bold(),
-                    ":".bold(),
-                    "Ruff crashed.".bold(),
-                );
-            }
+                "error".red().bold(),
+                ":".bold(),
+                "Ruff crashed.".bold(),
+            ).ok();
             default_panic_hook(info);
         }));
     }
 
     // Don't set up logging for the server command, as it has its own logging setup
     // and setting the global logger can only be done once.
-    if !matches!(command, Command::Server { .. }) {
-        set_up_logging(global_options.log_level())?;
+    if !matches!(args.command, Command::Server { .. }) {
+        set_up_logging(args.global_options.log_level())?;
     }
 
+    run_command(args)
+}
+
+/// Run a CLI command without reinstalling the process-wide logger and panic hook.
+pub fn run_command(
+    Args {
+        command,
+        global_options,
+    }: Args,
+) -> Result<ExitStatus> {
     match command {
         Command::Version { output_format } => {
             commands::version::version(output_format)?;
@@ -477,10 +480,9 @@ pub fn check(args: CheckCommand, global_options: GlobalConfigArgs) -> Result<Exi
             .unwrap_or(Severity::Info);
         if max_severity.is_fatal() {
             // When a panic/fatal error is reported, prompt the user to open an issue on github.
-            // Diagnostics with severity `fatal` will be sorted to the bottom, and printing the
-            // message here instead of attaching it to the diagnostic ensures that we only print
-            // it once instead of repeating it for each diagnostic. Prints to stderr to prevent
-            // the message from being captured by tools parsing the normal output.
+            // Printing the message here instead of attaching it to the diagnostic ensures that we
+            // only print it once instead of repeating it for each diagnostic. Prints to stderr to
+            // prevent the message from being captured by tools parsing the normal output.
             let message = "Panic during linting indicates a bug in Ruff. If you could open an issue at:
 
 https://github.com/astral-sh/ruff/issues/new?title=%5BLinter%20panic%5D

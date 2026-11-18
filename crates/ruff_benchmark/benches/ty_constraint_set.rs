@@ -1,10 +1,9 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
+use ruff_benchmark::checkout::get_project_cache_dir;
 use ruff_benchmark::criterion;
-use ruff_benchmark::real_world_projects::{
-    TY_ECOSYSTEM_PIN, get_project_cache_dir, install_dependencies_to_cache,
-};
+use ruff_benchmark::real_world_projects::{TY_ECOSYSTEM_PIN, install_dependencies_to_cache};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use itertools::Itertools;
@@ -226,6 +225,85 @@ fn benchmark_factored_upper_bounds(criterion: &mut Criterion) {
                 let result = db.check();
                 assert_eq!(result.len(), 0);
             },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+/// Bokeh's constructor combines a large literal alias with `str` in its receiver (ty#5046).
+fn benchmark_constructor_literal_alias(criterion: &mut Criterion) {
+    setup_rayon();
+
+    for (name, receiver_arg, size) in [
+        ("union_28", "A | B", 28),
+        ("alias_12", "Alternatives[A, B]", 12),
+    ] {
+        let markers = (0..size).map(|i| format!("'marker{i}'")).join(", ");
+        let code = format!(
+            r#"
+            from typing import Literal, assert_type
+
+            type Alternatives[A, B] = A | B
+            type Marker = Literal[{markers}]
+
+            class Property[T]:
+                value: T
+
+            class Either[T](Property[T]):
+                def __init__[A, B](
+                    self: "Either[{receiver_arg}]", first: type[Property[A]], second: type[Property[B]]
+                ) -> None: ...
+
+            assert_type(Either(Property[Marker], Property[str]), Either[str])
+            "#
+        );
+        criterion.bench_function(
+            &format!("ty_micro[constructor_literal_alias/{name}]"),
+            |b| {
+                b.iter_batched_ref(
+                    || setup_micro_case(&code),
+                    |Case { db }| assert_eq!(db.check().len(), 0),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+}
+
+/// Rejecting `T <= int` contradicts `T <= bool`. Trying to disprove the expression on that
+/// branch can exhaust every combination of unrelated choices for `V`.
+fn benchmark_counterexample_behind_implied_bound(criterion: &mut Criterion) {
+    setup_rayon();
+    let choices = (0..22)
+        .map(|i| format!(
+            "(ConstraintSet.lower_bound(Literal[{}], V) | ConstraintSet.lower_bound(Literal[{}], V))",
+            2 * i, 2 * i + 1
+        ))
+        .join(" & ");
+    // Falsifying a long disjunction requires one continuous path through every bound.
+    let alternatives = (1000..1033)
+        .map(|i| format!("ConstraintSet.lower_bound(Literal[{i}], U)"))
+        .join(" | ");
+    let code = format!(
+        "
+        from typing import Literal
+        from ty_extensions import static_assert
+        from ty_extensions._internal import ConstraintSet
+
+        def check[T, U, V]():
+            t_bool = ConstraintSet.upper_bound(T, bool)
+            t_int = ConstraintSet.upper_bound(T, int)
+            u_int = ConstraintSet.upper_bound(U, int)
+            choices = {choices}
+            static_assert(not (~(t_bool & choices) | (u_int & t_int)))
+            alternatives = {alternatives}
+            static_assert(not (((t_int | ~choices) & t_bool) | alternatives))
+        "
+    );
+    criterion.bench_function("ty_micro[counterexample_behind_implied_bound]", |b| {
+        b.iter_batched_ref(
+            || setup_micro_case(&code),
+            |Case { db }| assert_eq!(db.check().len(), 0),
             BatchSize::SmallInput,
         );
     });
@@ -827,6 +905,8 @@ criterion_group!(
     benchmark_constraint_quantification,
     benchmark_bottom_and_top_signature_comparisons,
     benchmark_factored_upper_bounds,
+    benchmark_constructor_literal_alias,
+    benchmark_counterexample_behind_implied_bound,
     benchmark_many_upper_bound_callbacks,
     benchmark_incompatible_lower_bound_alternatives,
     benchmark_long_valid_bound_prefix,

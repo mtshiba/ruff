@@ -216,8 +216,7 @@ impl GlobalOptions {
     pub(crate) fn into_settings(self) -> GlobalSettings {
         let experimental = self
             .experimental
-            .map(Experimental::into_settings)
-            .unwrap_or_default();
+            .map_or_default(Experimental::into_settings);
 
         GlobalSettings {
             diagnostic_mode: self.diagnostic_mode.unwrap_or_default(),
@@ -287,6 +286,7 @@ impl WorkspaceOptions {
                 match TyOptions::deserialize_with(
                     ValueSource::Editor,
                     serde::de::value::MapDeserializer::new(map.0.into_iter()),
+                    ty_python_semantic::default_lint_registry(),
                 ) {
                     Ok(options) => Some(options),
                     Err(error) => {
@@ -345,12 +345,10 @@ impl WorkspaceOptions {
             disable_language_services: self.disable_language_services.unwrap_or_default(),
             inlay_hints: self
                 .inlay_hints
-                .map(InlayHintOptions::into_settings)
-                .unwrap_or_default(),
+                .map_or_default(InlayHintOptions::into_settings),
             completions: self
                 .completions
-                .map(CompletionOptions::into_settings)
-                .unwrap_or_default(),
+                .map_or_default(CompletionOptions::into_settings),
             configuration_file,
             override_options,
             fallback_options,

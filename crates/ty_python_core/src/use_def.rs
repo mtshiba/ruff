@@ -169,7 +169,7 @@
 //! this in the future for some closures, but for now this is where we start.)
 //!
 //! The data structure we build to answer these questions is the `UseDefMap`. It has a
-//! `bindings_by_use` vector of [`InternedBindingsId`] indexed by [`ScopedUseId`]
+//! `bindings_by_use` table of reaching bindings indexed by [`ScopedUseId`]
 //! (plus an interned bindings table), a
 //! `definitions_by_definition` map of [`DefinitionsAtDefinition`], and `symbol_states` and
 //! `member_states` vectors indexed by [`ScopedSymbolId`]/[`ScopedMemberId`]. The values are (in
@@ -261,7 +261,7 @@ use thin_vec::ThinVec;
 
 use crate::ast_ids::ScopedUseId;
 use crate::definition::{Definition, DefinitionCategory, DefinitionState};
-use crate::frozen::FrozenMap;
+use crate::frozen::{FrozenMap, PackedIds};
 use crate::member::ScopedMemberId;
 use crate::narrowing_constraints::{
     ConstraintKey, NarrowingConstraints, NarrowingConstraintsBuilder, ScopedNarrowingConstraint,
@@ -685,7 +685,7 @@ impl PredicateNarrowingTargets {
 #[derive(Debug, PartialEq, Eq, get_size2::GetSize)]
 struct UseDefMapExtra {
     /// [`Bindings`] reaching a [`ScopedUseId`].
-    bindings_by_use: FrozenIndexVec<ScopedUseId, InternedBindingsId>,
+    bindings_by_use: PackedIds<InternedBindingsId>,
 
     /// Bindings before an `if` chain, for uses in its final `elif` condition.
     if_chain_start_by_use: FrozenMap<ScopedUseId, InternedBindingsId>,
@@ -874,10 +874,105 @@ pub struct UseDefMap<'db> {
 pub(super) struct UseDefMapInterner {
     bindings: FxHashSet<Arc<RetainedBindings>>,
     declarations: FxHashSet<Arc<RetainedDeclarations>>,
+    stub_layouts: FxHashMap<SmallVec<[bool; 8]>, StubParameterLayout>,
+}
+
+/// Binding and declaration tables for a function whose body contains only `pass` or `...`.
+/// Each distinct parameter binds its symbol once. An annotated parameter also declares it.
+/// These functions share a layout because the tables refer to definitions by scope-local index.
+///
+/// ```python
+/// def first(x: int, y): ...
+/// def second(a: str, b): pass
+/// ```
+struct StubParameterLayout {
+    bindings: Arc<RetainedBindings>,
+    declarations: Arc<RetainedDeclarations>,
+    symbols: FrozenIndexVec<ScopedSymbolId, RetainedPlaceStates>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(super) struct StubParameter<'db> {
+    pub(super) symbol: ScopedSymbolId,
+    pub(super) definition: Definition<'db>,
+    pub(super) annotated: bool,
+}
+
+impl StubParameterLayout {
+    /// Returns the annotation pattern in definition order. A repeated symbol shadows an
+    /// earlier parameter, so the annotation pattern alone cannot describe that scope.
+    fn key(parameters: &[StubParameter<'_>]) -> Option<SmallVec<[bool; 8]>> {
+        let mut key = SmallVec::with_capacity(parameters.len());
+        for (index, parameter) in parameters.iter().enumerate() {
+            if parameter.symbol.index() != index {
+                return None;
+            }
+            key.push(parameter.annotated);
+        }
+        Some(key)
+    }
+
+    /// Pairs the shared tables with the definitions their indices refer to in this function.
+    /// The function also keeps its own reachability information for source ranges.
+    fn instantiate<'db>(
+        &self,
+        parameters: Vec<StubParameter<'db>>,
+        builder: &mut UseDefMapBuilder<'db>,
+    ) -> UseDefMap<'db> {
+        UseDefMap {
+            all_definitions: RetainedDefinitions {
+                states: parameters
+                    .into_iter()
+                    .map(|p| DefinitionEntry::Unused(p.definition))
+                    .collect(),
+            },
+            constraint_tables: None,
+            interned_bindings: Arc::clone(&self.bindings),
+            interned_declarations: Arc::clone(&self.declarations),
+            range_reachability: builder.finish_ranges(),
+            definitions_by_definition: FrozenMap::default(),
+            symbol_states: self.symbols.clone(),
+            extra: None,
+            end_of_scope_reachability: builder.reachability,
+        }
+    }
 }
 
 impl UseDefMapInterner {
-    pub(super) fn intern<'db>(&mut self, mut map: UseDefMap<'db>) -> Arc<UseDefMap<'db>> {
+    /// Reuses the layout of an earlier stub in this file when the same parameter positions
+    /// have annotations. The first occurrence and signatures with duplicate names build
+    /// their binding and declaration tables from the individual parameters.
+    pub(super) fn finish<'db>(
+        &mut self,
+        mut builder: Box<UseDefMapBuilder<'db>>,
+    ) -> Arc<UseDefMap<'db>> {
+        let Some(parameters) = builder.stub_parameters.take() else {
+            return self.intern(builder.finish());
+        };
+        let shape = StubParameterLayout::key(&parameters);
+        if let Some(layout) = shape
+            .as_ref()
+            .and_then(|shape| self.stub_layouts.get(shape))
+        {
+            return Arc::new(layout.instantiate(parameters, &mut builder));
+        }
+
+        builder.record_stub_parameters(parameters);
+        let map = self.intern(builder.finish());
+        if let Some(shape) = shape {
+            self.stub_layouts.insert(
+                shape,
+                StubParameterLayout {
+                    bindings: Arc::clone(&map.interned_bindings),
+                    declarations: Arc::clone(&map.interned_declarations),
+                    symbols: map.symbol_states.clone(),
+                },
+            );
+        }
+        map
+    }
+
+    fn intern<'db>(&mut self, mut map: UseDefMap<'db>) -> Arc<UseDefMap<'db>> {
         map.interned_bindings = Self::intern_table(&mut self.bindings, map.interned_bindings);
         map.interned_declarations =
             Self::intern_table(&mut self.declarations, map.interned_declarations);
@@ -996,7 +1091,7 @@ impl<'db> UseDefMap<'db> {
     }
 
     pub fn bindings_at_use(&self, use_id: ScopedUseId) -> BindingWithConstraintsIterator<'_, 'db> {
-        let bindings_id = self.extra().bindings_by_use[use_id];
+        let bindings_id = self.extra().bindings_by_use.get(use_id.index());
         self.bindings_iterator(
             &self.interned_bindings[bindings_id],
             BoundnessAnalysis::BasedOnUnboundVisibility,
@@ -1956,6 +2051,7 @@ impl PendingReachability {
         // Consecutive places often share their last applied reachability node, so their
         // merged path constraint can be reused even when they have distinct place states.
         let mut last_merged_reachability = None;
+        let mut last_singleton_merge = None;
         let mut branch_states = branch_states.into_iter();
         for current in current_states {
             let Some(mut branch_state) = branch_states.next() else {
@@ -2023,6 +2119,30 @@ impl PendingReachability {
                 continue;
             }
 
+            // Distinct definitions can carry the same path constraints. When both branches
+            // retain the same binding and declaration for a place, only these constraints
+            // change. Reuse an earlier eager merge with identical inputs and pending paths.
+            let inputs = current
+                .state
+                .singleton_merge_inputs(&branch_state.state)
+                .map(|constraints| {
+                    (
+                        current.reachability,
+                        current.narrowing,
+                        branch_state.reachability,
+                        branch_state.narrowing,
+                        constraints,
+                    )
+                });
+            if let (Some(inputs), Some((previous, merged))) = (inputs, last_singleton_merge)
+                && inputs == previous
+            {
+                Rc::make_mut(&mut current.state).set_singleton_constraints(merged);
+                current.reachability = self.current;
+                current.narrowing = self.current;
+                continue;
+            }
+
             self.materialize(
                 &mut branch_state,
                 branch,
@@ -2036,11 +2156,20 @@ impl PendingReachability {
                 narrowing_constraints,
                 reachability_constraints,
             );
-            current.merge(
-                branch_state,
-                narrowing_constraints,
-                reachability_constraints,
-            );
+            if let Some(inputs) = inputs {
+                let merged = current.merge_singleton(
+                    &branch_state,
+                    narrowing_constraints,
+                    reachability_constraints,
+                );
+                last_singleton_merge = Some((inputs, merged));
+            } else {
+                current.merge(
+                    branch_state,
+                    narrowing_constraints,
+                    reachability_constraints,
+                );
+            }
         }
     }
 }
@@ -2054,6 +2183,7 @@ pub(super) struct SingleSymbolSnapshot {
 
 #[derive(Debug)]
 pub(super) struct UseDefMapBuilder<'db> {
+    pub(super) stub_parameters: Option<Vec<StubParameter<'db>>>,
     /// Append-only history of declarations and bindings, including their usage state.
     all_definitions: IndexVec<ScopedDefinitionId, DefinitionEntry<'db>>,
 
@@ -2069,7 +2199,7 @@ pub(super) struct UseDefMapBuilder<'db> {
     /// Builder of narrowing constraints.
     pub(super) narrowing_constraints: NarrowingConstraintsBuilder,
 
-    /// Live bindings at each so-far-recorded use.
+    /// Live bindings at each use.
     bindings_by_use: IndexVec<ScopedUseId, Bindings>,
 
     /// Live bindings associated with each so-far-recorded use.
@@ -2140,6 +2270,7 @@ pub(super) struct UseDefMapBuilder<'db> {
 impl<'db> UseDefMapBuilder<'db> {
     pub(super) fn new(scope_kind: ScopeKind) -> Self {
         Self {
+            stub_parameters: None,
             all_definitions: IndexVec::from_iter([DefinitionEntry::Undefined]),
             predicates: PredicatesBuilder::default(),
             predicate_narrowing_targets: Vec::new(),
@@ -2774,7 +2905,9 @@ impl<'db> UseDefMapBuilder<'db> {
         );
     }
 
-    pub(super) fn record_use(&mut self, place: ScopedPlaceId, use_id: ScopedUseId) {
+    /// Appends the bindings for a source use and returns its scope-local ordinal.
+    pub(super) fn record_use(&mut self, place: ScopedPlaceId) -> ScopedUseId {
+        let use_id = self.bindings_by_use.next_index();
         if let Some(snapshot) = &mut self.if_chain_start {
             let state = match place {
                 ScopedPlaceId::Symbol(symbol) => snapshot.symbol_states.get_mut(symbol),
@@ -2806,7 +2939,7 @@ impl<'db> UseDefMapBuilder<'db> {
         );
         let bindings = place_state.bindings().clone();
 
-        self.record_use_bindings(bindings, use_id);
+        self.record_use_bindings(bindings)
     }
 
     pub(super) fn set_if_chain_start(&mut self, snapshot: Option<FlowSnapshot>) {
@@ -2816,8 +2949,8 @@ impl<'db> UseDefMapBuilder<'db> {
     pub(super) fn record_multi_use(
         &mut self,
         places: impl Iterator<Item = ScopedPlaceId>,
-        use_id: ScopedUseId,
-    ) {
+    ) -> ScopedUseId {
+        let use_id = self.bindings_by_use.next_index();
         let pending = self.pending_reachability.current;
         for place in places {
             let place_state =
@@ -2839,17 +2972,16 @@ impl<'db> UseDefMapBuilder<'db> {
         }
 
         // Record a placeholder use of the parent expression to preserve the indices of `bindings_by_use`.
-        self.record_use_bindings(Bindings::default(), use_id);
+        self.record_use_bindings(Bindings::default())
     }
 
-    fn record_use_bindings(&mut self, bindings: Bindings, use_id: ScopedUseId) {
+    fn record_use_bindings(&mut self, bindings: Bindings) -> ScopedUseId {
         let binding_definition_ids = bindings.iter().map(LiveBinding::binding);
         self.mark_definition_ids_used(binding_definition_ids);
 
         // We have a use of a place; clone the current bindings for that place, and record them
         // as the live bindings for this use.
-        let new_use = self.bindings_by_use.push(bindings);
-        debug_assert_eq!(use_id, new_use);
+        self.bindings_by_use.push(bindings)
     }
 
     pub(super) fn symbol_binding_definition_ids(
@@ -3038,6 +3170,18 @@ impl<'db> UseDefMapBuilder<'db> {
         }
     }
 
+    /// Get the current binding IDs for a place without materializing pending constraints.
+    pub(super) fn current_binding_ids(
+        &self,
+        place: ScopedPlaceId,
+    ) -> impl Iterator<Item = ScopedDefinitionId> + '_ {
+        let pending = match place {
+            ScopedPlaceId::Symbol(symbol) => &self.symbol_states[symbol],
+            ScopedPlaceId::Member(member) => &self.member_states[member],
+        };
+        pending.state.bindings().iter().map(LiveBinding::binding)
+    }
+
     /// Get the current live bindings for a place.
     pub(super) fn current_bindings(
         &mut self,
@@ -3142,7 +3286,47 @@ impl<'db> UseDefMapBuilder<'db> {
             .add_or_constraint(self.checkpoint_flow, snapshot.checkpoint_flow);
     }
 
+    /// Records deferred stub parameters in definition order so duplicate names retain
+    /// their earlier bindings and declarations during construction.
+    fn record_stub_parameters(&mut self, parameters: Vec<StubParameter<'db>>) {
+        for StubParameter {
+            symbol,
+            definition,
+            annotated,
+        } in parameters
+        {
+            let place = symbol.into();
+            if symbol == self.symbol_states.next_index() {
+                self.add_place(place);
+            }
+            if annotated {
+                self.record_combined_definition(
+                    place,
+                    definition,
+                    DefinitionCategory::DeclarationAndBinding,
+                );
+            } else {
+                self.record_binding(
+                    place,
+                    definition,
+                    PreviousDefinitions::AreShadowed,
+                    FutureDefinitions::ShadowThisOne,
+                    ImportedQualifierAction::Preserve,
+                );
+            }
+        }
+    }
+
+    /// Drops the default ranges that served as barriers between non-contiguous ranges
+    /// with the same reachability while building the map.
+    fn finish_ranges(&mut self) -> Box<[(TextRange, RangeInfo)]> {
+        let mut ranges = std::mem::take(&mut self.range_reachability);
+        ranges.retain(|(_, info)| *info != RangeInfo::default());
+        ranges.into_boxed_slice()
+    }
+
     pub(super) fn finish(mut self: Box<Self>) -> UseDefMap<'db> {
+        let range_reachability = self.finish_ranges();
         let pending = self.pending_reachability.current;
         for state in self
             .symbol_states
@@ -3186,8 +3370,13 @@ impl<'db> UseDefMapBuilder<'db> {
             self.definitions_by_definition,
             &mut place_state_interner,
         );
-        let bindings_by_use =
-            Self::intern_bindings_by_use(self.bindings_by_use, &mut place_state_interner);
+        let has_uses = !self.bindings_by_use.is_empty();
+        let bindings_by_use = self
+            .bindings_by_use
+            .into_iter()
+            .map(|bindings| place_state_interner.intern_bindings(&bindings))
+            .collect::<Vec<_>>()
+            .into();
         let if_chain_start_by_use = FrozenMap::from_entries(
             self.if_chain_start_by_use
                 .into_iter()
@@ -3245,12 +3434,7 @@ impl<'db> UseDefMapBuilder<'db> {
                 &mut self.reachability_constraints,
             );
         }
-        // Keep default entries while building so they remain barriers between non-contiguous
-        // ranges with the same metadata. Once construction is complete, absence represents the
-        // default of reachable code outside a `TYPE_CHECKING` block.
-        self.range_reachability
-            .retain(|(_, info)| *info != RangeInfo::default());
-        for &(_, RangeInfo { reachability, .. }) in &self.range_reachability {
+        for &(_, RangeInfo { reachability, .. }) in &range_reachability {
             self.reachability_constraints.mark_used(reachability);
         }
         for enclosing_snapshot in &enclosing_snapshots {
@@ -3266,14 +3450,14 @@ impl<'db> UseDefMapBuilder<'db> {
         // In `body if test else other`, we visit `test` before `body`, but node indices follow
         // source order. Sort the recorded IDs so root membership can use binary search.
         boolean_test_roots.sort_unstable();
-        let extra = (!bindings_by_use.is_empty()
+        let extra = (has_uses
             || !member_states.is_empty()
             || !enclosing_snapshots.is_empty()
             || !loop_headers.is_empty()
             || !boolean_test_roots.is_empty())
         .then(|| {
             Box::new(UseDefMapExtra {
-                bindings_by_use: bindings_by_use.into(),
+                bindings_by_use,
                 if_chain_start_by_use,
                 multi_bindings_by_use,
                 member_states,
@@ -3304,7 +3488,7 @@ impl<'db> UseDefMapBuilder<'db> {
             constraint_tables,
             interned_bindings: Arc::new(interned_bindings),
             interned_declarations: Arc::new(interned_declarations),
-            range_reachability: self.range_reachability.into_boxed_slice(),
+            range_reachability,
             symbol_states,
             definitions_by_definition,
             extra,
@@ -3397,21 +3581,6 @@ impl<'db> UseDefMapBuilder<'db> {
         }
 
         FrozenMap::from_entries(interned_ids_by_definition)
-    }
-
-    fn intern_bindings_by_use(
-        bindings_by_use: IndexVec<ScopedUseId, Bindings>,
-        place_state_interner: &mut PlaceStateInterner,
-    ) -> IndexVec<ScopedUseId, InternedBindingsId> {
-        let mut interned_ids_by_use: IndexVec<ScopedUseId, InternedBindingsId> =
-            IndexVec::with_capacity(bindings_by_use.len());
-
-        for bindings in bindings_by_use {
-            let interned_id = place_state_interner.intern_bindings(&bindings);
-            interned_ids_by_use.push(interned_id);
-        }
-
-        interned_ids_by_use
     }
 
     fn intern_place_states<I: Idx, T>(

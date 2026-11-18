@@ -1,6 +1,6 @@
 [package]
 name = "ruff_db"
-version = "0.0.20"
+version = "0.0.22"
 description = "This is an internal component crate of Ruff"
 authors = { workspace = true }
 edition = { workspace = true }
@@ -74,3 +74,6 @@ serde = [
 ]
 # Exposes testing utilities.
 testing = ["tracing-subscriber"]
+
+[lints.cargo]
+redundant_homepage = "allow"

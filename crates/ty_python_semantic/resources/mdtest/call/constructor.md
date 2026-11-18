@@ -84,7 +84,7 @@ class LambdaNew:
     __new__ = lambda cls: object.__new__(cls)
 
 reveal_type(LambdaNew())  # revealed: LambdaNew
-LambdaNew().missing_attribute  # error: [unresolved-attribute]
+LambdaNew().missing_attribute  # error: [missing-attribute]
 ```
 
 ## `__new__` with an invalid decorator and unresolved return annotation
@@ -102,7 +102,7 @@ from typing_extensions import deprecated
 
 class C:
     @deprecated  # error: [invalid-argument-type] "LiteralString"
-    def __new__() -> T:  # error: [empty-body] "TypeVar"
+    def __new__() -> T:  # error: [invalid-implicit-return-in-function-with-stub-body] "TypeVar"
         pass
 
 C()
@@ -702,11 +702,11 @@ def _(flag: bool) -> None:
     class Foo:
         __new__ = Callable()
 
-    # error: [call-non-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
+    # error: [not-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
     reveal_type(Foo(1))  # revealed: Foo
     # TODO should be - error: [missing-argument] "No argument provided for required parameter `x` of bound method `__call__`"
     # but we currently infer the signature of `__call__` as unknown, so it accepts any arguments
-    # error: [call-non-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
+    # error: [not-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
     reveal_type(Foo())  # revealed: Foo
 ```
 
@@ -1818,6 +1818,18 @@ reveal_type(C("a"))  # revealed: C[str | None]
 reveal_type(C(1))  # revealed: C[int | None]
 ```
 
+## Variadic receiver annotations
+
+A variadic parameter can accept both the receiver and the explicit constructor arguments.
+
+```py
+class Plain:
+    def __init__(*args: *tuple[object, ...]) -> None: ...
+
+Plain()  # ok
+Plain(1, "a")  # ok
+```
+
 ## Union `self` annotations with variadic constructor parameters
 
 The `object` argument selects the `Any` constraint, even when the constructor also infers a
@@ -2213,11 +2225,11 @@ def _(flag: bool) -> None:
     class Foo:
         __init__ = Callable()
 
-    # error: [call-non-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
+    # error: [not-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
     reveal_type(Foo(1))  # revealed: Foo
     # TODO should be - error: [missing-argument] "No argument provided for required parameter `x` of bound method `__call__`"
     # but we currently infer the signature of `__call__` as unknown, so it accepts any arguments
-    # error: [call-non-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
+    # error: [not-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
     reveal_type(Foo())  # revealed: Foo
 ```
 

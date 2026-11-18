@@ -2202,12 +2202,12 @@ on `type[Top[MutableAny]]` or `type[Bottom[MutableAny]]`.
 
 ```py
 def class_instance_attributes(top: Top[MutableAny], bottom: Bottom[MutableAny]) -> None:
-    type(top).value  # error: [unresolved-attribute]
-    type(bottom).value  # error: [unresolved-attribute]
+    type(top).value  # error: [missing-attribute]
+    type(bottom).value  # error: [missing-attribute]
 
 def annotated_class_instance_attributes(top: type[Top[MutableAny]], bottom: type[Bottom[MutableAny]]) -> None:
-    top.value  # error: [unresolved-attribute]
-    bottom.value  # error: [unresolved-attribute]
+    top.value  # error: [missing-attribute]
+    bottom.value  # error: [missing-attribute]
 ```
 
 ### Writable properties
@@ -2305,7 +2305,7 @@ class ChildProtocol(BaseProtocol, Protocol):
     marker: Any
 
     @property
-    def value(self) -> str: ...  # error: [invalid-property-type-override]
+    def value(self) -> str: ...  # error: [incompatible-property-override]
 
 static_assert(is_subtype_of(Top[ChildProtocol], BaseProtocol))
 static_assert(is_subtype_of(ChildProtocol, Top[BaseProtocol]))
@@ -2447,7 +2447,7 @@ static_assert(not is_subtype_of(Top[Source], Bottom[Target]))
 static_assert(is_subtype_of(Bottom[Source], Top[Target]))
 
 def invalid(source: Top[Source]) -> Bottom[Target]:
-    return source  # error: [invalid-return-type]
+    return source  # error: [invalid-explicit-return]
 ```
 
 ### Members outside the protocol interface

@@ -10,7 +10,7 @@ use crate::checkers::ast::Checker;
 use crate::preview::{
     is_pep604_future_annotations_fix_enabled, is_up006_future_annotations_fix_enabled,
 };
-use crate::registry::Rule;
+use crate::registry::{Rule, RuleSet};
 use crate::rules::{
     airflow, flake8_2020, flake8_async, flake8_bandit, flake8_boolean_trap, flake8_bugbear,
     flake8_builtins, flake8_comprehensions, flake8_datetimez, flake8_debugger, flake8_django,
@@ -721,6 +721,9 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             if checker.is_rule_enabled(Rule::LongSleepNotForever) {
                 flake8_async::rules::long_sleep_not_forever(checker, call);
             }
+            if checker.is_rule_enabled(Rule::PytestRaisesExceptionGroup) {
+                flake8_async::rules::pytest_raises_exception_group(checker, call);
+            }
             if checker.any_rule_enabled(&[
                 Rule::SuspiciousPickleUsage,
                 Rule::SuspiciousMarshalUsage,
@@ -940,13 +943,6 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             if checker.is_rule_enabled(Rule::SharedClockMock) {
                 ruff::rules::shared_clock_mock(checker, call);
             }
-            if checker.any_rule_enabled(&[
-                Rule::PytestParametrizeNamesWrongType,
-                Rule::PytestParametrizeValuesWrongType,
-                Rule::PytestDuplicateParametrizeTestCases,
-            ]) {
-                flake8_pytest_style::rules::parametrize(checker, call);
-            }
             if checker.is_rule_enabled(Rule::PytestUnittestAssertion) {
                 flake8_pytest_style::rules::unittest_assertion(checker, expr, func, args, keywords);
             }
@@ -961,23 +957,6 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             }
             if checker.is_rule_enabled(Rule::UnspecifiedEncoding) {
                 pylint::rules::unspecified_encoding(checker, call);
-            }
-            if checker.any_rule_enabled(&[
-                Rule::PytestRaisesWithoutException,
-                Rule::PytestRaisesTooBroad,
-            ]) {
-                flake8_pytest_style::rules::raises_call(checker, call);
-            }
-            if checker.is_rule_enabled(Rule::LegacyFormPytestRaises) {
-                ruff::rules::legacy_raises_warns_deprecated_call(checker, call);
-            }
-            if checker
-                .any_rule_enabled(&[Rule::PytestWarnsWithoutWarning, Rule::PytestWarnsTooBroad])
-            {
-                flake8_pytest_style::rules::warns_call(checker, call);
-            }
-            if checker.is_rule_enabled(Rule::PytestFailWithoutMessage) {
-                flake8_pytest_style::rules::fail_call(checker, call);
             }
             if checker.is_rule_enabled(Rule::ZipInsteadOfPairwise) {
                 if checker.target_version() >= PythonVersion::PY310 {
@@ -1135,9 +1114,6 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
             }
             if checker.is_rule_enabled(Rule::BatchedWithoutExplicitStrict) {
                 flake8_bugbear::rules::batched_without_explicit_strict(checker, call);
-            }
-            if checker.is_rule_enabled(Rule::PytestRaisesAmbiguousPattern) {
-                ruff::rules::pytest_raises_ambiguous_pattern(checker, call);
             }
             if checker.is_rule_enabled(Rule::FalsyDictGetFallback) {
                 ruff::rules::falsy_dict_get_fallback(checker, expr);
@@ -1739,7 +1715,7 @@ pub(crate) fn expression(expr: &Expr, checker: &Checker) {
 /// Run rules that need the qualified name of the function being called.
 /// Include each rule in the initial check so it also runs when enabled on its own.
 fn call_with_qualified_name(checker: &Checker, call: &ast::ExprCall) {
-    if !checker.any_rule_enabled(&[
+    const QUALIFIED_CALL_RULES: RuleSet = RuleSet::from_rules(&[
         Rule::RedundantOpenModes,
         Rule::OpenAlias,
         Rule::OSErrorAlias,
@@ -1816,7 +1792,19 @@ fn call_with_qualified_name(checker: &Checker, call: &ast::ExprCall) {
         Rule::UnnecessaryEmptyIterableWithinDequeCall,
         Rule::StarmapZip,
         Rule::TarfileIgnoreZerosTrue,
-    ]) {
+        Rule::PytestParametrizeNamesWrongType,
+        Rule::PytestParametrizeValuesWrongType,
+        Rule::PytestDuplicateParametrizeTestCases,
+        Rule::PytestRaisesWithoutException,
+        Rule::PytestRaisesTooBroad,
+        Rule::LegacyFormPytestRaises,
+        Rule::PytestWarnsWithoutWarning,
+        Rule::PytestWarnsTooBroad,
+        Rule::PytestFailWithoutMessage,
+        Rule::PytestRaisesAmbiguousPattern,
+    ]);
+
+    if !checker.context.rules.any_enabled_in(&QUALIFIED_CALL_RULES) {
         return;
     }
     let Some(qualified_name) = checker.semantic().resolve_qualified_name(&call.func) else {
@@ -2051,5 +2039,30 @@ fn call_with_qualified_name(checker: &Checker, call: &ast::ExprCall) {
     }
     if checker.is_rule_enabled(Rule::TarfileIgnoreZerosTrue) {
         ruff::rules::tarfile_ignore_zeros_true(checker, call, &qualified_name);
+    }
+    if checker.any_rule_enabled(&[
+        Rule::PytestParametrizeNamesWrongType,
+        Rule::PytestParametrizeValuesWrongType,
+        Rule::PytestDuplicateParametrizeTestCases,
+    ]) {
+        flake8_pytest_style::rules::parametrize(checker, call, &qualified_name);
+    }
+    if checker.any_rule_enabled(&[
+        Rule::PytestRaisesWithoutException,
+        Rule::PytestRaisesTooBroad,
+    ]) {
+        flake8_pytest_style::rules::raises_call(checker, call, &qualified_name);
+    }
+    if checker.is_rule_enabled(Rule::LegacyFormPytestRaises) {
+        ruff::rules::legacy_raises_warns_deprecated_call(checker, call, &qualified_name);
+    }
+    if checker.any_rule_enabled(&[Rule::PytestWarnsWithoutWarning, Rule::PytestWarnsTooBroad]) {
+        flake8_pytest_style::rules::warns_call(checker, call, &qualified_name);
+    }
+    if checker.is_rule_enabled(Rule::PytestFailWithoutMessage) {
+        flake8_pytest_style::rules::fail_call(checker, call, &qualified_name);
+    }
+    if checker.is_rule_enabled(Rule::PytestRaisesAmbiguousPattern) {
+        ruff::rules::pytest_raises_ambiguous_pattern(checker, call, &qualified_name);
     }
 }

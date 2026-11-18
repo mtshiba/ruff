@@ -25,7 +25,10 @@ use super::{
     BoundTypeVarIdentity, BoundTypeVarInstance, MemberLookupPolicy, MroIterator, SpecialFormType,
     SubclassOfType, Type, TypeQualifiers, class_base::ClassBase, function::FunctionType,
 };
-use crate::place::{DefinedPlace, Provenance, TypeOrigin, place_from_declarations};
+use crate::place::{
+    ConsideredDefinitions, DefinedPlace, Provenance, RequiresExplicitReExport, TypeOrigin,
+    place_by_id, place_from_declarations,
+};
 use crate::reachability::{DeclarationsIteratorExtension, ReachabilityConstraintsExtension};
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::{
@@ -44,7 +47,7 @@ use crate::types::relation::{
 use crate::types::signatures::{
     CallableSignature, Parameter, Parameters, Signature, SignatureRelationVisitor,
 };
-use crate::types::tuple::{Tuple, TupleSpec};
+use crate::types::tuple::{Tuple, TupleLength, TupleSpec};
 use crate::types::typevar::TypeVarSet;
 use crate::types::variance::VarianceOrigin;
 use crate::types::{
@@ -212,7 +215,6 @@ impl<'db> CodeGeneratorKind<'db> {
             db: &'db dyn Db,
             class: StaticClassLiteral<'db>,
         ) -> Option<CodeGeneratorKind<'db>> {
-            let env = ProgramEnvironment::from_scope(class.body_scope(db));
             // If a class is directly decorated as a dataclass, it's a dataclass.
             // If a class' metaclass is a dataclass transformer, it's a dataclass.
             // If a class inherits from a base class that is a dataclass
@@ -228,24 +230,7 @@ impl<'db> CodeGeneratorKind<'db> {
                     class,
                     info.params,
                 ))
-            } else if KnownClass::Type
-                .try_to_class_literal(db, &env)
-                .is_none_or(|type_class| {
-                    !class.is_subclass_of(
-                        db,
-                        None,
-                        ClassType::NonGeneric(ClassLiteral::Static(type_class)),
-                    )
-                })
-                && let Some(transformer_params) =
-                    class.iter_mro(db, None).skip(1).find_map(|base| {
-                        base.into_class().and_then(|class| {
-                            class
-                                .static_class_literal(db)
-                                .and_then(|(lit, _)| lit.dataclass_transformer_params(db))
-                        })
-                    })
-            {
+            } else if let Some(transformer_params) = class.dataclass_transformer_from_bases(db) {
                 Some(CodeGeneratorKind::from_dataclass_transformer(
                     db,
                     class,
@@ -470,7 +455,7 @@ impl<'db> GenericAlias<'db> {
         let tcx = if type_mapping.is_structural() {
             &[]
         } else {
-            tcx.annotation
+            tcx.expected_type()
                 .and_then(|ty| ty.specialization_of(db, visitor.env, self.origin(db)))
                 .map(|specialization| specialization.types(db))
                 .unwrap_or(&[])
@@ -541,7 +526,7 @@ impl<'db> VarianceInferable<'db> for GenericAlias<'db> {
 
 #[salsa::tracked]
 impl<'db> GenericAlias<'db> {
-    /// Resolve the MRO with this alias's type arguments applied to its base classes.
+    /// Resolve this alias's ancestors in MRO order with its type arguments applied.
     #[salsa::tracked(
         returns(as_ref),
         cycle_initial=|db, _, alias: GenericAlias<'db>| {
@@ -555,13 +540,19 @@ impl<'db> GenericAlias<'db> {
         },
         heap_size=ruff_memory_usage::heap_size
     )]
-    pub(in crate::types) fn try_mro(
+    pub(in crate::types) fn try_mro_ancestors(
         self,
         db: &'db dyn Db,
-    ) -> Result<Mro<'db>, Box<StaticMroError<'db>>> {
+    ) -> Result<Box<[ClassBase<'db>]>, Box<StaticMroError<'db>>> {
         let origin = self.origin(db);
-        tracing::trace!("GenericAlias::try_mro: {}", origin.name(db));
-        Mro::of_static_class(db, origin, Some(self.specialization(db))).map_err(Box::new)
+        tracing::trace!("GenericAlias::try_mro_ancestors: {}", origin.name(db));
+        Mro::ancestors_of_static_class(
+            db,
+            origin,
+            Some(self.specialization(db)),
+            origin.explicit_bases(db),
+        )
+        .map_err(Box::new)
     }
 
     /// Compose each type argument's variance with its formal parameter's variance. Inferred
@@ -1396,7 +1387,7 @@ impl<'db> ClassType<'db> {
     ///
     /// If the MRO could not be accurately resolved, this method falls back to iterating
     /// over an MRO that has the class directly inheriting from `Unknown`. Use
-    /// [`StaticClassLiteral::try_mro`] if you need to distinguish between the success and failure
+    /// [`StaticClassLiteral::try_mro_ancestors`] if you need to distinguish between the success and failure
     /// cases rather than simply iterating over the inferred resolution order for the class.
     ///
     /// [method resolution order]: https://docs.python.org/3/glossary.html#term-method-resolution-order
@@ -1871,11 +1862,7 @@ impl<'db> ClassType<'db> {
         else {
             return true;
         };
-        if types_are_disjoint(self_metaclass_instance, other_metaclass_instance) {
-            return false;
-        }
-
-        true
+        !types_are_disjoint(self_metaclass_instance, other_metaclass_instance)
     }
 
     /// Return a type representing "the set of all instances of the metaclass of this class".
@@ -2166,64 +2153,19 @@ impl<'db> ClassType<'db> {
                     .unwrap_or_else(fallback_member_lookup)
             }
 
-            // ```py
-            // class tuple:
-            //     @overload
-            //     def __new__(cls: type[tuple[()]], iterable: tuple[()] = ()) -> tuple[()]: ...
-            //     @overload
-            //     def __new__[T](cls: type[tuple[T, ...]], iterable: tuple[T, ...]) -> tuple[T, ...]: ...
-            // ```
-            "__new__" if class_literal.is_tuple(db) => {
-                let mut iterable_parameter =
-                    Parameter::positional_only(Some(Name::new_static("iterable")));
-
-                let tuple = specialization.and_then(|spec| spec.tuple(db));
-
-                match tuple {
-                    Some(tuple) => {
-                        // TODO: Once we support PEP 646 annotations for `*args` parameters, we can
-                        // use the tuple itself as the argument type.
-                        let tuple_len = tuple.len();
-
-                        if tuple_len.minimum() == 0 && tuple_len.maximum().is_none() {
-                            // If the tuple has no length restrictions,
-                            // any iterable is allowed as long as the iterable has the correct element type.
-                            assert_eq!(
-                                tuple.iter_element_types(db).count(),
-                                1,
-                                "Tuple specialization should have exactly one element when it has \
-                                 no length restriction"
-                            );
-                            iterable_parameter = iterable_parameter.with_annotated_type(
-                                KnownClass::Iterable.to_specialized_instance(
-                                    db,
-                                    env,
-                                    &[tuple.homogeneous_element_type(db, env)],
-                                ),
-                            );
-                        } else {
-                            // But if the tuple is of a fixed length, or has a minimum length, we require a tuple rather
-                            // than an iterable, as a tuple is the only kind of iterable for which we can
-                            // specify a fixed length, or that the iterable must be at least a certain length.
-                            iterable_parameter = iterable_parameter
-                                .with_annotated_type(Type::instance(db, env, self));
-                        }
-                    }
-                    None => {
-                        // If the tuple isn't specialized at all, we allow any argument as long as it is iterable.
-                        iterable_parameter = iterable_parameter
-                            .with_annotated_type(KnownClass::Iterable.to_instance(db, env));
-                    }
-                }
-
-                // We allow the `iterable` parameter to be omitted for:
-                // - a zero-length tuple
-                // - an unspecialized tuple
-                // - a tuple with no minimum length
-                if tuple.is_none_or(|tuple| tuple.len().minimum() == 0) {
-                    iterable_parameter =
-                        iterable_parameter.with_default_type(Type::empty_tuple(db, env));
-                }
+            // Typeshed's `Iterable[_T_co]` parameter accepts any length. For a tuple with a
+            // fixed or minimum length, require a tuple argument that satisfies that constraint.
+            "__new__"
+                if class_literal.is_tuple(db)
+                    && let Some(tuple) = specialization.and_then(|spec| spec.tuple(db))
+                    && tuple.len() != TupleLength::unknown() =>
+            {
+                let default =
+                    (tuple.len() == TupleLength::Fixed(0)).then(|| Type::empty_tuple(db, env));
+                let iterable_parameter =
+                    Parameter::positional_only(Some(Name::new_static("iterable")))
+                        .with_annotated_type(Type::instance(db, env, self))
+                        .with_optional_default_type(default);
 
                 let parameters = Parameters::standard([
                     Parameter::positional_only(Some(Name::new_static("self")))
@@ -2342,7 +2284,8 @@ impl<'db> ClassType<'db> {
                     .origin(db)
                     .own_instance_member(db, env, name)
                     .map_type(|ty| {
-                        ty.apply_optional_owner_specialization_to_member(db, Some(specialization))
+                        ty.freshen_member_for_owner_specialization(db, env, Some(specialization))
+                            .apply_optional_owner_specialization_to_member(db, Some(specialization))
                     })
             }
         }
@@ -2455,7 +2398,7 @@ impl<'db> ClassType<'db> {
         }
 
         let dunder_new_callables = lookup_type
-            .lookup_dunder_new(db, env, MemberLookupPolicy::default())
+            .lookup_dunder_new(db, env, MemberLookupPolicy::INHERIT_GENERIC_CONTEXT)
             .and_then(|place_and_quals| {
                 receiver
                     .resolve_dunder_new_callable(db, env, place_and_quals.place)
@@ -2682,72 +2625,59 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
     ) -> ConstraintSet<'db, 'c> {
         // Fast path: if source and target are the same class (possibly with different
         // specializations), we can compare them directly without walking the MRO.
-        match (source, target) {
-            (ClassType::NonGeneric(source), ClassType::NonGeneric(target)) if source == target => {
-                return self.always();
-            }
-            (ClassType::Generic(source_alias), ClassType::Generic(target_alias))
-                if source_alias.origin(db) == target_alias.origin(db) =>
-            {
-                return self.check_specialization_pair(
-                    db,
-                    source_alias.specialization(db),
-                    target_alias.specialization(db),
-                );
-            }
-            _ => {}
+        if source == target && matches!(target, ClassType::NonGeneric(_)) {
+            return self.always();
         }
 
-        let mut generic_target = None;
-        let result = source.iter_mro(db).when_any(db, self.constraints, |base| {
-            match base {
-                ClassBase::Any => ConstraintSet::from_bool(
-                    self.constraints,
-                    self.relation.is_assignability() || target.is_object(db),
-                ),
-                ClassBase::Dynamic(_) | ClassBase::Divergent(_) => match self.relation {
-                    TypeRelation::Subtyping | TypeRelation::Redundancy { .. } => {
-                        ConstraintSet::from_bool(self.constraints, target.is_object(db))
-                    }
-                    TypeRelation::Assignability => {
-                        ConstraintSet::from_bool(self.constraints, !target.is_final(db))
-                    }
-                },
+        let unknown_base_matches = |base| match base {
+            ClassBase::Any => self.relation.is_assignability() || target.is_object(db),
+            ClassBase::Dynamic(_) | ClassBase::Divergent(_) => match self.relation {
+                TypeRelation::Subtyping | TypeRelation::Redundancy { .. } => target.is_object(db),
+                TypeRelation::Assignability => !target.is_final(db),
+            },
+            _ => false,
+        };
 
-                // Protocol, Generic, and TypedDict are special bases that don't match ClassType.
-                ClassBase::Protocol | ClassBase::Generic | ClassBase::TypedDict(_) => self.never(),
+        let ClassType::Generic(target_alias) = target else {
+            let found = source
+                .relation_bases(db, target.class_literal(db))
+                .any(|base| base == ClassBase::Class(target) || unknown_base_matches(base));
+            return ConstraintSet::from_bool(self.constraints, found);
+        };
 
-                ClassBase::Class(source) => match (source, target) {
-                    // Two non-generic classes match if they have the same class literal.
-                    (
-                        ClassType::NonGeneric(source_literal),
-                        ClassType::NonGeneric(target_literal),
-                    ) => {
-                        ConstraintSet::from_bool(self.constraints, source_literal == target_literal)
-                    }
+        let origin = target_alias.origin(db);
+        if let ClassType::Generic(source_alias) = source
+            && source_alias.origin(db) == origin
+        {
+            return self.check_specialization_pair(
+                db,
+                source_alias.specialization(db),
+                target_alias.specialization(db),
+            );
+        }
 
-                    // Two generic classes match if they have the same origin and compatible specializations.
-                    (ClassType::Generic(source), ClassType::Generic(target))
-                        if source.origin(db) == target.origin(db) =>
-                    {
-                        generic_target = Some(target);
-                        self.check_specialization_pair(
-                            db,
-                            source.specialization(db),
-                            target.specialization(db),
-                        )
-                    }
-
-                    // Different generic origins, or generic and non-generic classes, don't match.
-                    (ClassType::Generic(_), ClassType::Generic(_) | ClassType::NonGeneric(_))
-                    | (ClassType::NonGeneric(_), ClassType::Generic(_)) => self.never(),
-                },
+        let mut matched_origin = false;
+        let candidates = source
+            .relation_bases(db, origin.into())
+            .filter(|&base| match base {
+                ClassBase::Class(ClassType::Generic(alias)) => alias.origin(db) == origin,
+                _ => unknown_base_matches(base),
+            });
+        let result = candidates.when_any(db, self.constraints, |base| {
+            if let ClassBase::Class(ClassType::Generic(alias)) = base {
+                matched_origin = true;
+                self.check_specialization_pair(
+                    db,
+                    alias.specialization(db),
+                    target_alias.specialization(db),
+                )
+            } else {
+                self.always()
             }
         });
-
-        let Some(target) = generic_target else {
+        if !matched_origin {
             return result;
-        };
+        }
 
         // The MRO retains only one specialization per class. A different inheritance path can
         // still establish the relation: `Child(Gradual, Concrete)` is a subtype of `Base[int]`
@@ -2756,12 +2686,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             source
                 .iter_explicit_ancestors(db, self.env)
                 .filter_map(ClassType::into_generic_alias)
-                .filter(|ancestor| ancestor.origin(db) == target.origin(db))
+                .filter(|ancestor| ancestor.origin(db) == origin)
                 .when_any(db, self.constraints, |ancestor| {
                     self.check_specialization_pair(
                         db,
                         ancestor.specialization(db),
-                        target.specialization(db),
+                        target_alias.specialization(db),
                     )
                 })
         })
@@ -2928,7 +2858,8 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
         }
     }
 
-    /// Finds the annotation governing a new class-body default, without inferring existing defaults.
+    /// Finds the type governing a new class-body default. A bare `ClassVar` gets its public type
+    /// from the base class's bindings.
     ///
     /// An unannotated binding retains its owner's inherited declaration. Resolving that owner
     /// before continuing the MRO prevents a later sibling base from supplying a different contract.
@@ -2954,9 +2885,10 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
             };
             let use_def = use_def_map(db, scope);
             let declarations = use_def.end_of_scope_symbol_declarations(symbol);
-            let declared = place_from_declarations(db, &self.env, declarations.clone())
-                .ignore_conflicting_declarations();
-            let declaration = if declared.is_undefined() {
+            let declared = place_from_declarations(db, &self.env, declarations.clone());
+            let qualifier_only = declared.is_qualifier_only();
+            let declared = declared.ignore_conflicting_declarations();
+            let mut declaration = if declared.is_undefined() {
                 let mut bindings = use_def.end_of_scope_symbol_bindings(symbol);
                 let predicates = bindings.predicates();
                 let constraints = bindings.reachability_constraints();
@@ -2968,16 +2900,43 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                 }) {
                     continue;
                 }
-                inherited_class_body_declaration(db, scope, symbol)
+                inherited_class_body_declaration(db, scope, symbol)?
+            } else if declared.qualifiers.contains(TypeQualifiers::FINAL)
+                || !declarations.contains_only_annotated_assignments(db)
+            {
+                return None;
             } else {
-                (!declared.qualifiers.contains(TypeQualifiers::FINAL)
-                    && declarations.contains_only_annotated_assignments(db))
-                .then_some(ClassBodyDeclaration {
-                    member: declared,
+                ClassBodyDeclaration {
+                    member: if qualifier_only {
+                        Place::Undefined.with_qualifiers(declared.qualifiers)
+                    } else {
+                        declared
+                    },
                     class: base,
-                })
+                }
             };
-            return declaration.map(|declaration| ClassBodyDeclaration {
+            // The first class to bind a bare ClassVar supplies its type to subclasses.
+            // An uninitialized declaration or a stub placeholder supplies only the qualifier.
+            if declaration.member.is_class_var()
+                && !declaration.member.place.is_definitely_bound()
+                && let Place::Defined(binding) = place_by_id(
+                    db,
+                    scope,
+                    symbol.into(),
+                    RequiresExplicitReExport::No,
+                    ConsideredDefinitions::EndOfScope,
+                )
+                .place
+                && (!declaration.member.is_undefined() || !binding.ty.is_unknown())
+            {
+                declaration.member.place = Place::Defined(DefinedPlace {
+                    ty: binding.public_type(db, &self.env),
+                    public_type_policy: PublicTypePolicy::Raw,
+                    ..binding
+                });
+                declaration.class = base;
+            }
+            return Some(ClassBodyDeclaration {
                 member: declaration
                     .member
                     .map_type(|ty| ty.apply_optional_specialization(db, specialization)),
@@ -3188,11 +3147,8 @@ impl<'db, I: Iterator<Item = ClassBase<'db>>> MroLookup<'db, I> {
                     let member = class.own_instance_member(db, &self.env, name);
                     let definitely_declared = matches!(
                         member.inner.place,
-                        Place::Defined(DefinedPlace {
-                            origin: TypeOrigin::Declared,
-                            definedness: Definedness::AlwaysDefined,
-                            ..
-                        })
+                        Place::Defined(place) if place.is_definitely_defined()
+                            && (place.origin.is_declared() || member.qualifiers().contains(TypeQualifiers::FINAL))
                     );
                     if definitely_declared {
                         let overriding_class_default =

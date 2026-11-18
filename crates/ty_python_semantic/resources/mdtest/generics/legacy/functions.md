@@ -63,6 +63,27 @@ reveal_type(f(True))  # revealed: Literal[True]
 reveal_type(f("string"))  # revealed: Literal["string"]
 ```
 
+## Conditional imports of `Type`
+
+Either binding of `Type` lets ty infer `T` from the class passed to `make`.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+try:
+    from typing import Type
+except ImportError:
+    Type = type
+
+def make(cls: Type[T]) -> T:
+    reveal_type(cls)  # revealed: type[T@make]
+    return cls()
+
+reveal_type(make(int))  # revealed: int
+```
+
 ## Inferring “deep” generic parameter types
 
 The matching up of call arguments and discovery of constraints on typevars can be a recursive
@@ -477,7 +498,7 @@ def bounded(value: BoundedS) -> None:
     reveal_type(box(value))  # revealed: list[BoundedS@bounded]
 
 def contextual(value: str, existing: S) -> list[S]:
-    return box(value)  # error: [invalid-return-type]
+    return box(value)  # error: [invalid-explicit-return]
 
 def compatible_context(value: BoundedS) -> list[BoundedS]:
     return box(value)  # ok
@@ -1314,7 +1335,7 @@ def good_return(x: T) -> T:
     return x
 
 def bad_return(x: T) -> T:
-    # error: [invalid-return-type] "Return type does not match returned value: expected `T@bad_return`, found `int`"
+    # error: [invalid-explicit-return] "Return type does not match returned value: expected `T@bad_return`, found `int`"
     return x + 1
 ```
 
@@ -1336,6 +1357,103 @@ def f(value: T):
     reveal_type(value + value)  # revealed: Unknown
 ```
 
+## Unary operators on bounded type variables
+
+When a unary method returns `Self`, the operator preserves the operand's type variable.
+
+```py
+from typing import TypeVar
+from typing_extensions import Self, assert_type
+
+class Number:
+    def __neg__(self) -> Self:
+        return self
+
+    __pos__ = __neg__
+    __invert__ = __neg__
+
+T = TypeVar("T", bound=Number)
+
+def check(value: T):
+    assert_type(+value, T)
+    assert_type(-value, T)
+    assert_type(~value, T)
+```
+
+The result is also assignable to the type variable when each member of a union bound implements the
+operator with a `Self` return type.
+
+```py
+class Other:
+    def __neg__(self) -> Self:
+        return self
+
+U = TypeVar("U", bound=Number | Other)
+
+def negate(value: U) -> U:
+    # TODO: Since U is bounded by Number | Other, the revealed union could simplify to U@negate.
+    return reveal_type(-value)  # revealed: (U@negate & Number) | (U@negate & Other)
+```
+
+## Unary operators on intersection bounds
+
+The result of a unary operator must satisfy the return type of each implementation on the bound. A
+method returning `Self` preserves the original type variable.
+
+```py
+from typing import TypeVar
+from typing_extensions import Self, assert_type
+from ty_extensions import Intersection
+
+class Left:
+    @staticmethod
+    def __neg__() -> object:
+        return 1
+
+    def __pos__(self) -> Self:
+        return self
+
+class Right:
+    @staticmethod
+    def __neg__() -> int:
+        return 1
+
+T = TypeVar("T", bound=Intersection[Left, Right])
+
+def check(value: T):
+    assert_type(-value, int)
+    assert_type(+value, T)
+```
+
+If a component has several possible implementations, its return type is their union.
+
+```py
+from typing import Callable, ClassVar
+
+class Alternative:
+    __neg__: ClassVar[Callable[[], int] | Callable[[], str]]
+
+U = TypeVar("U", bound=Intersection[Left, Alternative])
+
+def check_alternatives(value: U):
+    assert_type(-value, int | str)
+```
+
+## Unary operators on literal bounds
+
+An integer literal bound determines the exact value of each unary operation.
+
+```py
+from typing import Literal, TypeVar
+
+T = TypeVar("T", bound=Literal[3])
+
+def check(value: T):
+    reveal_type(+value)  # revealed: Literal[3]
+    reveal_type(-value)  # revealed: Literal[-3]
+    reveal_type(~value)  # revealed: Literal[-4]
+```
+
 ## All occurrences of the same typevar have the same type
 
 If a typevar appears multiple times in a function signature, all occurrences have the same type.
@@ -1350,7 +1468,7 @@ def different_types(cond: bool, t: T, s: S) -> T:
     if cond:
         return t
     else:
-        # error: [invalid-return-type] "Return type does not match returned value: expected `T@different_types`, found `S@different_types`"
+        # error: [invalid-explicit-return] "Return type does not match returned value: expected `T@different_types`, found `S@different_types`"
         return s
 
 def same_types(cond: bool, t1: T, t2: T) -> T:
@@ -1473,7 +1591,7 @@ class TwoTag(TypedDict):
 def equal_dictionary_tags(value: FalseTag | TwoTag, other: T):
     if value["tag"] == other:
         reveal_type(value)  # revealed: FalseTag | TwoTag
-        value["two_only"]  # error: [invalid-key] "Unknown key "two_only" for TypedDict `FalseTag`"
+        value["two_only"]  # error: [invalid-typed-dict-key] "Unknown key "two_only" for TypedDict `FalseTag`"
 ```
 
 ## Constraints containing `Any`
@@ -1569,6 +1687,24 @@ specific.asDict()
 
 reveal_type(any_first(1))  # revealed: int
 reveal_type(int_first(1))  # revealed: int
+```
+
+## Fixed-length starred parameters on generic methods
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+class Base:
+    def run(self, value: T, *args: *tuple[int, str]) -> None: ...
+
+class A(Base): ...
+class B(Base): ...
+
+def check(receiver: A | B, ints: list[int]) -> None:
+    receiver.run(0, 1, "ok")  # ok
+    receiver.run(0, *ints)  # error: [invalid-argument-type]
 ```
 
 ## Independent specializations during overload argument expansion
@@ -2321,6 +2457,42 @@ def forward(value: Pair[U, object], hint: U):
     reveal_type(choose(hint=hint, value=value))  # revealed: U@forward
 ```
 
+An `isinstance` check can narrow an `int` to an intersection with the caller's type variable.
+Passing the narrowed argument to a generic optional parameter preserves that intersection.
+
+```py
+def unwrap(value: T | None) -> T:
+    raise NotImplementedError
+
+def checked_int(value: int, kind: type[U]) -> U:
+    assert isinstance(value, kind)
+    result = unwrap(value)
+    reveal_type(result)  # revealed: int & U@checked_int
+    return unwrap(value)
+```
+
+Excluding `None` preserves the caller's type variable as the inferred list element type, including
+when the parameter uses a type variable bounded by `None`.
+
+```py
+from types import NoneType
+
+N = TypeVar("N", bound=NoneType)
+
+def singleton(value: T | None) -> list[T]:
+    raise NotImplementedError
+
+def singleton_with_sentinel(value: T | N) -> list[T]:
+    raise NotImplementedError
+
+def non_none(value: U) -> list[U]:
+    assert value is not None
+    result = singleton(value)
+    reveal_type(result)  # revealed: list[U@non_none]
+    reveal_type(singleton_with_sentinel(value))  # revealed: list[U@non_none]
+    return singleton(value)
+```
+
 ## Preserving type variables when forwarding a generic union
 
 Forwarding a union to a helper with the same parameter type preserves the caller's type variable. A
@@ -2367,6 +2539,33 @@ def check(box: Box[int | str], value: int):
     reveal_type(provide(box, value))  # revealed: Box[str]
 ```
 
+## Declared type matching multiple type variables
+
+Regression test for <https://github.com/astral-sh/ty/issues/3236>.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Never, TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V", default=Never)
+
+def concat(left: list[T], right: list[U]) -> list[T | U]:
+    return [*left, *right]
+
+def concat_wider(left: list[T], right: list[U]) -> list[T | U | V]:
+    return [*left, *right]
+
+def _(left: list[int], right: list[str]):
+    result: list[int | str] = concat(left, right)  # ok
+    wider: list[int | str | bytes] = concat_wider(left, right)  # ok
+```
+
 ## Inferring nested generic function calls
 
 We can infer type assignments in nested calls to multiple generic functions. If they use the same
@@ -2385,6 +2584,178 @@ def g(x: T) -> T | None:
 
 reveal_type(f(g("a")))  # revealed: tuple[Literal["a"] | None, int]
 reveal_type(g(f("a")))  # revealed: tuple[Literal["a"], int] | None
+```
+
+## List literals with ambiguous union parameters
+
+When a type variable appears at different nesting levels in a union parameter, an argument can
+provide more than one binding for it. In `as_list([1])`, the literal initially has type `list[int]`.
+Matching it against `T` gives `T = list[int]`, and matching it against `list[T]` gives `T = int`.
+
+When a type variable occurs more than once, we can revisit the call's arguments using the
+specialized parameter types from the previous pass as context. This lets one argument help determine
+the type of another. For example, in `map(lambda s: s.upper(), ["foo"])`, the list of strings tells
+us that `s` is a `str`. See [Unified call inference](../../bidirectional.md#unified-call-inference).
+
+If we used both bindings to specialize the `list[T]` arm, it would become `list[list[int] | int]`.
+On the second pass, the bare arm would still allow `list[int]`, so the inferred type of `[1]` would
+be `list[int] | list[list[int] | int]`. Matching that union against the parameter again would give
+`T = list[list[int] | int] | list[int] | int`. Each pass would add another list layer until we hit
+the iteration limit.
+
+To avoid this, when we revisit `[1]`, we specialize the `list[T]` arm with the binding it
+contributed, `T = int`. That gives the literal just an expected element type of `int`, so its type
+stays `list[int]` and inference converges. Both bindings still contribute to the return type,
+`list[list[int] | int]`.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def as_list(value: T | list[T]) -> list[T]:
+    if isinstance(value, list):
+        return value
+    return [value]
+
+result = as_list(reveal_type([1]))  # revealed: list[int]
+reveal_type(result)  # revealed: list[list[int] | int]
+```
+
+The return annotation also constrains the nested `Sequence[T]` arm. Widening its element type to
+`tuple[str]` would lose the literal required by the assignment.
+
+```py
+from collections.abc import Sequence
+from typing import Literal
+
+def pick(items: T | Sequence[T]) -> T:
+    raise NotImplementedError
+
+red = ("red",)
+result: tuple[Literal["red"], ...] = pick([red])  # ok
+```
+
+## Nested calls with ambiguous union parameters
+
+Each outer call to `choose` can use `T = None`. Its nested call returns `list[None]`, which matches
+`list[T]`, while its other argument, `None`, matches the bare `T` arm.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def choose(left: T | list[T], right: T | list[T]) -> list[T]:
+    raise NotImplementedError
+
+result: list[None] | list[int] = choose(choose(choose(None, None), None), None)
+reveal_type(result)  # revealed: list[None]
+```
+
+`collect` must return `list[U]` for any `U`. Both calls to `choose` can use `T = U`. The inner call
+takes `value` twice and returns `list[U]`. In the outer call, that list matches `list[T]` and
+`value` matches `T`, so the result is again `list[U]`.
+
+```py
+U = TypeVar("U")
+
+def collect(value: U) -> list[U]:
+    return reveal_type(choose(choose(value, value), value))  # revealed: list[U@collect]
+```
+
+The empty list in `first(xs, [])` initially contributes `Unknown`, but `xs` supplies the return type
+`list[int]` for `first`. Both arguments to `choose` can then match the bare `T` arm with
+`T = list[list[str]] | list[int]`.
+
+```py
+def first(value: T, alternatives: list[T]) -> T:
+    return value
+
+def _(xs: list[int]):
+    result = choose([["x"]], first(xs, []))  # ok
+    # TODO: Revisiting [["x"]] still adds extra list layers to the inferred return type.
+    expected: list[list[list[str]] | list[int]] = result  # error: [invalid-assignment]
+```
+
+`first(xs, [])` can return `list[int]`, which fits both parameters of `store` with `T = int`. The
+empty `list()` can also use `int` as its element type.
+
+```py
+from collections.abc import Iterable
+
+def store(values: T | Iterable[T | None], output: list[T]) -> T:
+    return output[0]
+
+def _(xs: list[int]):
+    # TODO: Matching the union from `first(xs, [])` against `output: list[T]` skips the
+    # `list[int]` member that would give `T = int`. See https://github.com/astral-sh/ty/issues/4909
+    reveal_type(store(first(xs, []), first(xs, [])))  # revealed: Unknown
+    reveal_type(store(list(), first(xs, [])))  # revealed: Unknown
+```
+
+## Inferring a union parameter from other arguments
+
+Matching `items` against `source: list[T]` fixes `T` to `int | list[str]`. The empty list can
+therefore match the bare `T` arm as a `list[str]` or the `list[T]` arm as a `list[int | list[str]]`.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def pick(source: list[T], *others: T | list[T]) -> T:
+    return source[0]
+
+def _(items: list[int | list[str]]):
+    reveal_type(pick(items, []))  # revealed: int | list[str]
+```
+
+With `T = list[int]`, the empty list can take the `list[T]` arm and `items` can take the `T` arm.
+
+```py
+def _(nested: list[list[int]], items: list[int]):
+    reveal_type(pick(nested, [], items))  # revealed: list[int]
+```
+
+The element type can also come from an argument matched to a bare type variable.
+
+```py
+from collections.abc import Iterable
+
+def first(value: T, fallback: T | Iterable[T | None]) -> T:
+    return value
+
+def _(value: int):
+    reveal_type(first(value, list()))  # revealed: int
+```
+
+## Contextual typing of callbacks with ambiguous union parameters
+
+The two ways to match `shape` give different return types for the callback. In either case, `value`
+determines that the callback receives a `str`.
+
+```py
+from collections.abc import Callable
+from typing import TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V")
+
+def visit(shape: T | tuple[T], value: U, seed: V, callback: Callable[[U], list[T | V]]) -> None:
+    callback(value)
+
+# error: [invalid-argument-type] "Argument to bound method `str.index`"
+visit((1,), "x", "", lambda x: [x.index(3)])
+```
+
+A callable supplied by the bare `T` arm can also provide the parameter type of a lambda.
+
+```py
+def register(handlers: list[T] | T, handler: T | Callable[[object], str]) -> None: ...
+def _(handlers: list[Callable[[str], str]]):
+    register(handlers, lambda s: reveal_type(s))  # revealed: str
 ```
 
 ## Passing generic functions to generic functions
@@ -2450,16 +2821,16 @@ from typing import Any, Callable, Generic, TypeVar
 F = TypeVar("F", bound=Callable[..., Any])
 
 def my_decorator(f: F) -> None:
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     f.whatever
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     f.whatever = 1
 
 class Box(Generic[F]):
     cls: type[F]
 
 def specialized(box: Box[Callable[..., Any]]) -> None:
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     box.cls.whatever
 ```
 
@@ -2517,6 +2888,29 @@ T = TypeVar("T", Instance, type[ClassObject])
 
 def read(value: T) -> list[str]:
     return value.keys()
+```
+
+## Class patterns after narrowing a class object
+
+Inside the identity check, `A` is known to be both the exact class object and a `type[T]`. A
+successful class pattern lets us return the subject as `T`. The pattern covers every `A` instance.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+class A: ...
+
+def match_exact_class(value: A, cls: type[T]) -> T:
+    if cls is A:
+        match value:
+            case A():
+                return value
+            case _:
+                reveal_type(value)  # revealed: Never
+    else:
+        raise AssertionError
 ```
 
 ## Assignment narrowing of dynamic attributes
@@ -2767,6 +3161,28 @@ reveal_type(age)  # revealed: Age
 reveal_type(name)  # revealed: Name
 ```
 
+## Nested overloads capture enclosing type variables
+
+Overload signatures and their implementation refer to the same type variables captured from an
+enclosing function.
+
+```py
+from typing import TypeVar, overload
+
+T = TypeVar("T")
+
+def outer(value: T) -> None:
+    @overload
+    def inner(value: T) -> T: ...
+    @overload
+    def inner(value: T, count: int) -> T: ...
+    def inner(value: T, count: int = 1) -> T:
+        return value
+
+    first: T = inner(value)  # ok
+    second: T = inner(value, 2)  # ok
+```
+
 ## `~T` is never assignable to `T`
 
 ```py
@@ -2779,6 +3195,22 @@ def f(x: T, y: Not[T]) -> T:
     x = y  # error: [invalid-assignment]
     y = x  # error: [invalid-assignment]
     return x
+```
+
+## Invalid assignments preserve type variable bindings
+
+After an invalid assignment, a local variable retains its declared type, including references to the
+enclosing function's type variables.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def recover(value: list[T]) -> list[T]:
+    result: list[T] = value
+    result = None  # error: [invalid-assignment]
+    return result  # ok
 ```
 
 ## Prefer exact matches for constrained typevars
@@ -3523,7 +3955,7 @@ V = TypeVar("V", bound=int)
 
 def bounded(value: U) -> U:
     reveal_type(double(value))  # revealed: int
-    return double(value)  # error: [invalid-return-type]
+    return double(value)  # error: [invalid-explicit-return]
 
 def same_bound(value: V) -> None:
     reveal_type(double(value))  # revealed: int
@@ -3914,6 +4346,26 @@ def _(sink: Intersection[Sink[A], Sink[B]]) -> None:
     reveal_type(element(sink))  # revealed: A & B
 ```
 
+If multiple distinct alternatives are valid but their intersection is not, the compatible return
+types are unioned:
+
+```py
+from collections.abc import Sequence
+
+def make_list(sink: Sink[list[T]]) -> list[T]:
+    return []
+
+def _(sink: Intersection[Sink[list[A]], Sink[list[B]], Sink[list[C]]]) -> None:
+    inferred = make_list(sink)
+    reveal_type(inferred)  # revealed: list[A] | list[B] | list[C]
+
+    result: Sequence[A | B] = make_list(sink)
+    reveal_type(result)  # revealed: list[A] | list[B]
+
+    # error: [invalid-assignment] "Object of type `list[A] | list[B] | list[C]` is not assignable to `int`"
+    bad: int = make_list(sink)
+```
+
 Assignments to different type variables remain correlated within an alternative: the choices here
 are `(T = A, U = B)` and `(T = B, U = C)`. The contravariant `Sink[A]` selects the first pair, so
 the result is `B`:
@@ -4146,8 +4598,8 @@ def _(unknown, any_: Any) -> None:
     reveal_type(unknown_result)  # revealed: Literal[1] | str
     # TODO: revealed: Literal[1] | (Any & str)
     reveal_type(any_result)  # revealed: Literal[1] | str
-    unknown_result.bit_length()  # error: [unresolved-attribute]
-    any_result.bit_length()  # error: [unresolved-attribute]
+    unknown_result.bit_length()  # error: [missing-union-attribute]
+    any_result.bit_length()  # error: [missing-union-attribute]
 ```
 
 Gradual specializations inherited through concrete subclasses can satisfy bounds and constraints
@@ -4514,9 +4966,14 @@ def correlated(x: Source[ElementT], y: Source[ElementT]) -> ElementT:
     raise NotImplementedError
 
 def _(x: Intersection[Source[A], Source[B]], other: Any) -> None:
-    assert isinstance(other, DSource)
-    # TODO: revealed: (A & B) | (Any & D)
-    reveal_type(correlated(x, other))  # revealed: (A & B) | D
+    if isinstance(other, DSource):
+        # TODO: revealed: (A & B) | (Any & D)
+        reveal_type(correlated(x, other))  # revealed: (A & B) | D
+
+    reveal_type(correlated(x, other))  # revealed: A | B
+
+    result: B = correlated(x, other)
+    reveal_type(result)  # revealed: B
 ```
 
 A gradual component in the return annotation is preserved in both specialized return types:
@@ -4585,6 +5042,7 @@ a subtype of all others, we select that one.)
 ### Mutable returns from intersection arguments
 
 ```py
+from collections.abc import Sequence
 from typing import Generic, TypeVar
 from ty_extensions import Intersection
 
@@ -4606,6 +5064,10 @@ def _(source: Intersection[Source[A], Source[B]]) -> None:
     # the argument also fits `Source[A | B]`. Inference uses `T = A | B`, producing `list[A | B]`
     # instead of intersecting `list[A]` and `list[B]`.
     reveal_type(make_list(source))  # revealed: list[A | B]
+
+    # Only `T = B` is assignable to the declared type.
+    result: Sequence[B] = make_list(source)
+    reveal_type(result)  # revealed: list[B]
 ```
 
 The same applies when an alias hides the mutable result:
@@ -4685,7 +5147,8 @@ mutable list, but merging their element types does not produce a specialization 
 sink. The call retains the union of the separately specialized list types:
 
 ```py
-from typing import Generic, TypeVar
+from typing import Generic
+from typing_extensions import TypeVar
 from ty_extensions import Intersection
 
 SinkT = TypeVar("SinkT", contravariant=True)
@@ -4704,6 +5167,21 @@ def make_list(sink: Sink[T]) -> list[T]:
 
 def _(sink: Intersection[ASink, BSink]) -> None:
     reveal_type(make_list(sink))  # revealed: list[A] | list[B]
+
+    result: list[A] | list[B] = make_list(sink)
+    reveal_type(result)  # revealed: list[A] | list[B]
+```
+
+A call with an unbound type variable retains the separately specialized list types:
+
+```py
+U = TypeVar("U", default=bytes)
+
+def collect_pairs(items: tuple[list[T], list[U]] | tuple[list[int], list[T]]) -> list[tuple[T, U]]:
+    return []
+
+def _(items: tuple[list[int], list[str]]) -> None:
+    reveal_type(collect_pairs(items))  # revealed: list[tuple[int, str]] | list[tuple[str, bytes]]
 ```
 
 Evidence from another argument can leave only one valid specialization. A supplied value of type `A`
@@ -4715,6 +5193,35 @@ def with_value(sink: Sink[T], value: T) -> list[T]:
 
 def _(sink: Intersection[ASink, BSink], value: A) -> None:
     reveal_type(with_value(sink, value))  # revealed: list[A]
+```
+
+If a nested callback accepts each distinct specialization of the list but not the merged
+`list[A | B]`, we retain the union of the separately specialized list types:
+
+```py
+from collections.abc import Callable, Sequence
+from typing import overload
+from typing_extensions import Unpack
+
+SourceT = TypeVar("SourceT", covariant=True)
+
+class Source(Generic[SourceT]):
+    def get(self) -> SourceT:
+        raise NotImplementedError
+
+def consume_lists(items: list[A] | list[B]) -> None: ...
+@overload
+def collect(
+    source: Source[T],
+    *args: Unpack[tuple[Sequence[Callable[[list[T]], None]]]],
+) -> list[T]: ...
+@overload
+def collect(source: None, arg: list[object], /) -> None: ...
+def collect(source: object, *args: object) -> object:
+    raise NotImplementedError
+
+def _(source: Intersection[Source[A], Source[B]]) -> None:
+    reveal_type(collect(source, [consume_lists]))  # revealed: list[A] | list[B]
 ```
 
 ### Mutable components in inferred return types
@@ -4738,6 +5245,16 @@ def invoke(callback: Callable[[object], R], value: object) -> R:
 
 def _(callback: Intersection[Callable[[object], list[A]], Callable[[object], list[B]]]) -> None:
     reveal_type(invoke(callback, object()))  # revealed: list[A] | list[B]
+```
+
+If the declared type excludes a given element of the intersection, the result is inferred from the
+remaining alternatives.
+
+```py
+def _(callback: Intersection[Callable[[object], A], Callable[[object], B], Callable[[object], list[int]]]) -> None:
+    result: A | B = invoke(callback, object())
+    # TODO: We could infer `A & B` here.
+    reveal_type(result)  # revealed: A | B
 ```
 
 An inferred tuple can still be refined when its mutable component has the same type in both
@@ -5132,6 +5649,31 @@ def probe(value: Levels[int, str, bytes]):
     reveal_type(grandchild_value(value))  # revealed: bytes
 ```
 
+## Recursive alias in a generic call's return type
+
+We infer `Tree[V]` for `subtree(entry)` even when the caller expects `V`. This call used to
+[overflow the stack](https://github.com/astral-sh/ty/issues/4972).
+
+```py
+from typing import TypeVar, cast
+from typing_extensions import TypeAliasType
+
+K = TypeVar("K")
+T = TypeVar("T")
+V = TypeVar("V")
+Tree = TypeAliasType("Tree", T | tuple["Tree[T]", ...], type_params=(T,))
+
+def subtree(entry: tuple[K, Tree[T]]) -> Tree[T]:
+    return entry[1]
+
+def cast_leaf(entry: tuple[V, V]) -> V:
+    return cast(V, subtree(entry))  # ok
+
+def leaf(entry: tuple[V, V]) -> V:
+    # error: [invalid-explicit-return] "expected `V@leaf`, found `Tree[V@leaf]`"
+    return subtree(entry)
+```
+
 ## Generic property setters implementing protocols
 
 These deliberately contrived setters could use `object` and `int` directly instead of method-scoped
@@ -5286,6 +5828,123 @@ def optional_callback(value: O) -> Callable[[O | None], O | None]:
     return reveal_type(identity_callback(value))
 ```
 
+When the second item is a string, the pair fits `tuple[object, str]`, so the callback's parameter
+can widen to `str`. An integer second item rules out that alternative, so the first item must retain
+its literal type.
+
+```py
+from typing import Literal
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+def pair(first: T, second: U, visit: Callable[[T, U], object]) -> tuple[tuple[T, U]]:
+    visit(first, second)
+    return ((first, second),)
+
+Result = tuple[tuple[Literal["a"] | None, object] | tuple[object, str]]
+
+def example(text: str, number: int):
+    a: Result = pair("a", text, lambda first, _: reveal_type(first))  # revealed: str
+    b: Result = pair("a", number, lambda first, _: reveal_type(first))  # revealed: Literal["a"]
+```
+
+When each alternative allows a different item to widen, the callback receives both literal types
+regardless of the order of the type variables.
+
+```py
+def pair_reversed(second: U, first: T, visit: Callable[[T, U], object]) -> tuple[tuple[T, U]]:
+    return pair(first, second, visit)
+
+Either = tuple[tuple[Literal["a"] | None, object] | tuple[object, Literal["b"] | None]]
+
+# revealed: tuple[Literal["a"], Literal["b"]]
+xy: Either = pair(first="a", second="b", visit=lambda x, y: reveal_type((x, y)))
+# revealed: tuple[Literal["a"], Literal["b"]]
+yx: Either = pair_reversed(first="a", second="b", visit=lambda x, y: reveal_type((x, y)))
+```
+
+Both alternatives allow the third item to widen to `str`, even though they disagree on which of the
+first two items can widen.
+
+```py
+V = TypeVar("V")
+
+def triple(a: T, b: U, c: V, visit: Callable[[T, U, V], object]) -> tuple[tuple[T, U, V]]:
+    visit(a, b, c)
+    return ((a, b, c),)
+
+Left = tuple[Literal["a"] | None, object, str]
+Right = tuple[object, Literal["b"] | None, str]
+
+# revealed: tuple[Literal["a"], Literal["b"], str]
+result: tuple[Left | Right] = triple("a", "b", "c", lambda a, b, c: reveal_type((a, b, c)))
+```
+
+## Related type variables in a callback's return context
+
+`Wrap` returns a list with the same element type as its argument. For a runner to accept a `Wrap`,
+the input type `X` must therefore be assignable to the output element type `Y`. Widening `"a"` to
+`str` would break that relationship when the output only accepts two literals.
+
+```py
+from collections.abc import Callable
+from typing import Literal, Protocol, TypeVar
+
+X = TypeVar("X")
+Y = TypeVar("Y")
+V = TypeVar("V")
+
+class Wrap(Protocol):
+    def __call__(self, value: V, /) -> list[V]: ...
+
+Runner = Callable[[Callable[[X], list[Y]]], None]
+
+def make_runner(value: X, output: list[Y], visit: Callable[[X], None]) -> Runner[X, Y]:
+    def run(wrap: Callable[[X], list[Y]]) -> None:
+        visit(value)
+        output.extend(wrap(value))
+
+    return run
+
+def example(output: list[Literal["a", "b"]]):
+    run: Callable[[Wrap], None] = make_runner("a", output, lambda item: output.append(item))
+```
+
+## Dictionary value context containing a bounded type variable
+
+The return annotation lets `dict.fromkeys` initialize a dictionary of `T | str` with a string. An
+arbitrary `int` is an invalid initial value because the caller can specialize `T` to a narrower
+type.
+
+```py
+from typing_extensions import TypeVar, assert_type
+
+T = TypeVar("T", bound=int)
+
+def defaults(keys: list[str]) -> dict[str, T | str]:
+    return assert_type(dict.fromkeys(keys, ""), dict[str, T | str])
+
+def int_defaults(keys: list[str], value: int) -> dict[str, T | str]:
+    return dict.fromkeys(keys, value)  # error: [invalid-explicit-return]
+```
+
+## Contextual key type for a dictionary copy
+
+The return annotation supplies `str | int` as the key type for the dictionary constructed inside
+`MappingProxyType`. Every key copied from `rows` fits that type, even when `K` is narrower.
+
+```py
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import TypeVar
+
+K = TypeVar("K", bound=str | int)
+
+def copy_proxy(rows: Mapping[K, int]) -> Mapping[str | int, int]:
+    return MappingProxyType(dict(rows.items()))
+```
+
 ## Inferring a recursive protocol from a factory's return context
 
 The annotated assignment supplies `Stream[int]` as the type argument to `make_result`. Comparing the
@@ -5346,5 +6005,86 @@ class BoundedSetter(Base):
         return None
 
     @value.setter
-    def value(self, value: I) -> None: ...  # error: [invalid-property-type-override]
+    def value(self, value: I) -> None: ...  # error: [incompatible-property-override]
+```
+
+## Recursive calls preserve captured type variables
+
+A recursive call can infer a new specialization of the function's type parameter. A nested function
+that captures that parameter still refers to the original argument's type. Comparing a generic
+callback with that captured type also leaves the original parameter unchanged.
+
+```py
+from collections.abc import Callable
+from typing import TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+def recursive(value: T) -> T:
+    def captured(other: T) -> T:
+        return other
+
+    def generic(other: U) -> U:
+        return other
+
+    def accepts(callback: Callable[[T], T]) -> None: ...
+
+    accepts(generic)  # ok
+    captured(1)  # error: [invalid-argument-type]
+    # revealed: Literal[1]
+    reveal_type(recursive(1))
+    # revealed: T@recursive
+    reveal_type(captured(value))
+    return recursive(value)  # ok
+```
+
+## Type parameter defaults referring to other parameters
+
+Defaults use the type arguments inferred for the same call, including when the argument's type is
+fixed by an enclosing generic function.
+
+```py
+from typing_extensions import TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U", default=list[T])
+V = TypeVar("V", default=tuple[U, T])
+
+def defaults(value: T) -> tuple[U, V]:
+    raise NotImplementedError
+
+def check(value: T) -> tuple[list[T], tuple[list[T], T]]:
+    result = defaults(value)
+    return result  # ok
+
+def concrete(value: int):
+    # revealed: tuple[list[int], tuple[list[int], int]]
+    reveal_type(defaults(value))
+```
+
+The default also uses the recursive call's type argument inside a recursive alias.
+
+```py
+A = TypeVar("A")
+Node = tuple[A, "Node[A] | None"]
+R = TypeVar("R", default=Node[T])
+
+def make(value: T) -> R:
+    result: Node[int] = make(1)  # ok
+    raise NotImplementedError
+```
+
+## Type arguments in annotation metadata
+
+Expressions in `Annotated` metadata can call constructors specialized with the enclosing function's
+type parameters.
+
+```py
+from typing import Annotated, TypeVar
+
+T = TypeVar("T")
+
+def metadata(value: T) -> None:
+    annotated: Annotated[int, list[T]([value])]  # ok
 ```

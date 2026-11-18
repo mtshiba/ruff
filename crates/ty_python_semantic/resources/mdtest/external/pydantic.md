@@ -77,7 +77,7 @@ Product(name="Laptop", internal_price_cent=999_00)
 Conversely, accessing a field through the alias is also not allowed:
 
 ```py
-product.price_cent  # error: [unresolved-attribute]
+product.price_cent  # error: [missing-attribute]
 ```
 
 ## Usage of ellipsis in `Field`
@@ -932,6 +932,17 @@ StrictFields(strict_int=1, strict_str="foo")
 StrictFields(strict_int="1", strict_str="foo")  # error: [invalid-argument-type]
 StrictFields(strict_int=1, strict_str=b"foo")  # error: [invalid-argument-type]
 
+type Direct = Annotated[int, Strict()]
+type Indirect = StrictInt
+
+class AliasedStrictFields(BaseModel):
+    direct: Direct
+    indirect: Indirect
+
+AliasedStrictFields(direct=1, indirect=1)  # ok
+AliasedStrictFields(direct="1", indirect=1)  # error: [invalid-argument-type]
+AliasedStrictFields(direct=1, indirect="1")  # error: [invalid-argument-type]
+
 class StrictMetadataOrder(BaseModel):
     field_then_lax: Annotated[int, Field(strict=True), Strict(False)]
     lax_then_field: Annotated[int, Strict(False), Field(strict=True)]
@@ -1499,6 +1510,46 @@ class FrozenFieldWithCustomSetattr(BaseModel):
 FrozenFieldWithCustomSetattr(value=1).value = 2  # ok
 ```
 
+## Hashability of frozen models
+
+Pydantic generates a hash for frozen models even when they define their own equality method.
+
+```py
+from collections.abc import Hashable
+from typing import Literal
+from pydantic import BaseModel
+
+def accepts_hashable(value: Hashable) -> None: ...
+
+class Frozen(BaseModel, frozen=True):
+    value: int = 0
+    __eq__ = object.__eq__
+
+class Child(Frozen):
+    __eq__ = object.__eq__
+
+accepts_hashable(Frozen())
+accepts_hashable(Child())
+Frozen.__hash__(1)  # error: [invalid-argument-type]
+```
+
+If a base defines a custom hash, Pydantic leaves it alone. A subclass can then inherit that hash or
+disable it by defining `__eq__`.
+
+```py
+class Custom(BaseModel):
+    def __hash__(self) -> Literal[7]:
+        return 7
+
+class Inherited(Custom, frozen=True): ...
+
+class Disabled(Custom, frozen=True):
+    __eq__ = object.__eq__
+
+reveal_type(Inherited().__hash__())  # revealed: Literal[7]
+accepts_hashable(Disabled())  # error: [invalid-argument-type]
+```
+
 ## Frozen models and protocols
 
 Frozen models cannot satisfy a protocol that requires a writable field, but can satisfy one that
@@ -1941,7 +1992,7 @@ class Parent(BaseModel):
     name: str
 
 class Child(Parent):
-    params: ClassVar[int] = 1  # error: [invalid-attribute-override]
+    params: ClassVar[int] = 1  # error: [incompatible-attribute-override]
 
 reveal_type(Child.__init__)  # revealed: (self: Child, *, name: LaxStr, **extra: Any) -> None
 Child(name="child")  # ok
@@ -1963,7 +2014,7 @@ A `ClassVar` declaration without a value also excludes the inherited field.
 
 ```py
 class AnnotationOnly(Parent):
-    params: ClassVar[int]  # error: [invalid-attribute-override]
+    params: ClassVar[int]  # error: [incompatible-attribute-override]
 
 reveal_type(AnnotationOnly.__init__)  # revealed: (self: AnnotationOnly, *, name: LaxStr, **extra: Any) -> None
 AnnotationOnly(name="child")  # ok
@@ -1981,7 +2032,7 @@ class Parent:
     params: int
 
 class Child(BaseModel, Parent):
-    params: ClassVar[int] = 1  # error: [invalid-attribute-override]
+    params: ClassVar[int] = 1  # error: [incompatible-attribute-override]
 
 reveal_type(Child.__init__)  # revealed: (self: Child, **extra: Any) -> None
 child = Child()  # ok
@@ -1992,7 +2043,7 @@ The overriding `ClassVar` can itself be inherited from an ordinary class.
 
 ```py
 class Mixin(Parent):
-    params: ClassVar[int] = 1  # error: [invalid-attribute-override]
+    params: ClassVar[int] = 1  # error: [incompatible-attribute-override]
 
 class Model(BaseModel, Mixin):
     pass
@@ -2024,9 +2075,9 @@ RequiredAfterDefault(required=1)
 Pydantic models do not expose some of the special attributes of dataclasses:
 
 ```py
-RequiredAfterDefault.__dataclass_fields__  # error: [unresolved-attribute]
-RequiredAfterDefault.__dataclass_params__  # error: [unresolved-attribute]
-RequiredAfterDefault.__match_args__  # error: [unresolved-attribute]
+RequiredAfterDefault.__dataclass_fields__  # error: [missing-attribute]
+RequiredAfterDefault.__dataclass_params__  # error: [missing-attribute]
+RequiredAfterDefault.__match_args__  # error: [missing-attribute]
 ```
 
 They do, however, expose various Pydantic-specific fields (inherited from `BaseModel`), for example:
