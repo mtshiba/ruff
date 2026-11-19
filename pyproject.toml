@@ -376,11 +376,15 @@ combine-as-imports = true
 "crates/ty_vendored/ty_extensions/*.pyi" = "py312"
 "scripts/*.py" = "py312"
 
+[tool.ty.project-manager]
+script = "uv"
+
 [[tool.ty.overrides]]
 include = [
     "scripts/*.py",
     "crates/ruff_python_ast/generate.py",
     "crates/ty_python_semantic/mdtest.py",
+    "python/py-fuzzer/prepare_corpus.py",
 ]
 
 [tool.ty.overrides.analysis]
