@@ -5,12 +5,11 @@ use smallvec::SmallVec;
 use strum::IntoEnumIterator;
 
 use super::{ArgumentsIter, TypeInferenceBuilder};
-use crate::TypeQualifiers;
 use crate::types::call::CallError;
 use crate::types::class::{ClassLiteral, DynamicTypedDictAnchor, DynamicTypedDictLiteral};
 use crate::types::diagnostic::{
-    INVALID_ARGUMENT_TYPE, INVALID_TYPE_FORM, MISSING_ARGUMENT, TOO_MANY_POSITIONAL_ARGUMENTS,
-    UNKNOWN_ARGUMENT, report_mismatched_type_name,
+    INVALID_ARGUMENT_TYPE, INVALID_TYPE_FORM, MISMATCHED_TYPEDDICT_NAME, MISSING_ARGUMENT,
+    TOO_MANY_POSITIONAL_ARGUMENTS, UNKNOWN_ARGUMENT, report_mismatched_type_name,
 };
 use crate::types::special_form::TypeQualifier;
 use crate::types::typed_dict::{
@@ -23,7 +22,48 @@ use crate::types::{
     ClassType, DeclaredType, IntersectionType, KnownClass, Type, TypeContext, TypedDictType,
     TypingModule, any_over_type,
 };
+use crate::{Db, TypeQualifiers};
 use ty_python_core::definition::Definition;
+
+/// Skips union members whose required fields already rule out the literal, before inferring
+/// its values in each member's type context.
+pub(super) fn literal_candidates<'db>(
+    db: &'db dyn Db,
+    dict: &ast::ExprDict,
+    candidates: Vec<TypedDictType<'db>>,
+) -> impl Iterator<Item = TypedDictType<'db>> {
+    // The last value for each key wins. An unpack or a computed key could supply any required
+    // field or overwrite its value, so fall back to full inference for those literals.
+    let fields = dict
+        .iter()
+        .map(|item| {
+            let key = item.key.as_ref()?.as_string_literal_expr()?;
+            Some((key.value.to_str(), &item.value))
+        })
+        .collect::<Option<FxHashMap<_, _>>>();
+
+    candidates.into_iter().filter(move |candidate| {
+        let Some(fields) = &fields else {
+            return true;
+        };
+        candidate
+            .items(db)
+            .iter()
+            .filter(|(_, field)| field.is_required())
+            .all(|(name, field)| {
+                let Some(value) = fields.get(name.as_str()) else {
+                    return false;
+                };
+                match (
+                    field.declared_ty.as_string_literal(),
+                    value.as_string_literal_expr(),
+                ) {
+                    (Some(tag), Some(literal)) => tag.value(db) == literal.value.to_str(),
+                    _ => true,
+                }
+            })
+    })
+}
 
 /// The shape of a `TypedDict` constructor call that affects how we prepare it for inference.
 #[derive(Debug, Clone, Copy)]
@@ -266,11 +306,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
 
         let name = name_type
-            .as_string_literal()
+            .resolve_string_literal(db)
             .map(|literal| literal.value(db));
 
-        if name.is_none()
-            && !name_type.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env))
+        let valid_name_type = name.is_some()
+            || name_type.is_assignable_to(db, env, KnownClass::Str.to_instance(db, env));
+
+        if !valid_name_type
             && let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, name_arg)
         {
             let mut diagnostic = builder.into_diagnostic(format_args!(
@@ -280,12 +322,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 "Expected `str`, found `{}`",
                 name_type.display(db, env)
             ));
-        } else if let Some(definition) = definition
+        }
+
+        if valid_name_type
+            && let Some(definition) = definition
             && let Some(assigned_name) = definition.name(db)
             && Some(assigned_name.as_str()) != name
         {
             report_mismatched_type_name(
                 &self.context,
+                &MISMATCHED_TYPEDDICT_NAME,
                 name_arg,
                 "TypedDict",
                 &assigned_name,
