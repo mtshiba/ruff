@@ -7,6 +7,7 @@ use crate::lint::{LintSource, RuleSelection};
 use crate::place::symbol;
 use crate::place::{ConsideredDefinitions, Place, PlaceAndQualifiers};
 use crate::types::{KnownClass, KnownInstanceType, TypeAndQualifiers, check_types};
+use ruff_db::Db as _;
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::system::DbWithWritableSystem as _;
@@ -1157,6 +1158,32 @@ fn first_public_binding<'db>(db: &'db TestDb, file: File, name: &str) -> Definit
 }
 
 #[test]
+fn star_import_infers_unused_bindings_on_demand() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_files([
+        ("/src/main.py", "from dependency import *"),
+        ("/src/dependency.py", "value: int = 1"),
+    ])?;
+
+    let main = system_path_to_file(&db, "/src/main.py")?;
+    db.clear_salsa_events();
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    let check_events = db.take_salsa_events();
+
+    let ty = global_symbol(&db, main, "value").place.expect_type();
+    assert_eq!(
+        ty.display(&db, &db.program_environment()).to_string(),
+        "int"
+    );
+    let lookup_events = db.take_salsa_events();
+
+    let binding = first_public_binding(&db, main, "value");
+    assert_function_query_was_not_run(&db, infer_definition_types, binding, &check_events);
+    assert_function_query_was_run(&db, infer_definition_types, binding, &lookup_events);
+    Ok(())
+}
+
+#[test]
 fn changing_a_name_use_keeps_an_imported_declaration_cached() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_files([
@@ -1821,6 +1848,41 @@ fn dependency_implicit_alias_definition() -> anyhow::Result<()> {
             assert_function_query_was_not_run(&db, infer_definition_types, definition, &events);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn statement_call_index_survives_unrelated_revisions() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    // Project files have LOW durability, unlike setup_db's search paths.
+    db.files().try_add_root(
+        &db,
+        ruff_db::system::SystemPath::new("/src/project"),
+        ruff_db::files::FileRootKind::Project,
+    );
+    let source = "def run(callback):\n    callback()\n";
+    db.write_file("/src/project/target.py", source)?;
+    let file = system_path_to_file(&db, "/src/project/target.py")?;
+    semantic_index(&db, program_file(&db, file));
+
+    db.synthetic_write(salsa::Durability::LOW);
+    db.clear_salsa_events();
+    semantic_index(&db, program_file(&db, file));
+    let events = db.take_salsa_events();
+    assert_function_query_was_not_run(&db, semantic_index, program_file(&db, file), &events);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.kind,
+            salsa::EventKind::DidValidateInternedValue { key, .. }
+                if db.ingredient_debug_name(key.ingredient_index()) == "CallableAndCallExpr"
+        )),
+        "validating the semantic index depended on an interned call key"
+    );
+
+    db.write_file("/src/project/target.py", format!("{source}changed = 1\n"))?;
+    semantic_index(&db, program_file(&db, file));
+    let events = db.take_salsa_events();
+    assert_function_query_was_run(&db, semantic_index, program_file(&db, file), &events);
     Ok(())
 }
 

@@ -2116,6 +2116,17 @@ fn benchmark_literal_match_fallthrough(criterion: &mut Criterion) {
     );
 }
 
+/// Each failed case adds another literal exclusion to the type of `opcode`.
+fn benchmark_int_match_fallthrough(criterion: &mut Criterion) {
+    let mut code = String::from("def decode(opcode: int) -> int:\n    match opcode:\n");
+    for opcode in 0..128 {
+        writeln!(code, "        case {opcode}: return {opcode}").unwrap();
+    }
+    code.push_str("    return opcode\n");
+
+    benchmark_micro_case(criterion, "ty_micro[int_match_fallthrough]", &code);
+}
+
 /// Benchmarks guarded `match` fallthrough over a gradual literal subject.
 ///
 /// This generates a large version of this Python shape:
@@ -2721,6 +2732,25 @@ fn benchmark_repeated_statement_calls(criterion: &mut Criterion) {
     }
 }
 
+/// Each call adds a reachability constraint for the next statement. Passing an extra argument
+/// forces a diagnostic at every call, so scanning all ranges for each diagnostic is quadratic.
+fn benchmark_diagnostic_range_reachability(criterion: &mut Criterion) {
+    const CALLS: usize = 4_000;
+    let code = format!(
+        "def f(value: str) -> None:\n{}",
+        "    value.upper(0)\n".repeat(CALLS)
+    );
+
+    setup_rayon();
+    criterion.bench_function("ty_micro[diagnostic_range_reachability]", |b| {
+        b.iter_batched_ref(
+            || setup_micro_case(&code),
+            |case| assert_eq!(case.db.check().len(), CALLS),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 /// Exercises repeated control-flow gates with and without interleaved statement-call predicates.
 ///
 /// Each suppressing context manager merges the old binding with a reassigned binding. Repeating
@@ -3022,6 +3052,7 @@ criterion_group!(
     benchmark_class_or_pattern_captures,
     benchmark_large_isinstance_narrowing,
     benchmark_literal_match_fallthrough,
+    benchmark_int_match_fallthrough,
     benchmark_literal_match_fallthrough_guarded_any,
     benchmark_literal_equality_fallthrough_guarded_any,
     benchmark_enum_union_equality,
@@ -3037,6 +3068,7 @@ criterion_group!(
     benchmark_nested_mapping_pattern_exhaustiveness,
     benchmark_typeis_narrowing,
     benchmark_repeated_statement_calls,
+    benchmark_diagnostic_range_reachability,
     benchmark_repeated_suppressing_context_managers,
     benchmark_repeated_narrowed_assignments,
 );

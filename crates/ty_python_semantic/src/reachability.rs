@@ -282,7 +282,7 @@ pub(crate) fn type_narrowed_by_previous_patterns<'db>(
 /// pattern capture. Inferring it within the query lets Salsa recognize and normalize that cycle.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, id, _, _| Type::divergent(id),
+    cycle_initial = |_, id, _, _, _| Type::divergent(id),
     cycle_fn = |db: &'db dyn Db, cycle, previous: &Type<'db>, result: Type<'db>, predicate: PatternPredicate<'db>, _| {
         let env = ProgramEnvironment::from_scope(predicate.subject(db).scope(db));
         result.cycle_normalized(db, &env, *previous, cycle)
@@ -524,7 +524,7 @@ fn analyze_enum_literal_union_pattern_predicate<'db>(
 /// With memoization, each pattern is analyzed exactly once.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _| Truthiness::Ambiguous,
+    cycle_initial = |_, _, _, _| Truthiness::Ambiguous,
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn analyze_pattern_predicate<'db>(db: &'db dyn Db, predicate: PatternPredicate<'db>) -> Truthiness {
@@ -607,7 +607,7 @@ fn predicate_scope<'db>(db: &'db dyn Db, predicate: &Predicate<'db>) -> ScopeId<
         PredicateNode::OrPatternAlternative(scope) => scope,
         PredicateNode::SubjectElementPattern(subject_element) => subject_element.pattern.scope(db),
         PredicateNode::IsNonEmptyIterable(expression) => expression.scope(db),
-        PredicateNode::StarImportPlaceholder(star_import) => star_import.scope(db),
+        PredicateNode::StarImportPlaceholder(star_import) => star_import.import.scope(db),
     }
 }
 
@@ -717,7 +717,7 @@ fn analyze_non_terminal_calls<'db>(
 /// reachability is evaluated directly by the decision-diagram walk.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _, _, _| (),
+    cycle_initial = |_, _, _, _, _, _| (),
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn analyze_non_terminal_call_range<'db>(
@@ -789,7 +789,7 @@ fn evaluate_reachability_constraint<'db>(
 /// every constraint.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _, _| Truthiness::Ambiguous,
+    cycle_initial = |_, _, _, _, _| Truthiness::Ambiguous,
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn evaluate_finally_continuation<'db>(
@@ -960,7 +960,7 @@ fn evaluate_reachability_path<'db>(
 /// both cold evaluation and Salsa validation after an edit.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _, _, _| ReachabilitySegment::Complete(Truthiness::Ambiguous),
+    cycle_initial = |_, _, _, _, _, _| ReachabilitySegment::Complete(Truthiness::Ambiguous),
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn evaluate_reachability_checkpoint<'db>(
@@ -1153,7 +1153,7 @@ impl<'db> ProjectedNarrowingCheckpoint<'db> {
 /// when simplifying a join requires their predicates.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, id, _, _, _, _| ProjectedNarrowingCheckpoint::Narrowed(Type::divergent(id)),
+    cycle_initial = |_, id, _, _, _, _, _| ProjectedNarrowingCheckpoint::Narrowed(Type::divergent(id)),
     cycle_fn = |db: &'db dyn Db, cycle, previous: &ProjectedNarrowingCheckpoint<'db>, result: ProjectedNarrowingCheckpoint<'db>, scope: ScopeId<'db>, _, _, base_ty| {
         match result {
             ProjectedNarrowingCheckpoint::Narrowed(ty) => ProjectedNarrowingCheckpoint::Narrowed(
@@ -1920,7 +1920,7 @@ fn analyze_single_pattern_predicate_kind<'db>(
 /// dependency cannot make subsequent code unreachable.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _| Truthiness::AlwaysTrue,
+    cycle_initial = |_, _, _, _| Truthiness::AlwaysTrue,
     cycle_fn = |_, cycle: &salsa::Cycle, previous: &Truthiness, result: Truthiness, _| {
         // A call can determine whether its own target is reachable, as with `sys.exit()` before
         // `import sys` in a loop. Expression inference can lose its previous result when it stops
@@ -2006,7 +2006,7 @@ fn analyze_non_empty_iterable(db: &dyn Db, iterable: Expression) -> Truthiness {
 /// Separate sync and async queries use the expression directly as their Salsa key.
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _| false,
+    cycle_initial = |_, _, _, _| false,
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn sync_context_manager_suppresses<'db>(db: &'db dyn Db, expression: Expression<'db>) -> bool {
@@ -2015,7 +2015,7 @@ fn sync_context_manager_suppresses<'db>(db: &'db dyn Db, expression: Expression<
 
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _| false,
+    cycle_initial = |_, _, _, _| false,
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn async_context_manager_suppresses<'db>(db: &'db dyn Db, expression: Expression<'db>) -> bool {
@@ -2075,9 +2075,9 @@ fn analyze_single(db: &dyn Db, env: &ProgramEnvironment<'_>, predicate: &Predica
             analyze_non_empty_iterable(db, iterable).negate_if(!predicate.is_positive)
         }
         PredicateNode::StarImportPlaceholder(star_import) => {
-            let place_table = place_table(db, star_import.scope(db));
-            let symbol = place_table.symbol(star_import.symbol_id(db));
-            let program_file = star_import.referenced_file(db);
+            let place_table = place_table(db, star_import.import.scope(db));
+            let symbol = place_table.symbol(star_import.symbol_id);
+            let program_file = star_import.import.referenced_file(db);
             let requires_explicit_reexport = match dunder_all_names(db, program_file) {
                 Some(all_names) => {
                     if all_names.contains(symbol.name()) {
@@ -2127,11 +2127,9 @@ pub(crate) fn is_range_reachable<'db>(
 ) -> bool {
     index.ancestor_scopes(scope_id).all(|(scope_id, _)| {
         let use_def = index.use_def_map(scope_id);
-        !use_def
-            .range_reachability()
-            .any(|(entry_range, constraint)| {
-                entry_range.contains_range(range) && !is_reachable(db, use_def, constraint)
-            })
+        use_def
+            .reachability_constraints_for(range)
+            .all(|constraint| is_reachable(db, use_def, constraint))
     })
 }
 

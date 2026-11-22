@@ -58,48 +58,21 @@ use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
-/// Extract `(core, guard)` from truthiness-guarded intersections.
-///
-/// e.g.
-/// - `A & ~AlwaysTruthy` -> `Some((A, ~AlwaysTruthy))`
-/// - `A & ~AlwaysFalsy` -> `Some((A, ~AlwaysFalsy))`
-/// - `A` -> `None`
-/// - `A & ~AlwaysTruthy & ~AlwaysFalsy` -> `None` (not a single-guard shape)
-///
-/// This only recognizes the "single truthiness guard" forms used by truthiness narrowing.
-fn split_truthiness_guarded_intersection<'db>(
-    db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
-    ty: Type<'db>,
-) -> Option<(Type<'db>, Type<'db>)> {
+/// The truthiness excluded by a single guard, e.g. `AlwaysFalsy` in `A & ~AlwaysFalsy`.
+/// Intersections that exclude both truthy and falsy values have no single guard.
+fn excluded_truthiness<'db>(db: &'db dyn Db, ty: Type<'db>) -> Option<Type<'db>> {
     let Type::Intersection(intersection) = ty else {
         return None;
     };
-    let falsy = Type::AlwaysTruthy.negate(db, env);
-    let truthy = Type::AlwaysFalsy.negate(db, env);
-
     let negative = intersection.negative(db);
-    let has_not_truthy = negative.contains(&Type::AlwaysTruthy);
-    let has_not_falsy = negative.contains(&Type::AlwaysFalsy);
-    let guard = match (has_not_truthy, has_not_falsy) {
-        (true, false) => falsy,
-        (false, true) => truthy,
-        _ => return None,
-    };
-
-    let mut core = IntersectionBuilder::new(db, env);
-    for positive in intersection.positive(db) {
-        core.add_positive_in_place(*positive);
+    match (
+        negative.contains(&Type::AlwaysTruthy),
+        negative.contains(&Type::AlwaysFalsy),
+    ) {
+        (true, false) => Some(Type::AlwaysTruthy),
+        (false, true) => Some(Type::AlwaysFalsy),
+        _ => None,
     }
-    for negative in negative {
-        if (guard == falsy && *negative == Type::AlwaysTruthy)
-            || (guard == truthy && *negative == Type::AlwaysFalsy)
-        {
-            continue;
-        }
-        core.add_negative_in_place(*negative);
-    }
-    Some((core.build(), guard))
 }
 
 /// Try to merge a complementary guarded pair into an unguarded core.
@@ -122,24 +95,46 @@ fn merge_truthiness_guarded_pair<'db>(
     left: Type<'db>,
     right: Type<'db>,
 ) -> Option<Type<'db>> {
-    let (left_core, left_guard) = split_truthiness_guarded_intersection(db, env, left)?;
-    let (right_core, right_guard) = split_truthiness_guarded_intersection(db, env, right)?;
-    if left_guard == right_guard {
+    let left_excluded = excluded_truthiness(db, left)?;
+    let right_excluded = excluded_truthiness(db, right)?;
+    if left_excluded == right_excluded {
         return None;
     }
 
+    let left_core = remove_covered_exclusions(db, env, left, |ty| ty == left_excluded)?;
+    let right_core = remove_covered_exclusions(db, env, right, |ty| ty == right_excluded)?;
     if left_core.is_equivalent_to(db, env, right_core) {
         return Some(left_core);
     }
 
     let candidate = UnionType::from_elements(db, env, [left_core, right_core]);
-    let left_reconstructed = IntersectionType::from_two_elements(db, env, candidate, left_guard);
-    let right_reconstructed = IntersectionType::from_two_elements(db, env, candidate, right_guard);
+    let left_reconstructed =
+        IntersectionType::from_two_elements(db, env, candidate, left_excluded.negate(db, env));
+    let right_reconstructed =
+        IntersectionType::from_two_elements(db, env, candidate, right_excluded.negate(db, env));
     if left_reconstructed == left && right_reconstructed == right {
         Some(candidate)
     } else {
         None
     }
+}
+
+/// Whether the first positive element of `target` requires a class that `source` cannot supply.
+///
+/// When all the positives are nominal, at least one source class must supply each
+/// target bound. Look at just one target bound to keep this check linear.
+fn has_unrelated_nominal_bound<'db>(
+    db: &'db dyn Db,
+    source: IntersectionType<'db>,
+    target: IntersectionType<'db>,
+) -> bool {
+    let Some(Type::NominalInstance(bound)) = target.iter_positive(db).next() else {
+        return false;
+    };
+    source.positive_elements_or_object(db).all(|ty| {
+        ty.as_nominal_instance()
+            .is_some_and(|instance| bound.has_unrelated_class(db, instance))
+    })
 }
 
 /// Fold `(T & ~A) | (T & ~B)` to `T` when `A` and `B` are disjoint.
@@ -1163,8 +1158,11 @@ impl<'db> UnionBuilder<'db> {
     /// A `false` result leaves the decision to the general relation checks.
     ///
     /// Distinct class and module literals identify different objects. Applying the same truthiness
-    /// guard to two class literals preserves that distinction. Methods bound to distinct
-    /// singleton literals also remain distinct because `__self__` exposes their captured receiver:
+    /// guard to two class literals preserves that distinction.
+    ///
+    /// Bound methods expose the underlying function as `__func__`, so distinct function
+    /// literals keep their methods distinct even when the signatures are identical. Similarly,
+    /// `__self__` distinguishes methods bound to different singleton literals:
     ///
     /// ```python
     /// from typing import Literal, LiteralString, reveal_type
@@ -1187,6 +1185,14 @@ impl<'db> UnionBuilder<'db> {
         match (left, right) {
             (Type::ClassLiteral(_), Type::ClassLiteral(_))
             | (Type::ModuleLiteral(_), Type::ModuleLiteral(_)) => true,
+            // Distributing `Any & Literal["a", "b"]` produces one intersection per
+            // value. Each intersection is still bounded by its literal.
+            (Type::Intersection(left), Type::Intersection(right))
+                if let Some(left) = left.gradual_literal(db)
+                    && let Some(right) = right.gradual_literal(db) =>
+            {
+                left.is_disjoint_from(db, right)
+            }
             (Type::Intersection(left), Type::Intersection(right)) => {
                 let class_guard = |ty: IntersectionType<'db>| {
                     let Ok(Type::ClassLiteral(_)) = ty.iter_positive(db).exactly_one() else {
@@ -1202,6 +1208,11 @@ impl<'db> UnionBuilder<'db> {
             (Type::Dynamic(_), Type::NominalInstance(instance))
             | (Type::NominalInstance(instance), Type::Dynamic(_))
                 if !instance.is_object() =>
+            {
+                true
+            }
+            (Type::BoundMethod(left), Type::BoundMethod(right))
+                if left.has_distinct_function(db, right) =>
             {
                 true
             }
@@ -1340,6 +1351,19 @@ impl<'db> UnionBuilder<'db> {
                 if let (Type::NominalInstance(left), Type::NominalInstance(right)) =
                     (ty, element_type)
                     && left.has_unrelated_class(db, right)
+                {
+                    continue;
+                }
+
+                // Narrowing a union of classes can add the same exclusions to every
+                // alternative. Neither side can restore a shared exclusion. If each
+                // also requires a nominal bound the other lacks, neither subsumes the
+                // other and together they cannot cover `object`.
+                if let (Type::Intersection(left), Type::Intersection(right)) = (ty, element_type)
+                    && left.negative(db) == right.negative(db)
+                    && left.iter_negative(db).all(Type::is_nominal_instance)
+                    && has_unrelated_nominal_bound(db, left, right)
+                    && has_unrelated_nominal_bound(db, right, left)
                 {
                     continue;
                 }
@@ -1784,8 +1808,28 @@ impl<'db> IntersectionBuilder<'db> {
                 for pos in other.positive(db) {
                     self.add_positive_impl::<L>(*pos, seen_aliases)?;
                 }
-                for neg in other.negative(db) {
-                    self.add_negative_impl::<L>(*neg, seen_aliases)?;
+                let negatives = other.negative(db);
+                if let [inner] = &mut self.intersections[..]
+                    && inner.can_use_set_membership(negatives)
+                {
+                    if inner.can_copy_literal_exclusions(db, &self.env, negatives) {
+                        inner.negative = negatives.clone();
+                        return ControlFlow::Continue(());
+                    }
+                    // Distinct built-in literal exclusions never simplify each other. With
+                    // matching flags, set membership also detects equal literal values.
+                    for neg in negatives {
+                        inner.add_negative_impl(
+                            db,
+                            &self.env,
+                            *neg,
+                            ExclusionComparison::SetMembership,
+                        );
+                    }
+                } else {
+                    for neg in negatives {
+                        self.add_negative_impl::<L>(*neg, seen_aliases)?;
+                    }
                 }
             }
             Type::EnumComplement(complement) => {
@@ -1938,6 +1982,14 @@ impl<'db> IntersectionBuilder<'db> {
     }
 }
 
+/// How to compare an incoming exclusion with the existing exclusions.
+#[derive(Copy, Clone)]
+enum ExclusionComparison {
+    Pairwise,
+    /// Exact duplicates are redundant, and distinct exclusions cannot simplify each other.
+    SetMembership,
+}
+
 /// The signs of a pair of intersection elements. For `Mixed`, the first is positive.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 enum IntersectionPolarity {
@@ -1965,20 +2017,8 @@ fn simplify_intersection_pair<'db>(
     // Built-in literal values have no inference dependencies, so these simplifications cannot
     // participate in a cycle and do not need an interned pair or a tracked relation query.
     if let (Type::LiteralValue(first), Type::LiteralValue(second)) = (first, second)
-        && matches!(
-            first.kind(),
-            LiteralValueTypeKind::Int(_)
-                | LiteralValueTypeKind::Bool(_)
-                | LiteralValueTypeKind::String(_)
-                | LiteralValueTypeKind::Bytes(_)
-        )
-        && matches!(
-            second.kind(),
-            LiteralValueTypeKind::Int(_)
-                | LiteralValueTypeKind::Bool(_)
-                | LiteralValueTypeKind::String(_)
-                | LiteralValueTypeKind::Bytes(_)
-        )
+        && first.is_concrete_builtin()
+        && second.is_concrete_builtin()
     {
         return match (polarity, first.kind() == second.kind()) {
             (IntersectionPolarity::Positive, true) => {
@@ -2082,6 +2122,22 @@ struct InnerIntersectionBuilder<'db> {
 }
 
 impl<'db> InnerIntersectionBuilder<'db> {
+    /// Whether set membership can replace pairwise simplification for these exclusions.
+    fn can_use_set_membership(&self, incoming: &NegativeIntersectionElements<'db>) -> bool {
+        // Only scan the existing set if we can reuse the result across multiple insertions.
+        if incoming.len() <= 1 {
+            return false;
+        }
+        let Some(Type::LiteralValue(first)) = incoming.iter().next() else {
+            return false;
+        };
+        self.negative.iter().chain(incoming).all(|ty| {
+            ty.as_literal_value().is_some_and(|literal| {
+                literal.is_concrete_builtin() && literal.has_same_flags(*first)
+            })
+        })
+    }
+
     fn contains_never(&self) -> bool {
         self.positive.contains(&Type::Never)
     }
@@ -2435,12 +2491,60 @@ impl<'db> InnerIntersectionBuilder<'db> {
         }
     }
 
+    /// Whether all the distinct built-in literals in `exclusions` would survive insertion.
+    ///
+    /// A nominal instance overlaps a built-in literal if the literal's class is a subclass of
+    /// the instance's class. Consecutive literals of the same class need only one such check.
+    /// Excluding a boolean from `bool` can also narrow it to the opposite literal.
+    fn can_copy_literal_exclusions(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        exclusions: &NegativeIntersectionElements<'db>,
+    ) -> bool {
+        if !self.negative.is_empty() {
+            return false;
+        }
+        let mut positives = self.positive.iter();
+        let Some(positive) = positives.next() else {
+            return true;
+        };
+        let Type::NominalInstance(instance) = positive else {
+            return false;
+        };
+        if positives.next().is_some() || instance.has_known_class(db, KnownClass::Bool) {
+            return false;
+        }
+
+        let class = instance.class(db, env);
+        exclusions
+            .iter()
+            .map(|ty| {
+                ty.as_literal_value_kind()
+                    .and_then(LiteralValueTypeKind::known_class)
+            })
+            .dedup()
+            .all(|excluded| {
+                excluded.is_some_and(|excluded| excluded.is_subclass_of(db, env, class))
+            })
+    }
+
     /// Adds a negative type to this intersection.
     fn add_negative(
         &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         new_negative: Type<'db>,
+    ) {
+        self.add_negative_impl(db, env, new_negative, ExclusionComparison::Pairwise);
+    }
+
+    fn add_negative_impl(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        new_negative: Type<'db>,
+        comparison: ExclusionComparison,
     ) {
         // `Never & ~T` -> `Never`.
         if self.positive.contains(&Type::Never) {
@@ -2517,7 +2621,16 @@ impl<'db> InnerIntersectionBuilder<'db> {
             _ => {
                 let new_negative_enum = new_negative.resolve_type_alias(db).as_enum_literal();
                 let mut to_remove = SmallVec::<[usize; 1]>::new();
-                for (index, existing_negative) in self.negative.iter().enumerate() {
+                let negatives = match comparison {
+                    ExclusionComparison::Pairwise => &self.negative,
+                    ExclusionComparison::SetMembership => {
+                        if self.negative.contains(&new_negative) {
+                            return;
+                        }
+                        &NegativeIntersectionElements::Empty
+                    }
+                };
+                for (index, existing_negative) in negatives.iter().enumerate() {
                     if let Some(new_enum) = new_negative_enum
                         && existing_negative
                             .resolve_type_alias(db)
