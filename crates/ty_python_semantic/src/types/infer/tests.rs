@@ -1566,6 +1566,53 @@ fn parameter_default_presence_invalidates_caller() -> anyhow::Result<()> {
 }
 
 #[test]
+fn inherited_writes_follow_changes_to_frozen_bases() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    let path = "/src/main.py";
+    db.write_file(
+        path,
+        "\
+from base import Base
+
+class Child[T](Base[T]): ...
+
+def update(a: Child[int], b: Child[str]):
+    a.value = 42
+    del b.value
+",
+    )?;
+
+    for frozen in [false, true, false] {
+        let flag = if frozen { "True" } else { "False" };
+        db.write_file(
+            "/src/base.py",
+            format!(
+                "\
+from dataclasses import dataclass
+
+@dataclass(frozen={flag})
+class Base[T]:
+    value: T
+"
+            ),
+        )?;
+        if frozen {
+            assert_file_diagnostics(
+                &db,
+                path,
+                &[
+                    "Property `value` defined in `Child[int]` is read-only",
+                    "Cannot delete attribute `value` on type `Child[str]` whose `__delattr__` method returns `Never`/`NoReturn`",
+                ],
+            );
+        } else {
+            assert_file_diagnostics(&db, path, &[]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn dynamic_class_metaclass_updates_after_base_change() -> anyhow::Result<()> {
     let mut db = setup_db();
     let base = "\
@@ -1596,6 +1643,30 @@ reveal_type(type(C))
 
     db.write_file("/src/base.py", base)?;
     assert_revealed_type(&db, "/src/main.py", "<class 'Meta1'>");
+    Ok(())
+}
+
+#[test]
+fn iteration_follows_changes_to_the_iterator() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_file(
+        "/src/main.py",
+        "\
+from typing_extensions import reveal_type
+from source import Items
+
+def use(items: Items):
+    for item in items:
+        reveal_type(item)
+",
+    )?;
+    for element in ["int", "str", "int"] {
+        db.write_file(
+            "/src/source.pyi",
+            format!("class Items:\n    def __iter__(self) -> Items: ...\n    def __next__(self) -> {element}: ..."),
+        )?;
+        assert_revealed_type(&db, "/src/main.py", element);
+    }
     Ok(())
 }
 
@@ -1691,6 +1762,28 @@ fn recursive_protocol_materialization_tracks_member_type_changes() -> anyhow::Re
         assert_file_diagnostics(&db, "/src/main.py", diagnostics);
     }
 
+    Ok(())
+}
+
+#[test]
+fn abstract_methods_track_changes_to_identity_decorators() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    let module = "/src/main.py";
+    db.write_file(
+        module,
+        "from decorate import decorate\nclass Base:\n    @decorate\n    def method(self) -> int: return 1\nBase()",
+    )?;
+    let decorator = "/src/decorate.py";
+    let identity = "from typing import Callable, TypeVar\nF = TypeVar('F', bound=Callable)\ndef decorate(f: F) -> F: return f";
+
+    db.write_file(decorator, identity)?;
+    assert_file_diagnostics(&db, module, &[]);
+
+    db.write_file(decorator, "from abc import abstractmethod as decorate")?;
+    assert_file_diagnostics(&db, module, &["Cannot instantiate abstract class `Base`"]);
+
+    db.write_file(decorator, identity)?;
+    assert_file_diagnostics(&db, module, &[]);
     Ok(())
 }
 

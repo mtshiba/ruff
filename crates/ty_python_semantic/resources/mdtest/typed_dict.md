@@ -2457,6 +2457,29 @@ static_assert(is_assignable_to(Person1, Person2))
 static_assert(is_equivalent_to(Person1, Person2))
 ```
 
+`Tree` lacks the `name` field required by both `Other` and `NamedNode`. When checking the child
+field of `NamedNode`, ty reuses the failure against `Other` and provisionally accepts `Tree` as a
+`NamedNode` to break the cycle. Caching that union result would incorrectly make `Tree` assignable
+to `Parent`.
+
+```py
+from typing_extensions import ReadOnly
+
+class Tree(TypedDict):
+    child: "Tree | None"
+
+class Other(TypedDict):
+    name: int
+
+class Parent(TypedDict):
+    child: ReadOnly["Other | NamedNode | None"]
+
+class NamedNode(Parent):
+    name: str
+
+static_assert(not is_assignable_to(Tree, Other | NamedNode | Parent))
+```
+
 ## Recursively-specialized generic `TypedDict`s
 
 ```toml
@@ -3162,6 +3185,34 @@ def _(payload: Payload) -> None:
 def _(payload: Payload | Payload2) -> None:
     reveal_type(payload.get("resolved", {}))  # revealed: ResolvedData
     takes_resolved(payload.get("resolved", {}))
+```
+
+Nested calls can infer different defaults even when the overloads for different keys share a
+synthetic type variable.
+
+```py
+from typing import TypedDict
+from typing_extensions import assert_type
+
+class Record(TypedDict, total=False):
+    name: str
+    count: int
+
+def _(record: Record, backup: bytes) -> None:
+    assert_type(record.get("count", record.get("name", backup)), int | str | bytes)
+```
+
+The overload for a later key can give the default a different type context.
+
+```py
+from typing_extensions import NotRequired, TypeForm, TypedDict
+
+class Fields(TypedDict):
+    text: str
+    form: NotRequired[TypeForm[int]]
+
+def _(data: Fields):
+    value: TypeForm[int] = data.get("form", 1)  # error: [invalid-type-form]
 ```
 
 With a gradual default, the specialized known-key overload and generic default overload both match,

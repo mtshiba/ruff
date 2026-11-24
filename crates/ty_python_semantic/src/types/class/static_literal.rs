@@ -21,13 +21,13 @@ use crate::{
     },
     reachability::{DeclarationsIteratorExtension, ReachabilityConstraintsExtension},
     types::{
-        ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, CallArguments,
-        CallableType, ClassBase, ClassLiteral, ClassType, DATACLASS_FLAGS, DataclassFlags,
-        DataclassParams, GenericAlias, GenericContext, KnownClass, KnownInstanceType,
-        MaterializationKind, MemberLookupPolicy, MetaclassCandidate, MetaclassTransformInfo,
-        Parameter, Parameters, PropertyInstanceType, SelfTypeVarOrigin, Signature, SpecialFormType,
-        StaticMroError, SubclassOfType, Type, TypeContext, TypeMapping, TypeVarVariance,
-        TypingModule, UnionBuilder, UnionType,
+        ApplyTypeMappingVisitor, BindingContext, BoundTypeVarIdentity, BoundTypeVarInstance,
+        CallArguments, CallableType, ClassBase, ClassLiteral, ClassType, DATACLASS_FLAGS,
+        DataclassFlags, DataclassParams, GenericAlias, GenericContext, KnownClass,
+        KnownInstanceType, MaterializationKind, MemberLookupPolicy, MetaclassCandidate,
+        MetaclassTransformInfo, Parameter, Parameters, PropertyInstanceType, SelfTypeVarOrigin,
+        Signature, SpecialFormType, StaticMroError, SubclassOfType, Type, TypeContext, TypeMapping,
+        TypeVarVariance, TypingModule, UnionBuilder, UnionType,
         attribute_write::DescriptorSetterDomain,
         bound_super::BoundSuperType,
         call::{CallError, CallErrorKind},
@@ -40,7 +40,7 @@ use crate::{
             typed_dict::{TypedDictFields, synthesize_typed_dict_method, typed_dict_class_member},
         },
         context::InferContext,
-        dedicated::{django, pydantic},
+        dedicated::{attrs, django, pydantic},
         definition_expression_type, determine_self_class,
         diagnostic::INVALID_DATACLASS_OVERRIDE,
         enums::{enum_metadata, is_enum_class_by_inheritance, try_unwrap_nonmember_value},
@@ -263,10 +263,10 @@ impl<'db> StaticClassLiteral<'db> {
 
     /// Returns `true` if this class is decorated with `@dataclass(order=True)`.
     pub(crate) fn is_ordered_dataclass(self, db: &'db dyn Db) -> bool {
-        self.find_dataclass_decorator_position(db).is_some()
-            && self
-                .dataclass_params(db)
-                .is_some_and(|params| params.flags(db).contains(DataclassFlags::ORDER))
+        // Looking for the decorator can reparse the class's module.
+        self.dataclass_params(db)
+            .is_some_and(|params| params.flags(db).contains(DataclassFlags::ORDER))
+            && self.find_dataclass_decorator_position(db).is_some()
     }
 
     /// Returns a new [`StaticClassLiteral`] with the given dataclass params, preserving all other fields.
@@ -2009,9 +2009,9 @@ impl<'db> StaticClassLiteral<'db> {
                 };
                 let mut field_ty = field.declared_ty;
 
-                if !init && (name == "__init__" || field_policy.is_pydantic()) {
-                    // Fields with `init=False` are excluded from constructors. Pydantic's private
-                    // and internal fields are also excluded from replacement.
+                if !init {
+                    // Both constructors and replacement omit non-init fields, including
+                    // private and internal Pydantic model fields.
                     continue;
                 }
 
@@ -2179,13 +2179,30 @@ impl<'db> StaticClassLiteral<'db> {
                 parameters.push(extra);
             }
 
-            let signature = match name {
-                "__new__" | "__init__" => Signature::new_generic(
-                    inherited_generic_context,
-                    Parameters::standard(parameters),
-                    return_ty,
-                ),
-                _ => Signature::new(Parameters::standard(parameters), return_ty),
+            let generic_context = match name {
+                "__new__" | "__init__" => inherited_generic_context,
+                _ => None,
+            };
+            let signature = if return_ty.contains_self(db, env)
+                || parameters
+                    .iter()
+                    .any(|parameter| parameter.annotated_type().contains_self(db, env))
+            {
+                // Field annotations bind `Self` to their class. The generated method needs its
+                // own inferable `Self`, shared with the receiver, including for inherited fields.
+                let self_typevar = BoundTypeVarInstance::synthetic_self(
+                    db,
+                    SelfTypeVarOrigin::Class(self.into()),
+                    *instance_ty,
+                    BindingContext::Synthetic(env.program(db)),
+                );
+                let self_ty = Type::TypeVar(self_typevar);
+                let receiver = parameters.first_mut()?;
+                *receiver = receiver.clone().with_annotated_type(self_ty);
+                Signature::new_generic(generic_context, Parameters::standard(parameters), return_ty)
+                    .with_inferable_self(db, env, self_typevar)
+            } else {
+                Signature::new_generic(generic_context, Parameters::standard(parameters), return_ty)
             };
             Some(Type::function_like_callable(db, signature))
         };
@@ -2194,7 +2211,8 @@ impl<'db> StaticClassLiteral<'db> {
             (field_policy, "__init__")
                 if field_policy.synthesizes_constructor_signature_from_fields(db, self) =>
             {
-                let self_parameter = Parameter::positional_or_keyword(Name::new_static("self"))
+                // The receiver must not consume keyword arguments for fields named `self`.
+                let self_parameter = Parameter::positional_only(Some(Name::new_static("self")))
                     // TODO: could be `Self`.
                     .with_annotated_type(*instance_ty);
                 signature_from_fields(vec![self_parameter], Type::none(db, env))
@@ -2351,8 +2369,13 @@ impl<'db> StaticClassLiteral<'db> {
                 CodeGeneratorKind::DataclassLike(_) | CodeGeneratorKind::Pydantic(_),
                 "__replace__",
             ) if env.python_version(db) >= PythonVersion::PY313 => {
-                let self_parameter = Parameter::positional_or_keyword(Name::new_static("self"))
-                    .with_annotated_type(*instance_ty);
+                let self_parameter = if field_policy.is_pydantic() {
+                    // Pydantic's `__replace__` receiver can be passed by keyword.
+                    Parameter::positional_or_keyword(Name::new_static("self"))
+                } else {
+                    Parameter::positional_only(Some(Name::new_static("self")))
+                }
+                .with_annotated_type(*instance_ty);
 
                 signature_from_fields(vec![self_parameter], *instance_ty)
             }
@@ -2515,6 +2538,23 @@ impl<'db> StaticClassLiteral<'db> {
         }
     }
 
+    /// A class's type arguments do not affect whether any base is frozen. Share this
+    /// check across attribute writes and specializations before looking for overrides
+    /// and collecting fields. Incomplete MROs use the full lookup.
+    #[salsa::tracked(returns(copy), cycle_result=|_, _, _| true, heap_size=ruff_memory_usage::heap_size)]
+    fn may_inherit_frozen_fields(self, db: &'db dyn Db) -> bool {
+        let Ok(ancestors) = self.try_mro_ancestors(db, None) else {
+            return true;
+        };
+        ancestors.iter().any(|base| match base {
+            ClassBase::Class(class) => class
+                .static_class_literal(db)
+                .is_some_and(|(literal, _)| literal.is_frozen_dataclass(db) == Some(true)),
+            ClassBase::Any | ClassBase::Dynamic(_) | ClassBase::Divergent(_) => true,
+            ClassBase::Protocol | ClassBase::Generic | ClassBase::TypedDict(_) => false,
+        })
+    }
+
     /// Returns the inherited fields whose generated `__setattr__` or `__delattr__` still applies.
     fn inherited_non_slotted_frozen_dataclass_fields(
         self,
@@ -2522,6 +2562,10 @@ impl<'db> StaticClassLiteral<'db> {
         specialization: Option<Specialization<'db>>,
         method: &str,
     ) -> Option<InheritedFrozenDataclassFields<'db>> {
+        if !self.may_inherit_frozen_fields(db) {
+            return None;
+        }
+
         let mut names = FxIndexSet::default();
         let mut last_frozen_base = None;
 
@@ -2865,6 +2909,7 @@ impl<'db> StaticClassLiteral<'db> {
                 CodeGeneratorKind::from_class(db, self.into()).unwrap_or(field_policy);
             self.has_dataclass_param(db, own_field_policy, DataclassFlags::KW_ONLY)
         });
+        let is_attrs = attrs::is_attrs_class(db, self);
         let mut kw_only_sentinel_field_seen = false;
         let mut field_declarations = Vec::new();
 
@@ -2974,6 +3019,10 @@ impl<'db> StaticClassLiteral<'db> {
                     // A bare `Final` infers its type from the default value. The constructor must
                     // accept only values compatible with the type read through the instance.
                     declared_ty = default_ty;
+                }
+
+                if is_attrs {
+                    alias = attrs::effective_field_alias(self.name(db), symbol.name(), alias);
                 }
 
                 let kind = match field_policy {

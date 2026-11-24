@@ -96,7 +96,9 @@ use crate::types::function::{
 pub(crate) use crate::types::generics::GenericContext;
 use crate::types::generics::{ApplySpecialization, Specialization, bind_typevar};
 use crate::types::infer::InferenceFlags;
-use crate::types::known_instance::{InternedConstraintSet, InternedType, SentinelInstance};
+use crate::types::known_instance::{
+    FieldInstanceKind, InternedConstraintSet, InternedType, SentinelInstance,
+};
 pub use crate::types::method::{BoundMethodType, KnownBoundMethodType, WrapperDescriptorKind};
 use crate::types::mro::{MroIterator, StaticMroError};
 pub(crate) use crate::types::narrow::{NarrowingConstraint, infer_narrowing_constraints};
@@ -113,7 +115,7 @@ pub(crate) use crate::types::typevar::{
     TypeVarBoundOrConstraints, TypeVarNonce,
 };
 pub use crate::types::typevar::{BoundTypeVarInstance, TypeVarKind};
-use crate::types::typevar::{TypeVarDomain, TypeVarInstance, TypeVarSet};
+use crate::types::typevar::{TypeVarDomain, TypeVarFreshening, TypeVarInstance, TypeVarSet};
 use crate::types::union_type_instance::UnionTypeInstance;
 pub use crate::types::variance::TypeVarVariance;
 use crate::types::variance::{VarianceInferable, VarianceTerm};
@@ -1976,6 +1978,7 @@ bitflags! {
         const KW_ONLY = 1 << 7;
         const SLOTS = 1 << 8   ;
         const WEAKREF_SLOT = 1 << 9;
+        const ATTRS = 1 << 10;
     }
 }
 
@@ -2461,6 +2464,44 @@ impl<'db> GeneratorTypes<'db> {
 
 fn object_type_form(db: &dyn Db) -> Type<'_> {
     TypeFormType::from_type_expression(db, Type::object())
+}
+
+/// Normalizes types for one cycle marker. Both arms of `list[U] | set[U]` visit
+/// `U` as a nested type. If `U` branches the same way, each layer doubles the
+/// work unless we reuse the result.
+///
+/// Share this state only through unions, tuples and generic arguments. Start
+/// fresh inside a function, where revisiting that function would trigger its
+/// recursion guard and could change the result for the same union.
+struct RecursiveTypeNormalizer<'env, 'db> {
+    env: &'env ProgramEnvironment<'db>,
+    div: Type<'db>,
+    nested_unions: FxHashMap<UnionType<'db>, Option<Type<'db>>>,
+}
+
+impl<'env, 'db> RecursiveTypeNormalizer<'env, 'db> {
+    fn new(env: &'env ProgramEnvironment<'db>, div: Type<'db>) -> Self {
+        Self {
+            env,
+            div,
+            nested_unions: FxHashMap::default(),
+        }
+    }
+
+    /// Propagate divergence through nested constructors and keep the outermost one.
+    fn normalize_argument(
+        &mut self,
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        parent_is_nested: bool,
+    ) -> Option<Type<'db>> {
+        let result = ty.normalize_recursive(db, self, true);
+        if parent_is_nested {
+            result
+        } else {
+            Some(result.unwrap_or(self.div))
+        }
+    }
 }
 
 #[salsa::tracked]
@@ -3116,7 +3157,17 @@ impl<'db> Type<'db> {
     }
 
     /// Resolve aliases and recursive binders at the outermost level.
+    #[inline]
     fn resolve_type_alias(self, db: &'db dyn Db) -> Type<'db> {
+        match self {
+            Type::TypeAlias(_) | Type::Recursive(_) | Type::RecursiveVar(_) => {
+                self.resolve_type_alias_chain(db)
+            }
+            _ => self,
+        }
+    }
+
+    fn resolve_type_alias_chain(self, db: &'db dyn Db) -> Type<'db> {
         let mut ty = self;
         let mut seen = SmallVec::<[Type<'db>; 4]>::new();
         loop {
@@ -3983,6 +4034,18 @@ impl<'db> Type<'db> {
         div: Type<'db>,
         nested: bool,
     ) -> Option<Self> {
+        self.normalize_recursive(db, &mut RecursiveTypeNormalizer::new(env, div), nested)
+    }
+
+    /// Continue normalization under the same cycle marker and function recursion guards.
+    fn normalize_recursive(
+        self,
+        db: &'db dyn Db,
+        normalizer: &mut RecursiveTypeNormalizer<'_, 'db>,
+        nested: bool,
+    ) -> Option<Self> {
+        let env = normalizer.env;
+        let div = normalizer.div;
         if nested && (self.same_divergent_marker(div) || self.is_pending_narrowing()) {
             return None;
         }
@@ -4003,7 +4066,15 @@ impl<'db> Type<'db> {
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
-            Type::Union(union) => union.recursive_type_normalized_impl(db, env, div, nested),
+            Type::Union(union) if nested => {
+                if let Some(result) = normalizer.nested_unions.get(&union) {
+                    return *result;
+                }
+                let result = union.normalize_recursive(db, normalizer, true);
+                normalizer.nested_unions.insert(union, result);
+                result
+            }
+            Type::Union(union) => union.normalize_recursive(db, normalizer, false),
             Type::Intersection(intersection) => intersection
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::Intersection),
@@ -4017,7 +4088,7 @@ impl<'db> Type<'db> {
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::ProtocolInstance),
             Type::NominalInstance(instance) => instance
-                .recursive_type_normalized_impl(db, env, div, nested)
+                .normalize_recursive(db, normalizer, nested)
                 .map(Type::NominalInstance),
             Type::FunctionLiteral(function) => function
                 .recursive_type_normalized_impl(db, env, div, nested)
@@ -4050,7 +4121,7 @@ impl<'db> Type<'db> {
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::BoundSuper),
             Type::GenericAlias(generic) => generic
-                .recursive_type_normalized_impl(db, env, div, nested)
+                .normalize_recursive(db, normalizer, nested)
                 .map(Type::GenericAlias),
             Type::Recursive(_) => Some(self),
             Type::ClassLiteral(class) => class
@@ -6176,14 +6247,9 @@ impl<'db> Type<'db> {
                         .nominal_class(db, env)
                         .map(|class| class.class_literal(db))
                         .and_then(|class| class.into_enum_class(db)),
-                } && let Some(resolved_name) = enum_class.resolve_member(db, name)
+                } && let Some(member) = enum_class.member_type(db, env, name)
                 {
-                    return Place::bound(Type::enum_literal(EnumLiteralType::new(
-                        db,
-                        enum_class,
-                        resolved_name,
-                    )))
-                    .into();
+                    return Place::bound(member).into();
                 }
 
                 let fallback = this.instance_member(db, env, name_str);
@@ -6720,7 +6786,7 @@ impl<'db> Type<'db> {
                 Type::LiteralValue(literal)
                     if matches!(name_str, "name" | "_name_" | "value" | "_value_")
                         && let Some(enum_literal) = literal.as_enum()
-                        && !enums::class_defines_property(
+                        && !enums::class_overrides_enum_attribute(
                             db,
                             env,
                             enum_literal.enum_class(db),
@@ -6760,7 +6826,12 @@ impl<'db> Type<'db> {
                     if matches!(name_str, "name" | "_name_" | "value" | "_value_")
                         && let class_literal = instance.class_literal(db, env)
                         && let Some(metadata) = enum_metadata(db, class_literal)
-                        && !enums::class_defines_property(db, env, class_literal, name_str) =>
+                        && !enums::class_overrides_enum_attribute(
+                            db,
+                            env,
+                            class_literal,
+                            name_str,
+                        ) =>
                 {
                     let is_enum_subclass = Type::ClassLiteral(class_literal).is_subtype_of(
                         db,
@@ -6777,6 +6848,14 @@ impl<'db> Type<'db> {
                     };
 
                     ty.map_or_default(Place::bound).into()
+                }
+
+                // attrs defines the methods `validator` and `default` on field instances.
+                Type::KnownInstance(KnownInstanceType::Field(field))
+                    if matches!(name_str, "validator" | "default")
+                        && field.kind(db) == FieldInstanceKind::Attrs =>
+                {
+                    Place::bound(dedicated::attrs::generic_identity_function(db, env)).into()
                 }
 
                 Type::KnownInstance(KnownInstanceType::FunctoolsPartial(partial))
@@ -6864,14 +6943,9 @@ impl<'db> Type<'db> {
                         _ => None,
                     };
                     if let Some(enum_class) = enum_class
-                        && let Some(resolved_name) = enum_class.resolve_member(db, name)
+                        && let Some(member) = enum_class.member_type(db, env, name)
                     {
-                        return Place::bound(Type::enum_literal(EnumLiteralType::new(
-                            db,
-                            enum_class,
-                            resolved_name,
-                        )))
-                        .into();
+                        return Place::bound(member).into();
                     }
 
                     let class_attr_plain = this.class_object_member(db, env, name_str, policy);
@@ -7284,9 +7358,19 @@ impl<'db> Type<'db> {
                         .overloads
                         .iter()
                         .all(Signature::has_implicit_positional_receiver_annotation);
-                // Synthesized signatures can contain `Self` without a function's generic
-                // context, so substitute it when capturing the receiver.
-                if bound_method.function(db).is_none()
+                // TODO: Remove this fallback once generic decorators preserve method type
+                // variables: https://github.com/astral-sh/ty/issues/3186. A decorator can leave a
+                // type variable in the receiver without a generic context that can infer it.
+                // Declared aliases retain their definition, and generated `Self` methods have a
+                // generic context, so their receivers still participate in argument checking.
+                let receiver_needs_eager_binding = signature.overloads.iter().all(|overload| {
+                    overload.definition.is_none()
+                        && overload.generic_context.is_none()
+                        && overload.parameters().get(0).is_some_and(|parameter| {
+                            parameter.annotated_type().has_typevar(db, env)
+                        })
+                });
+                if receiver_needs_eager_binding
                     || protocol_receiver_is_specialized
                     || signature_receiver != self_instance
                 {
@@ -11779,10 +11863,10 @@ pub enum TypeMapping<'a, 'db> {
     /// Binds a legacy typevar with the generic context (class, function, type alias) that it is
     /// being used in.
     BindLegacyTypevars(BindingContext<'db>),
-    /// Freshens typevars bound by a generic context occurrence by adding a shared delta.
+    /// Freshens typevars bound by a generic context occurrence.
     FreshenBoundTypeVars {
         generic_context: GenericContext<'db>,
-        delta: u32,
+        freshening: TypeVarFreshening<'db>,
     },
     /// Binds any `typing.Self` typevar with a particular `self` class.
     BindSelf(SelfBinding<'db>),
@@ -12002,7 +12086,6 @@ enum DivergentOrigin {
 /// reference a recursive type. Both must survive dynamic type reduction
 /// (e.g. `Divergent` is assignable to `@Todo`, but `@Todo | Divergent` must not be reduced to `@Todo`).
 /// Otherwise, type inference cannot converge properly.
-/// For detailed properties of this type, see the unit test at the end of the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DivergentType {
     origin: DivergentOrigin,
@@ -12757,9 +12840,14 @@ impl<'db> ModuleLiteralType<'db> {
 
     fn resolve_submodule(self, db: &'db dyn Db, name: &str) -> Option<Type<'db>> {
         let importing_file = self.importing_file(db)?;
-        let relative_submodule_name = ModuleName::new(name)?;
-        let mut absolute_submodule_name = self.module(db).name(db).clone();
-        absolute_submodule_name.extend(&relative_submodule_name);
+        let relative_submodule_name = ModuleName::from_components([name])?;
+        let absolute_submodule_name = self.module(db).name(db).join(&relative_submodule_name);
+        if !semantic_index(db, importing_file)
+            .imported_modules()
+            .contains(&absolute_submodule_name)
+        {
+            return None;
+        }
         let submodule = resolve_module(
             db,
             ImportingFile::File(
@@ -12861,9 +12949,7 @@ impl<'db> ModuleLiteralType<'db> {
         // the parent module's `__init__.py` file being evaluated. That said, we have
         // chosen to always have the submodule take priority. (This matches pyright's
         // current behavior, but is the opposite of mypy's current behavior.)
-        if self.available_submodule_attributes(db).contains(name)
-            && let Some(submodule) = self.resolve_submodule(db, name)
-        {
+        if let Some(submodule) = self.resolve_submodule(db, name) {
             return Place::bound(submodule).into();
         }
 

@@ -638,6 +638,10 @@ fn analyze_non_terminal_calls_up_to_predicate<'db>(
     predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
     root: InteriorNode,
 ) {
+    if predicates.len() <= NON_TERMINAL_CALL_CHUNK_SIZE {
+        return;
+    }
+
     let root_predicate = root.atom();
     if !matches!(
         predicates[root_predicate].node,
@@ -651,17 +655,11 @@ fn analyze_non_terminal_calls_up_to_predicate<'db>(
         return;
     }
     let scope = predicate_scope(db, &predicates[root_predicate]);
-    let has_many_calls = predicates
-        .iter()
-        .filter(|predicate| matches!(predicate.node, PredicateNode::IsNonTerminalCall(_)))
-        .nth(NON_TERMINAL_CALL_CHUNK_SIZE)
-        .is_some();
-
-    if !has_many_calls {
+    let call_predicates = non_terminal_call_predicates(db, scope);
+    if call_predicates.len() <= NON_TERMINAL_CALL_CHUNK_SIZE {
         return;
     }
 
-    let call_predicates = non_terminal_call_predicates(db, scope);
     let call_count = call_predicates.partition_point(|predicate| *predicate <= root_predicate);
     let mut start = 0;
     // Leave the incomplete final block demand-driven. Its reverse dependency chain is bounded by
@@ -678,8 +676,8 @@ fn analyze_non_terminal_calls_up_to_predicate<'db>(
 
 /// Returns the statement-call predicates for `scope` in source order.
 ///
-/// This tracked index is used only once a scope exceeds [`NON_TERMINAL_CALL_CHUNK_SIZE`], avoiding
-/// a persistent allocation for the common case of scopes with few calls.
+/// This tracked index is used only once a scope has more than [`NON_TERMINAL_CALL_CHUNK_SIZE`]
+/// predicates. Smaller scopes never need to warm a call prefix.
 #[salsa::tracked(returns(deref), heap_size = get_size2::GetSize::get_heap_size)]
 fn non_terminal_call_predicates<'db>(
     db: &'db dyn Db,
@@ -1191,6 +1189,8 @@ fn evaluate_projected_narrowing_checkpoint<'db>(
     }
 }
 
+type ProjectionCache = FxHashMap<ScopedNarrowingConstraint, ProjectedNarrowingNodeId>;
+
 /// Narrows bindings of one place while reusing their shared constraint suffixes.
 pub(crate) struct NarrowingProjector<'a, 'db> {
     db: &'db dyn Db,
@@ -1201,7 +1201,8 @@ pub(crate) struct NarrowingProjector<'a, 'db> {
     place: ScopedPlaceId,
     base_ty: Type<'db>,
     /// Checkpoint entries retain narrowed types, so projections are specific to the binding type.
-    project_cache: FxHashMap<(ScopedNarrowingConstraint, Type<'db>), ProjectedNarrowingNodeId>,
+    project_cache: ProjectionCache,
+    other_projections: FxHashMap<Type<'db>, ProjectionCache>,
     graph: ProjectedNarrowingGraph<'db>,
     narrowed_cache: FxHashMap<(ProjectedNarrowingNodeId, Type<'db>), Type<'db>>,
 }
@@ -1225,7 +1226,8 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
             predicate_narrowing_targets,
             place,
             base_ty,
-            project_cache: FxHashMap::default(),
+            project_cache: ProjectionCache::default(),
+            other_projections: FxHashMap::default(),
             graph: ProjectedNarrowingGraph::default(),
             narrowed_cache: FxHashMap::default(),
         }
@@ -1248,7 +1250,6 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         constraint: ScopedNarrowingConstraint,
         base_ty: Type<'db>,
     ) -> Type<'db> {
-        self.base_ty = base_ty;
         match constraint {
             ScopedNarrowingConstraint::ALWAYS_TRUE => return base_ty,
             ScopedNarrowingConstraint::ALWAYS_FALSE => return Type::Never,
@@ -1259,6 +1260,15 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         // Avoid evaluating unrelated expressions, which can introduce inference cycles.
         if !self.predicate_narrowing_targets.contains_place(self.place) {
             return base_ty;
+        }
+
+        // Keep the current type out of the key for every visited node. Only places with
+        // bindings of different types need more than one projection table.
+        if self.base_ty != base_ty {
+            let next = self.other_projections.remove(&base_ty).unwrap_or_default();
+            let previous = std::mem::replace(&mut self.project_cache, next);
+            self.other_projections.insert(self.base_ty, previous);
+            self.base_ty = base_ty;
         }
 
         let root = self.project(constraint, true);
@@ -1475,12 +1485,12 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         id: ProjectedNarrowingNodeId,
         constraint: ScopedNarrowingConstraint,
     ) -> ProjectedNarrowingNodeId {
-        if let Some(cached) = self.project_cache.get(&(constraint, self.base_ty)).copied()
+        if let Some(cached) = self.project_cache.get(&constraint).copied()
             && cached != id
         {
             return cached;
         }
-        self.project_cache.remove(&(constraint, self.base_ty));
+        self.project_cache.remove(&constraint);
         self.project(constraint, false)
     }
 
@@ -1505,7 +1515,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         while let Some(action) = actions.pop() {
             match action {
                 Action::Visit(id) => {
-                    if id.is_terminal() || self.project_cache.contains_key(&(id, self.base_ty)) {
+                    if id.is_terminal() || self.project_cache.contains_key(&id) {
                         continue;
                     }
 
@@ -1551,7 +1561,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                                 projected
                             }
                         };
-                        self.project_cache.insert((id, self.base_ty), projected);
+                        self.project_cache.insert(id, projected);
                         continue;
                     }
                     actions.push(Action::VisitBranches(id));
@@ -1565,7 +1575,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                         == ProjectedNarrowingNodeId::ALWAYS_TRUE
                     {
                         self.project_cache
-                            .insert((id, self.base_ty), ProjectedNarrowingNodeId::ALWAYS_TRUE);
+                            .insert(id, ProjectedNarrowingNodeId::ALWAYS_TRUE);
                         continue;
                     }
                     let predicate = self.predicates.entries[node.atom];
@@ -1599,7 +1609,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                     let branch = self.projected_node(branch);
                     let if_uncertain = self.projected_node(node.if_uncertain);
                     let projected = self.or(branch, if_uncertain);
-                    self.project_cache.insert((id, self.base_ty), projected);
+                    self.project_cache.insert(id, projected);
                 }
                 Action::FinishPredicate(id) => {
                     let node = self.constraints.get_interior_node(id);
@@ -1611,7 +1621,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                     if [if_true, if_false].into_iter().all(|branch| {
                         branch == ProjectedNarrowingNodeId::ALWAYS_FALSE || branch == if_uncertain
                     }) {
-                        self.project_cache.insert((id, self.base_ty), if_uncertain);
+                        self.project_cache.insert(id, if_uncertain);
                         continue;
                     }
                     let (pos_constraint, neg_constraint) = self.predicate_constraints(node.atom);
@@ -1637,7 +1647,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                             if_false,
                         })
                     };
-                    self.project_cache.insert((id, self.base_ty), projected);
+                    self.project_cache.insert(id, projected);
                 }
             }
         }
@@ -1649,7 +1659,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         match id {
             ScopedNarrowingConstraint::ALWAYS_TRUE => ProjectedNarrowingNodeId::ALWAYS_TRUE,
             ScopedNarrowingConstraint::ALWAYS_FALSE => ProjectedNarrowingNodeId::ALWAYS_FALSE,
-            _ => self.project_cache[&(id, self.base_ty)],
+            _ => self.project_cache[&id],
         }
     }
 }
@@ -2192,27 +2202,22 @@ impl TruthinessCache {
 /// related places. Those evaluations can in turn infer predicate truthiness, so reusing the result
 /// avoids repeating non-trivial work.
 ///
-/// The common case is evaluating constraints from the inferred region's own use-def map. Those
-/// entries are stored in a dense vector indexed by [`ScopedReachabilityConstraintId`]. Distinct
-/// paths through that graph can test the same predicate, so cache its truthiness for the lifetime
-/// of this inference, including when the surrounding query is iterating a cycle. Constraints
-/// from other use-def maps are less common and are stored separately, keyed by the address of their
-/// [`ReachabilityConstraints`] graph plus the local constraint id. The graph address is part of the
-/// key because scoped constraint ids are only unique within one graph.
+/// A region may visit only a few constraints in a large graph. Store the results by
+/// graph address and local ID because constraint IDs are only unique within a graph.
+/// Within the primary scope, distinct paths can test the same predicate, so also
+/// cache its truthiness for the lifetime of this inference, including during cycles.
 pub(crate) struct ReachabilityEvaluationCache<'db> {
     primary_scope: ScopeId<'db>,
     primary_constraints: usize,
-    primary_entries: TruthinessCache,
     primary_predicates: TruthinessCache,
-    other_entries: RefCell<FxHashMap<(usize, ScopedReachabilityConstraintId), Truthiness>>,
+    entries: RefCell<FxHashMap<(usize, ScopedReachabilityConstraintId), Truthiness>>,
 }
 
 impl<'db> ReachabilityEvaluationCache<'db> {
     /// Creates a cache optimized for the use-def map of `primary_scope`.
     ///
     /// `primary_constraints` must be the reachability graph for `primary_scope`'s use-def map. The
-    /// cache uses this graph's address to decide whether an evaluation can use the dense primary
-    /// storage or must fall back to the secondary map for another graph.
+    /// cache uses the graph's address to decide whether to share predicate evaluations.
     pub(crate) fn new(
         primary_scope: ScopeId<'db>,
         primary_constraints: &ReachabilityConstraints,
@@ -2220,18 +2225,14 @@ impl<'db> ReachabilityEvaluationCache<'db> {
         Self {
             primary_scope,
             primary_constraints: std::ptr::from_ref(primary_constraints).addr(),
-            primary_entries: TruthinessCache::default(),
             primary_predicates: TruthinessCache::default(),
-            other_entries: RefCell::new(FxHashMap::default()),
+            entries: RefCell::new(FxHashMap::default()),
         }
     }
 
     /// Evaluates `id`, reusing a cached result when possible.
     ///
-    /// Trivial constraint ids return immediately and are not stored. For interior nodes, the
-    /// predicate determines whether the constraint belongs to the primary scope. A primary-scope
-    /// constraint from the primary graph is cached by dense index; all other constraints are cached
-    /// by graph identity and id.
+    /// Trivial constraint IDs return immediately and are not stored.
     fn evaluate(
         &self,
         db: &'db dyn Db,
@@ -2246,29 +2247,19 @@ impl<'db> ReachabilityEvaluationCache<'db> {
             _ => {}
         }
 
-        let predicate = predicates[constraints.get_interior_node(id).atom()];
-        let constraints_key = std::ptr::from_ref(constraints).addr();
-        let scope = predicate_scope(db, &predicate);
-
-        if scope != self.primary_scope || constraints_key != self.primary_constraints {
-            let key = (constraints_key, id);
-            if let Some(result) = self.other_entries.borrow().get(&key).copied() {
-                return result;
-            }
-
-            let result = evaluate_reachability_constraint(db, scope, id, None);
-            self.other_entries.borrow_mut().insert(key, result);
+        let graph = std::ptr::from_ref(constraints).addr();
+        let key = (graph, id);
+        if let Some(result) = self.entries.borrow().get(&key).copied() {
             return result;
         }
 
-        self.primary_entries.get_or_evaluate(id.index(), || {
-            evaluate_reachability_constraint(
-                db,
-                self.primary_scope,
-                id,
-                Some(&self.primary_predicates),
-            )
-        })
+        let predicate = predicates[constraints.get_interior_node(id).atom()];
+        let scope = predicate_scope(db, &predicate);
+        let predicate_cache = (scope == self.primary_scope && graph == self.primary_constraints)
+            .then_some(&self.primary_predicates);
+        let result = evaluate_reachability_constraint(db, scope, id, predicate_cache);
+        self.entries.borrow_mut().insert(key, result);
+        result
     }
 }
 
