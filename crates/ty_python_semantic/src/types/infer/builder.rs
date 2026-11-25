@@ -48,7 +48,7 @@ use crate::place_load::{
 use crate::reachability::{
     ReachabilityEvaluationCache, evaluate_reachability_with_cache, is_end_of_scope_reachable,
 };
-use crate::types::abstract_methods::AbstractMethods;
+use crate::types::abstract_methods::{AbstractMethods, decorator_preserves_concreteness};
 use crate::types::add_inferred_python_version_hint_to_diagnostic;
 use crate::types::annotation_target::{is_valid_annotation_target, receiver_method_scope};
 use crate::types::attribute_write::{
@@ -109,8 +109,8 @@ use crate::types::infer::builder::named_tuple::NamedTupleKind;
 use crate::types::infer::builder::paramspec_validation::validate_paramspec_components;
 use crate::types::infer::{
     StatementInference, StatementInferenceInner, StatementInferenceInnerExtra, TruthinessAnalyzer,
-    TypeAndRange, TypeExpressionFlags, infer_statement_types, nearest_enclosing_class,
-    nearest_enclosing_function, original_class_type,
+    TypeAndRange, TypeContextKind, TypeExpressionFlags, infer_statement_types,
+    nearest_enclosing_class, nearest_enclosing_function, original_class_type,
 };
 use crate::types::match_pattern::{ClassPatternPositionalResult, class_pattern_positional_result};
 use crate::types::member::{class_body_declaration_from_bases, inherited_class_body_declaration};
@@ -6944,7 +6944,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && let Some(peer_ty) = peer_ty
             && prefer_collection_literal_peer_context(db, env, tcx)
         {
-            TypeContext::preference(Some(peer_ty))
+            TypeContext::new(Some(peer_ty), TypeContextKind::CollectionPeer)
         } else {
             return infer_expression(self, tcx);
         };
@@ -8486,6 +8486,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // Create a set of constraints to infer a precise type for `T`.
         let mut tuple_size_promotion_constraints = TupleSizePromotionConstraints::default();
+        let mut has_element_context = false;
 
         for elt_ty in elt_tys.clone() {
             let elt_ty_identity = elt_ty.identity(self.db());
@@ -8521,6 +8522,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // matches the behavior of other type checkers and is usually the desired behavior.
             if let Some(elt_tcx) = elt_tcx {
                 builder.add_type_mapping(elt_ty, elt_tcx, TypeVarVariance::Invariant);
+                has_element_context = true;
             }
         }
 
@@ -8569,6 +8571,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
+        // Keep the element bounds for a retry if the collection doesn't fit its target.
+        // In `xs or [None]`, the fresh list can hold both elements of `xs` and `None`
+        // even if the resulting list type isn't assignable to the type of `xs`.
+        let retry_target = tcx
+            .expected_type()
+            .filter(|_| has_element_context && tcx.kind() != TypeContextKind::CollectionPeer);
+        let mut element_bounds = [const { Vec::new() }; N];
+
         // Consecutive elements often contribute the same lower bound after literal promotion.
         // Track keys and values separately for dictionaries.
         let mut previous_evidence = [None; N];
@@ -8611,6 +8621,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         unpacked_value_ty.promote(db, env),
                     );
 
+                    if retry_target.is_some() {
+                        element_bounds[0].push(unpacked_key_ty);
+                        element_bounds[1].push(unpacked_value_ty);
+                    }
+
                     builder.infer(Type::TypeVar(key_ty), unpacked_key_ty).ok()?;
 
                     builder
@@ -8652,12 +8667,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     });
 
                 // Simplify the inference based on a non-covariant declared type.
-                if let Some(elt_tcx) =
-                    elt_tcx.filter(|_| !elt_tcx_variance[&elt_ty_identity].is_covariant())
-                    && inferred_elt_ty.is_assignable_to(db, env, elt_tcx)
-                {
-                    continue;
-                }
+                let covered_by_context = elt_tcx.is_some_and(|elt_tcx| {
+                    !elt_tcx_variance[&elt_ty_identity].is_covariant()
+                        && inferred_elt_ty.is_assignable_to(db, env, elt_tcx)
+                });
 
                 // A covariant context is an upper bound, so promotion must not widen an otherwise
                 // compatible element beyond that bound. In particular, promoting an exact float
@@ -8682,6 +8695,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     inferred_elt_ty
                 };
 
+                if retry_target.is_some() {
+                    element_bounds[i].push(inferred_type_for_typevar);
+                }
+
                 // Only exact tuples depend on the expression for tuple-size promotion.
                 // For example, a variable can block promotion even immediately after a
                 // tuple literal with the same promoted type.
@@ -8700,7 +8717,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     inferred_type_for_typevar,
                 );
 
-                if !repeated {
+                if !covered_by_context && !repeated {
                     builder
                         .infer(Type::TypeVar(elt_ty), inferred_type_for_typevar)
                         .ok()?;
@@ -8709,22 +8726,44 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
-        let class_type = class.apply_specialization(db, |_| {
-            builder.build_merged_with(|current_typevar, bounds| {
-                let lower = bounds?.inference_lower()?;
+        let solve = |builder: &mut SpecializationBuilder<'db, '_>| {
+            let class_type = class.apply_specialization(db, |_| {
+                builder.build_merged_with(|current_typevar, bounds| {
+                    let lower = bounds?.inference_lower()?;
 
-                let lower = lower.promote_collection_element_type(
-                    db,
-                    env,
-                    tuple_size_promotion_constraints.allow(current_typevar.identity(self.db())),
-                    tcx.expected_type().is_none(),
-                );
+                    let lower = lower.promote_collection_element_type(
+                        db,
+                        env,
+                        tuple_size_promotion_constraints.allow(current_typevar.identity(self.db())),
+                        tcx.expected_type().is_none(),
+                    );
 
-                Some(lower)
-            })
-        });
+                    Some(lower)
+                })
+            });
 
-        Type::from(class_type).to_instance_approximation(db, env)
+            Type::from(class_type).to_instance_approximation(db, env)
+        };
+
+        let collection_ty = solve(&mut builder)?;
+
+        // If the result collection type is incompatible with the type context, re-solve without
+        // type context for more precise diagnostics.
+        if let Some(expected) = retry_target
+            && !collection_ty.is_assignable_to(db, env, expected)
+        {
+            let mut builder = SpecializationBuilder::new(db, env, &constraints, generic_context);
+            for (typevar, mut bounds) in elt_tys.zip(element_bounds) {
+                bounds.dedup();
+                for bound in bounds {
+                    builder.infer(Type::TypeVar(typevar), bound).ok()?;
+                }
+            }
+
+            return solve(&mut builder);
+        }
+
+        Some(collection_ty)
     }
 
     /// Infer the type of the `iter` expression of the first comprehension.
@@ -12550,58 +12589,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     pub(super) fn finish_function_decorator_inference(mut self) -> FunctionDecoratorInference<'db> {
-        // Specializing a nominal return type can change a descriptor's type arguments, but it
-        // cannot turn the descriptor into an abstract function, bound method, or property.
-        fn returns_nominal_instance<'db>(db: &'db dyn Db, decorator: Type<'db>) -> bool {
-            let Type::Callable(callable) = decorator else {
-                return false;
-            };
-            if callable.kind(db) != CallableTypeKind::Regular {
-                return false;
-            }
-            let [signature] = callable.signatures(db).overloads.as_slice() else {
-                return false;
-            };
-            matches!(signature.return_ty, Type::NominalInstance(_))
-        }
-
-        // With a single decorator of type `(F) -> F`, the argument is the undecorated
-        // method. Keep the full check if specialization could pick a different function
-        // from a TypeVar constraint, bound, or default.
-        fn is_identity_decorator<'db>(
-            db: &'db dyn Db,
-            env: &ProgramEnvironment<'db>,
-            decorator: Type<'db>,
-        ) -> bool {
-            let Type::FunctionLiteral(function) = decorator else {
-                return false;
-            };
-            if function.known(db).is_some() {
-                return false;
-            }
-            let [signature] = function.signature(db).overloads.as_slice() else {
-                return false;
-            };
-            let Type::TypeVar(variable) = signature.return_ty else {
-                return false;
-            };
-            let [parameter] = signature.parameters().as_slice() else {
-                return false;
-            };
-            parameter.is_positional()
-                && parameter.annotated_type() == signature.return_ty
-                && signature
-                    .generic_context
-                    .is_some_and(|context| context.variables(db).eq([variable]))
-                && !variable.is_paramspec(db)
-                && !variable.is_typevartuple(db)
-                && matches!(
-                    variable.typevar(db).bound_or_constraints(db, env),
-                    None | Some(TypeVarBoundOrConstraints::UpperBound(Type::Callable(_)))
-                )
-                && variable.typevar(db).default_type(db, env).is_none()
-        }
-
         self.infer_region();
 
         let mut known_decorators = FunctionDecorators::empty();
@@ -12610,31 +12597,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && let DefinitionKind::Function(function) = definition.kind(self.db())
         {
             may_produce_abstract_method = false;
-            let decorators = &function.node(self.module()).decorator_list;
-            for decorator in decorators {
+            for decorator in &function.node(self.module()).decorator_list {
                 let ty = self.expression_type(&decorator.expression);
                 let flags = FunctionDecorators::from_decorator_type(self.db(), ty);
                 known_decorators |= flags;
-                if !flags.is_empty()
+                if may_produce_abstract_method
+                    || !flags.is_empty()
                     || matches!(ty, Type::ClassLiteral(class)
                         if class.known(self.db()) == Some(KnownClass::Property))
                 {
                     continue;
                 }
-                if decorators.len() == 1 {
-                    if returns_nominal_instance(self.db(), ty) {
-                        continue;
-                    }
-                    // A class-body TypeGuard can narrow the method to an abstract function
-                    // even if the decorator preserves the type of the original definition.
-                    let bindings = self.index.use_def_map(definition.file_scope(self.db()));
-                    if !bindings.may_narrow(definition.place(self.db()))
-                        && is_identity_decorator(self.db(), self.program_environment(), ty)
-                    {
-                        continue;
-                    }
-                }
-                may_produce_abstract_method = true;
+                // Even if the decorator preserves concreteness, a later TypeGuard in the
+                // class body can narrow the member's type to that of an abstract method.
+                let bindings = self.index.use_def_map(definition.file_scope(self.db()));
+                may_produce_abstract_method = bindings.may_narrow(definition.place(self.db()))
+                    || !decorator_preserves_concreteness(self.db(), self.program_environment(), ty);
             }
             may_produce_abstract_method |=
                 known_decorators.contains(FunctionDecorators::ABSTRACT_METHOD);

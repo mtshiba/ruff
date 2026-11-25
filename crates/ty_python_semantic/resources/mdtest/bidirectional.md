@@ -1340,11 +1340,11 @@ x2: TD | None = first([{"x": 0}, {"x": 1}])
 reveal_type(x2)  # revealed: TD
 
 # TODO: We could provide `TypedDict` key diagnostics here.
-# error: [invalid-assignment] "Object of type `TD | dict[str, int]` is not assignable to `TD`"
+# error: [invalid-assignment] "Object of type `dict[str, int] | TD` is not assignable to `TD`"
 x3: TD = first([{"y": 0}, {"x": 1}])
 
 # TODO: We could provide `TypedDict` key diagnostics here.
-# error: [invalid-assignment] "Object of type `TD | None | dict[str, int]` is not assignable to `TD | None`"
+# error: [invalid-assignment] "Object of type `dict[str, int] | TD` is not assignable to `TD | None`"
 x4: TD | None = first([{"y": 0}, {"x": 1}])
 
 # `ObjectCallback` is redundant in this union, so expanding the aliases collapses the narrowing
@@ -1724,7 +1724,7 @@ collection literals:
 import builtins
 from collections import defaultdict
 from collections.abc import Mapping
-from typing import Any, Callable, Iterable, Literal, MutableSequence, overload, Sequence
+from typing import Any, Callable, Iterable, Literal, MutableSequence, overload, Protocol, Sequence
 
 # TODO: This should be `list[Any]`.
 # revealed: list[int]
@@ -1767,6 +1767,12 @@ x11: list[Iterable[Any]] = reveal_type([[i] for i in [1, 2, 3]])
 
 # revealed: list[list[Any]]
 x12: Iterable[list[Any]] = reveal_type([[i] for i in [1, 2, 3]])
+
+class Sink[T](Protocol):
+    def append(self, item: T, /) -> None: ...
+
+# revealed: list[int | str]
+x13: Sink[int] = reveal_type(["x"])
 
 def _(dynamic: Any):
     # TODO: This should be `list[int]`.
@@ -2766,7 +2772,8 @@ def _(flag: bool):
 ## Collection literals in boolean and conditional expressions
 
 When a boolean or conditional expression combines a fresh collection literal with another operand,
-the other operand can provide type context for the literal:
+the other operand can provide type context for the literal. The fresh collection can include
+additional element types without widening the type of an existing collection.
 
 ```py
 from collections.abc import Mapping
@@ -2832,8 +2839,14 @@ def generic_type_context(values: list[int | str] | None) -> None:
     reveal_type(preserve_partially_specialized(values or []))  # revealed: list[Unknown | int]
 
 def widened_non_empty_fallback(values: list[int] | None) -> None:
-    result = values or ["x"]
-    reveal_type(result)  # revealed: (list[int] & ~AlwaysFalsy) | list[int | str]
+    result = values or [None]
+    reveal_type(result)  # revealed: (list[int] & ~AlwaysFalsy) | list[int | None]
+    result.append(1)  # ok
+    result.append(None)  # error: [invalid-argument-type]
+
+def nested_dict_fallback(rows: list[dict[Key, int]] | None) -> None:
+    for row in rows or [{"foo": "missing"}]:
+        row["bar"] = 1  # ok
 
 def incompatible_collection_kind(values: set[str] | None) -> None:
     reveal_type(values or [1])  # revealed: (set[str] & ~AlwaysFalsy) | list[int]
