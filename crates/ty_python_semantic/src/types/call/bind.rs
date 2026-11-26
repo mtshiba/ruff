@@ -68,6 +68,7 @@ use crate::types::infer::{TypeContextKind, original_class_type};
 use crate::types::known_instance::{
     FieldInstance, InternedConstraintSetSolution, MethodWrapper, MethodWrapperKind,
 };
+use crate::types::protocol_class::has_all_protocol_members_defined;
 use crate::types::signatures::{
     CallableSignature, Parameter, ParameterDisplayName, ParameterKind, Parameters, ParametersKind,
     PartialApplication,
@@ -1190,6 +1191,15 @@ impl<'db> Bindings<'db> {
                 }
             }
         });
+    }
+
+    /// Whether the solver retried without the declared type for any selected overload.
+    pub(crate) fn ignored_declared_constraints(&self) -> bool {
+        let mut ignored_declared_constraints = false;
+        self.visit_type_context_callables(&mut |callable| {
+            ignored_declared_constraints |= callable.ignored_declared_constraints();
+        });
+        ignored_declared_constraints
     }
 
     /// Returns `true` if every element of the union contains an intersection element with a matching
@@ -3582,6 +3592,34 @@ struct OverloadFilterCandidate<'db> {
     slots: Box<[OverloadFilterSlot<'db>]>,
 }
 
+impl<'db> OverloadFilterCandidate<'db> {
+    /// Returns true for parameter types that exclude `object` even when unioned together.
+    ///
+    /// Complementary intersections can cover `object` together, and `object()` satisfies
+    /// some protocols, such as `Hashable`.
+    fn excludes_object_at(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        index: usize,
+    ) -> bool {
+        let Some(slot) = self.slots.get(index) else {
+            return false;
+        };
+        let excludes_object = |ty| match ty {
+            Type::NominalInstance(instance) => !instance.is_object(),
+            Type::ProtocolInstance(protocol) => {
+                !has_all_protocol_members_defined(db, env, Type::object(), protocol)
+            }
+            _ => false,
+        };
+        match slot.parameter.expand_top_level_aliases(db, env) {
+            Type::Union(union) => union.elements(db).iter().copied().all(excludes_object),
+            ty => excludes_object(ty),
+        }
+    }
+}
+
 /// The specialized argument and parameter types that affect step 5 of overload resolution.
 #[salsa::interned(heap_size=ruff_memory_usage::heap_size)]
 struct OverloadFilter<'db> {
@@ -3606,6 +3644,41 @@ impl<'db> OverloadFilter<'db> {
 
         // A provisional type can change which prefix covers the arguments on the next iteration.
         cached(db, self).unwrap_or_else(|| self.compute_covering_prefix_len(db))
+    }
+
+    /// Returns true if one argument rules out every prefix that omits the last overload.
+    ///
+    /// For example, consider overloads accepting `str`, `bytes`, and `object`, in that order.
+    /// The top materialization of `Any` is `object`. Neither `str` nor `str | bytes` covers
+    /// it, so we can keep all three overloads without building the union.
+    ///
+    /// `arguments` is the fixed-length tuple of top materializations for `group`.
+    fn can_rule_out_shorter_prefixes(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        group: &[OverloadFilterCandidate<'db>],
+        arguments: &TupleSpec<'db>,
+        max_slot_count: usize,
+    ) -> bool {
+        // Contextual inference can give the same argument different types in other groups.
+        if group.len() != self.candidates(db).len() - 1 {
+            return false;
+        }
+
+        // Both tuples omit empty slots. If every argument slot is present, a prefix that
+        // omits a parameter slot fails on length, and all other prefixes align by index.
+        let arguments = arguments.fixed_elements();
+        if arguments.len() != max_slot_count {
+            return false;
+        }
+
+        arguments.enumerate().any(|(index, argument)| {
+            argument.is_object()
+                && group
+                    .iter()
+                    .all(|candidate| candidate.excludes_object_at(db, env, index))
+        })
     }
 
     fn compute_covering_prefix_len(self, db: &'db dyn Db) -> usize {
@@ -3650,20 +3723,19 @@ impl<'db> OverloadFilter<'db> {
                 }
             }
 
-            let top_materialized_argument_type = Type::heterogeneous_tuple(
-                db,
-                env,
+            let argument_types = TupleSpec::heterogeneous(
                 union_argument_type_builders
                     .into_iter()
-                    .filter_map(|builder| {
-                        if builder.is_empty() {
-                            None
-                        } else {
-                            Some(builder.build())
-                        }
-                    }),
+                    .filter(|builder| !builder.is_empty())
+                    .map(UnionBuilder::build),
             );
 
+            if self.can_rule_out_shorter_prefixes(db, env, group, &argument_types, max_slot_count) {
+                return candidates.len();
+            }
+
+            let top_materialized_argument_type =
+                Type::tuple(TupleType::new(db, env, &argument_types));
             for current in group {
                 prefix_len += 1;
                 for (builder, slot) in union_parameter_types.iter_mut().zip(&current.slots) {
@@ -4753,7 +4825,7 @@ impl<'db> CallableBinding<'db> {
             .filter(|(_, overload)| !overload.has_errors_affecting_overload_resolution())
     }
 
-    /// Returns the overloads selected for deprecation reporting without changing the matches
+    /// Returns the overloads selected for this call without changing the matches
     /// retained for argument inference. Equivalent return types select the first match;
     /// ambiguous calls retain every match, and argument expansion combines its selected matches.
     fn selected_overloads(&self) -> impl Iterator<Item = (usize, &Binding<'db>)> + Clone {
@@ -4771,6 +4843,26 @@ impl<'db> CallableBinding<'db> {
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
             }
         }))
+    }
+
+    fn ignored_declared_constraints(&self) -> bool {
+        // The declared constraints may have been discarded for a single expanded argument list.
+        if let Some(OverloadCallResult::ArgumentTypeExpansion(expanded)) =
+            &self.overload_call_result
+        {
+            return expanded.cases.iter().any(|case| {
+                case.snapshot
+                    .matching_overloads
+                    .iter()
+                    .any(|(index, binding)| {
+                        binding.ignored_declared_constraints
+                            && case.selected_overloads.contains(index)
+                    })
+            });
+        }
+
+        self.selected_overloads()
+            .any(|(_, overload)| overload.ignored_declared_constraints)
     }
 
     /// Returns the deprecated implementation, taking precedence over any deprecated overloads.
@@ -6023,6 +6115,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             arguments_validated,
             errors: inference_errors,
             constraint_set_errors,
+            ignored_declared_constraints: _,
         } = inferred;
         errors.extend(inference_errors);
         Self {
@@ -6293,13 +6386,23 @@ fn parameter_context_specialization<'db>(
         .variables(db)
         .map(|typevar| {
             let identity = typevar.identity(db);
-            if return_type_solutions.contains_key(&identity) {
-                return_context.map(|context| context.kind)
-            } else {
-                inference
+            let Some(&return_ty) = return_type_solutions.get(&identity) else {
+                return inference
                     .is_some_and(|inference| inference.has_inferred_type(db, identity))
-                    .then_some(TypeContextKind::Inferred)
+                    .then_some(TypeContextKind::Inferred);
+            };
+
+            let kind = return_context?.kind;
+
+            // Propagate the type context as originating from an annotated assignment only if the
+            // annotated type directly specialized the type variable.
+            if kind == TypeContextKind::annotated_assignment()
+                && specialization.get(db, typevar) != Some(return_ty)
+            {
+                return Some(TypeContextKind::preference());
             }
+
+            Some(kind)
         })
         .collect();
 
@@ -6309,18 +6412,34 @@ fn parameter_context_specialization<'db>(
     }
 }
 
-/// Inputs to generic inference when a call has no expected return type. Only
-/// the ordered formal and actual types affect a successful solution.
+/// Inputs to generic inference, including the source and strength of any
+/// constraint supplied by the expected return type.
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 struct GenericArguments<'db> {
     #[returns(copy)]
     context: GenericContext<'db>,
     #[returns(copy)]
     return_ty: Type<'db>,
+    #[returns(copy)]
+    tcx: TypeContext<'db>,
     #[returns(deref)]
     relations: Box<[(Type<'db>, Type<'db>)]>,
 }
 
+/// What two calls with the same generic inference inputs can share.
+/// Argument validation and diagnostics still belong to each call site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
+enum GenericSolution<'db> {
+    /// The expected return type was incompatible. Retry with just argument evidence.
+    Retry,
+    /// A single specialization determines the return type independently of the arguments.
+    Merged(TypeVarInference<'db>, Type<'db>),
+    /// The caller must check its own arguments to choose between correlated alternatives.
+    Alternatives(TypeVarInference<'db>, Option<(Type<'db>, Type<'db>)>),
+}
+
+/// Solve the location-independent part of a generic call. A cycle or an error that
+/// needs an argument location falls back to inference with the original arguments.
 #[salsa::tracked(
     returns(copy),
     cycle_result=|_, _, _| None,
@@ -6329,23 +6448,121 @@ struct GenericArguments<'db> {
 fn infer_generic_arguments<'db>(
     db: &'db dyn Db,
     arguments: GenericArguments<'db>,
-) -> Option<TypeVarInference<'db>> {
+) -> Option<GenericSolution<'db>> {
     let context = arguments.context(db);
     let env = &ProgramEnvironment::from_program(context.program(db));
     let constraints = &ConstraintSetBuilder::new();
     let mut builder = SpecializationBuilder::new(db, env, constraints, context);
-    for &(formal, actual) in arguments.relations(db) {
+    let relations = arguments.relations(db);
+    for &(formal, actual) in relations {
         builder.infer(formal, actual).ok()?;
     }
     let return_ty = arguments.return_ty(db);
-    let prefer = TypeContext::default().should_prefer_expected_type();
-    builder
-        .build_inference_with(ReportDiagnostics::Yes, |_, bounds| {
-            bounds.map(|bounds| {
-                CallInference::solve_typevar(db, env, return_ty, constraints, bounds, prefer)
-            })
+    let tcx = arguments.tcx(db);
+    let return_context = infer_return_constraints(
+        db,
+        env,
+        &mut builder,
+        context.inferable_typevars(db),
+        return_ty,
+        tcx,
+    );
+    let report = if return_context.is_some() {
+        ReportDiagnostics::No
+    } else {
+        ReportDiagnostics::Yes
+    };
+    let choose = |_: BoundTypeVarInstance<'db>, bounds: Option<&CandidateTypeVarSolution<'db>>| {
+        bounds.map(|bounds| {
+            CallInference::solve_typevar(
+                db,
+                env,
+                return_ty,
+                constraints,
+                bounds,
+                tcx.should_prefer_expected_type(),
+            )
         })
-        .ok()
+    };
+    let inference = match builder.build_inference_with(report, choose) {
+        Ok(inference) => inference,
+        Err(_) if return_context.is_some() => return Some(GenericSolution::Retry),
+        // Even if the constraints are unsatisfiable, the arguments can yield a
+        // partial specialization. With no solver errors there are no locations to recover.
+        Err(errors) if errors.is_empty() => {
+            builder.build_diagnostic_inference_with(relations.iter().copied(), choose)
+        }
+        Err(_) => return None,
+    };
+    if matches!(
+        inference.solutions(db),
+        TypeVarInferenceSolutions::Alternatives(_)
+    ) {
+        return Some(GenericSolution::Alternatives(inference, return_context));
+    }
+
+    let selected = return_ty.apply_specialization(db, inference.merged_specialization(db));
+    if matches_return_context(
+        db,
+        env,
+        inference,
+        return_ty,
+        selected,
+        false,
+        return_context,
+    ) {
+        Some(GenericSolution::Merged(inference, selected))
+    } else {
+        Some(GenericSolution::Retry)
+    }
+}
+
+/// Check the selected specialization against the same type that supplied the constraints.
+fn matches_return_context<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    inference: TypeVarInference<'db>,
+    return_ty: Type<'db>,
+    selected: Type<'db>,
+    arguments_validated: bool,
+    return_context: Option<(Type<'db>, Type<'db>)>,
+) -> bool {
+    let Some((contextual_return_ty, tcx)) = return_context else {
+        return true;
+    };
+    // An unchecked merge may still contain union members discarded when constraining
+    // the return type. Validate just the members that contributed constraints.
+    let selected = if arguments_validated || contextual_return_ty == return_ty {
+        selected
+    } else {
+        contextual_return_ty.apply_specialization(db, inference.merged_specialization(db))
+    };
+    selected.is_assignable_to(db, env, tcx)
+}
+
+/// Add constraints from the expected type and retain the narrowed pair for validation.
+fn infer_return_constraints<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    builder: &mut SpecializationBuilder<'db, '_>,
+    inferable: TypeVarSet<'db>,
+    return_ty: Type<'db>,
+    context: TypeContext<'db>,
+) -> Option<(Type<'db>, Type<'db>)> {
+    let tcx = context.expected_type()?;
+    let return_ty = return_ty
+        .discard_disjoint_union_elements(db, env, tcx, inferable)
+        .or_never();
+    let tcx = tcx
+        .discard_disjoint_union_elements(db, env, return_ty, inferable)
+        .or_never();
+    let provenance = if context.kind() == TypeContextKind::Validity {
+        ConstraintProvenance::VALIDITY
+    } else {
+        ConstraintProvenance::DECLARED
+    };
+    builder.record_return_context(return_ty, tcx, provenance);
+    Some((return_ty, tcx))
 }
 
 /// Completed inference and its diagnostics, passed together to argument validation.
@@ -6358,6 +6575,8 @@ struct InferredCall<'db> {
     return_ty: Type<'db>,
     /// Whether inference has checked argument assignability for the selected return type.
     arguments_validated: bool,
+    /// Whether the solver retried without the declared type.
+    ignored_declared_constraints: bool,
     /// Inference errors retained after any retry without the expected return type.
     errors: Vec<BindingError<'db>>,
     /// Flags indexed by call argument, including synthetic receivers, to suppress duplicate errors.
@@ -7138,6 +7357,7 @@ impl<'db> CallInference<'_, 'db> {
                 inference: None,
                 return_ty: self.return_ty,
                 arguments_validated: false,
+                ignored_declared_constraints: false,
                 errors: Vec::new(),
                 constraint_set_errors,
             };
@@ -7147,37 +7367,75 @@ impl<'db> CallInference<'_, 'db> {
             return self.infer_legacy(constraints, generic_context, constraint_set_errors);
         }
 
-        // Expected return types and unpacked variadic packs can add constraints
-        // beyond the argument relations. Keep those calls and any failed solutions
-        // on the path that has the full argument list and diagnostic locations.
-        if self.call_expression_tcx == TypeContext::default()
-            && generic_context.program(db) == self.env.program(db)
-            // With a declared bound or constraints, rejecting one overload can be
-            // expensive. Solve those calls once with the full diagnostic context.
-            && generic_context.variables(db).all(|var| {
-                let var = var.typevar(db);
-                var.is_simple(db) || var.is_self(db)
-            })
+        // A starred parameter annotation depends on the complete argument list. Other calls
+        // can share the solver result while validating each call's own arguments.
+        if generic_context.program(db) == self.env.program(db)
             && self
                 .signature
                 .parameters()
                 .variadic()
                 .is_none_or(|(_, parameter)| !parameter.has_starred_annotation())
         {
+            // Equal types need no inference and assignability is reflexive in recovery.
+            // Concrete values passed to an untyped parameter cannot constrain a variable.
+            // Keep type variables, aliases and compound types, which can add evidence.
             let relations: SmallVec<[_; 4]> = self
                 .argument_relations()
-                .filter(|r| r.declared_type != r.argument_type)
+                .filter(|r| {
+                    r.declared_type != r.argument_type
+                        && !(matches!(r.declared_type, Type::Dynamic(_))
+                            && matches!(
+                                r.argument_type,
+                                Type::NominalInstance(_) | Type::LiteralValue(_) | Type::Dynamic(_)
+                            ))
+                })
                 .map(|r| (r.declared_type, r.argument_type))
                 .collect();
-            let arguments =
-                GenericArguments::new(db, generic_context, self.return_ty, relations.as_slice());
-            if let Some(inference) = infer_generic_arguments(db, arguments) {
-                let (return_ty, arguments_validated) = self.select_return_type(inference);
+            let context = self.call_expression_tcx;
+            // Inferred and preferred contexts produce the same constraints. A validity
+            // constraint has its own provenance. On retry, discard the expected type
+            // but preserve the original solver preference.
+            let preference = TypeContextKind::Expected {
+                prefer: context.should_prefer_expected_type(),
+                from_annotated_assignment: false,
+            };
+            let retry = context
+                .expected_type()
+                .map(|_| TypeContext::new(None, preference));
+            let context = if context.kind() == TypeContextKind::Validity && retry.is_some() {
+                context
+            } else {
+                TypeContext::new(context.expected_type(), preference)
+            };
+            for (attempt, tcx) in std::iter::once(context).chain(retry).enumerate() {
+                let arguments = GenericArguments::new(
+                    db,
+                    generic_context,
+                    self.return_ty,
+                    tcx,
+                    relations.as_slice(),
+                );
+                let (inference, return_ty, arguments_validated) =
+                    match infer_generic_arguments(db, arguments) {
+                        // Resolve cycles and errors requiring argument locations in the caller.
+                        None => break,
+                        Some(GenericSolution::Retry) => continue,
+                        Some(GenericSolution::Merged(inference, selected)) => {
+                            (inference, selected, false)
+                        }
+                        Some(GenericSolution::Alternatives(inference, context)) => {
+                            let Ok(solution) = self.validate_return_type(inference, context) else {
+                                continue;
+                            };
+                            solution
+                        }
+                    };
                 return InferredCall {
                     inferable_typevars: self.inferable_typevars,
                     inference: Some(inference),
                     return_ty,
                     arguments_validated,
+                    ignored_declared_constraints: attempt > 0,
                     errors: Vec::new(),
                     constraint_set_errors,
                 };
@@ -7195,22 +7453,14 @@ impl<'db> CallInference<'_, 'db> {
             &mut constraint_set_errors,
         );
 
-        let return_context = self.call_expression_tcx.expected_type().map(|tcx| {
-            let return_ty = self
-                .return_ty
-                .discard_disjoint_union_elements(db, self.env, tcx, self.inferable_typevars)
-                .or_never();
-            let tcx = tcx
-                .discard_disjoint_union_elements(db, self.env, return_ty, self.inferable_typevars)
-                .or_never();
-            let provenance = if self.call_expression_tcx.kind() == TypeContextKind::Validity {
-                ConstraintProvenance::VALIDITY
-            } else {
-                ConstraintProvenance::DECLARED
-            };
-            builder.record_return_context(return_ty, tcx, provenance);
-            (return_ty, tcx)
-        });
+        let return_context = infer_return_constraints(
+            db,
+            self.env,
+            &mut builder,
+            self.inferable_typevars,
+            self.return_ty,
+            self.call_expression_tcx,
+        );
 
         let mut solution = self.solve(constraints, &mut builder, return_context);
 
@@ -7219,7 +7469,8 @@ impl<'db> CallInference<'_, 'db> {
         // Note that this retry only exists to provide more precise diagnostics in cases where
         // the declared type may partially influence the type inferred for the call, leading to
         // confusing results.
-        if return_context.is_some() && solution.is_err() {
+        let ignored_declared_constraints = return_context.is_some() && solution.is_err();
+        if ignored_declared_constraints {
             builder = SpecializationBuilder::new(db, self.env, constraints, generic_context);
             specialization_errors.clear();
             constraint_set_errors.fill(false);
@@ -7262,6 +7513,7 @@ impl<'db> CallInference<'_, 'db> {
             inference: Some(inference),
             return_ty,
             arguments_validated,
+            ignored_declared_constraints,
             errors: specialization_errors,
             constraint_set_errors,
         }
@@ -7474,6 +7726,7 @@ impl<'db> CallInference<'_, 'db> {
             inference: Some(inference),
             return_ty,
             arguments_validated,
+            ignored_declared_constraints: !assignable_to_declared_type,
             errors: specialization_errors,
             constraint_set_errors,
         }
@@ -7485,8 +7738,6 @@ impl<'db> CallInference<'_, 'db> {
         builder: &mut SpecializationBuilder<'db, '_>,
         return_context: Option<(Type<'db>, Type<'db>)>,
     ) -> Result<(TypeVarInference<'db>, Type<'db>, bool), Vec<SpecializationError<'db>>> {
-        let db = self.db;
-
         let report_diagnostics = if return_context.is_some() {
             // Note that we perform a retry for failures performed with return context, and so can
             // avoid constructing expensive diagnostics on the initial failure in that case.
@@ -7507,22 +7758,29 @@ impl<'db> CallInference<'_, 'db> {
                 )
             })
         })?;
+        self.validate_return_type(inference, return_context)
+    }
+
+    /// Select a return type using this call's arguments and check it against the expected type.
+    fn validate_return_type(
+        &self,
+        inference: TypeVarInference<'db>,
+        return_context: Option<(Type<'db>, Type<'db>)>,
+    ) -> Result<(TypeVarInference<'db>, Type<'db>, bool), Vec<SpecializationError<'db>>> {
         let (return_ty, arguments_validated) = self.select_return_type(inference);
-
-        // Retry if the selected return is incompatible with the declared type. For an unchecked
-        // merge, use the return type that supplied the declared constraints.
-        if let Some((contextual_return_ty, tcx)) = return_context {
-            let selected = if arguments_validated || contextual_return_ty == self.return_ty {
-                return_ty
-            } else {
-                contextual_return_ty.apply_specialization(db, inference.merged_specialization(db))
-            };
-            if !selected.is_assignable_to(db, self.env, tcx) {
-                return Err(Vec::new());
-            }
+        if matches_return_context(
+            self.db,
+            self.env,
+            inference,
+            self.return_ty,
+            return_ty,
+            arguments_validated,
+            return_context,
+        ) {
+            Ok((inference, return_ty, arguments_validated))
+        } else {
+            Err(Vec::new())
         }
-
-        Ok((inference, return_ty, arguments_validated))
     }
 
     fn solve_typevar(
@@ -9039,6 +9297,9 @@ pub(crate) struct Binding<'db> {
     /// The type-variable inference result for this binding, if the callable is generic.
     inference: Option<TypeVarInference<'db>>,
 
+    /// Whether the solver retried without the declared type.
+    ignored_declared_constraints: bool,
+
     /// Whether these arguments construct a partial instead of completing a call.
     is_partial_application: bool,
 
@@ -9152,6 +9413,7 @@ impl<'db> Binding<'db> {
             constructor_context: None,
             inferable_typevars: TypeVarSet::None,
             inference: None,
+            ignored_declared_constraints: false,
             is_partial_application: false,
             argument_matches: Box::from([]),
             variadic_argument_matched_to_variadic_parameter: false,
@@ -9967,6 +10229,7 @@ impl<'db> Binding<'db> {
         let inferred = call
             .infer_structured(constraints)
             .unwrap_or_else(|| call.infer(constraints));
+        self.ignored_declared_constraints = inferred.ignored_declared_constraints;
 
         let mut checker = ArgumentTypeChecker::new(
             db,
@@ -10279,6 +10542,7 @@ impl<'db> Binding<'db> {
             return_ty: self.return_ty,
             inferable_typevars: self.inferable_typevars,
             inference: self.inference,
+            ignored_declared_constraints: self.ignored_declared_constraints,
             argument_matches: self.argument_matches.clone(),
             parameter_tys: self.parameter_tys.clone(),
             errors: self.errors.clone(),
@@ -10290,6 +10554,7 @@ impl<'db> Binding<'db> {
             return_ty,
             inferable_typevars,
             inference,
+            ignored_declared_constraints,
             argument_matches,
             parameter_tys,
             errors,
@@ -10298,6 +10563,7 @@ impl<'db> Binding<'db> {
         self.return_ty = return_ty;
         self.inferable_typevars = inferable_typevars;
         self.inference = inference;
+        self.ignored_declared_constraints = ignored_declared_constraints;
         self.argument_matches = argument_matches;
         self.parameter_tys = parameter_tys;
         self.errors = errors;
@@ -10341,6 +10607,7 @@ impl<'db> Binding<'db> {
         self.return_ty = self.initial_return_type(db);
         self.inferable_typevars = TypeVarSet::None;
         self.inference = None;
+        self.ignored_declared_constraints = false;
         self.argument_matches = Box::from([]);
         self.parameter_tys = Box::from([]);
         self.errors.clear();
@@ -10352,6 +10619,7 @@ struct BindingSnapshot<'db> {
     return_ty: Type<'db>,
     inferable_typevars: TypeVarSet<'db>,
     inference: Option<TypeVarInference<'db>>,
+    ignored_declared_constraints: bool,
     argument_matches: Box<[MatchedArgument<'db>]>,
     parameter_tys: Box<[Option<Type<'db>>]>,
     errors: Vec<BindingError<'db>>,
@@ -10392,6 +10660,7 @@ impl CallableBindingSnapshot<'_> {
                 snapshot.return_ty = binding.return_ty;
                 snapshot.inferable_typevars = binding.inferable_typevars;
                 snapshot.inference = binding.inference;
+                snapshot.ignored_declared_constraints = binding.ignored_declared_constraints;
                 snapshot
                     .argument_matches
                     .clone_from(&binding.argument_matches);

@@ -221,7 +221,9 @@ use ty_python_core::{
     Truthiness, UseDefMap,
     definition::{DefinitionKind, DefinitionState},
     expression::Expression,
-    narrowing_constraints::{NarrowingConstraints, ScopedNarrowingConstraint},
+    narrowing_constraints::{
+        InteriorNode as NarrowingNode, NarrowingConstraints, ScopedNarrowingConstraint,
+    },
     place::ScopedPlaceId,
     place_table,
     predicate::{
@@ -1197,7 +1199,7 @@ pub(crate) struct NarrowingProjector<'a, 'db> {
     env: &'a ProgramEnvironment<'db>,
     constraints: &'a NarrowingConstraints,
     predicates: PredicateEvaluator<'a, 'db>,
-    predicate_narrowing_targets: &'a PredicateNarrowingTargets,
+    narrowing_predicates: &'a [(ScopedPredicateId, ScopedPlaceId)],
     place: ScopedPlaceId,
     base_ty: Type<'db>,
     /// Checkpoint entries retain narrowed types, so projections are specific to the binding type.
@@ -1223,7 +1225,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
             env,
             constraints,
             predicates: PredicateEvaluator::uncached(predicates),
-            predicate_narrowing_targets,
+            narrowing_predicates: predicate_narrowing_targets.for_place(place),
             place,
             base_ty,
             project_cache: ProjectionCache::default(),
@@ -1258,7 +1260,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
 
         // Reachability gates can mention predicates that do not narrow this place.
         // Avoid evaluating unrelated expressions, which can introduce inference cycles.
-        if !self.predicate_narrowing_targets.contains_place(self.place) {
+        if self.narrowing_predicates.is_empty() {
             return base_ty;
         }
 
@@ -1308,6 +1310,13 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         narrowed
     }
 
+    /// Returns whether the predicate can narrow the place being projected.
+    fn can_narrow(&self, predicate: ScopedPredicateId) -> bool {
+        self.narrowing_predicates
+            .binary_search_by_key(&predicate, |&(id, _)| id)
+            .is_ok()
+    }
+
     /// Returns the cached positive and negative narrowing constraints for a predicate.
     fn predicate_constraints(
         &mut self,
@@ -1316,10 +1325,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         Option<NarrowingConstraint<'db>>,
         Option<NarrowingConstraint<'db>>,
     ) {
-        if !self
-            .predicate_narrowing_targets
-            .contains(predicate_id, self.place)
-        {
+        if !self.can_narrow(predicate_id) {
             return (None, None);
         }
 
@@ -1501,11 +1507,11 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
         use_root_checkpoint: bool,
     ) -> ProjectedNarrowingNodeId {
         type Id = ScopedNarrowingConstraint;
-        enum Action {
+        enum Action<'a> {
             Visit(Id),
-            VisitBranches(Id),
-            FinishNonTerminal { id: Id, branch: Id },
-            FinishPredicate(Id),
+            VisitBranches(Id, &'a NarrowingNode),
+            FinishNonTerminal { id: Id, branch: Id, bypass: Id },
+            FinishPredicate(Id, &'a NarrowingNode),
         }
         let db = self.db;
 
@@ -1527,9 +1533,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                     if (id != root || use_root_checkpoint)
                         && (checkpoint_position + 1)
                             .is_multiple_of(NARROWING_EVALUATION_CHECKPOINT_INTERVAL)
-                        && (self
-                            .predicate_narrowing_targets
-                            .contains(node.atom, self.place)
+                        && (self.can_narrow(node.atom)
                             || matches!(
                                 predicate.node,
                                 PredicateNode::ContextManagerSuppresses { .. }
@@ -1564,11 +1568,10 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                         self.project_cache.insert(id, projected);
                         continue;
                     }
-                    actions.push(Action::VisitBranches(id));
+                    actions.push(Action::VisitBranches(id, node));
                     actions.push(Action::Visit(node.if_uncertain));
                 }
-                Action::VisitBranches(id) => {
-                    let node = self.constraints.get_interior_node(id);
+                Action::VisitBranches(id, node) => {
                     // This path bypasses the predicate. If it admits every value, the
                     // conditional paths cannot narrow this place.
                     if self.projected_node(node.if_uncertain)
@@ -1585,7 +1588,7 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                             | PredicateNode::ContextManagerSuppresses { .. }
                             | PredicateNode::FinallyNormalPathImpossible { .. }
                     ) {
-                        actions.push(Action::FinishPredicate(id));
+                        actions.push(Action::FinishPredicate(id, node));
                         actions.push(Action::Visit(node.if_false));
                         actions.push(Action::Visit(node.if_true));
                         continue;
@@ -1601,18 +1604,20 @@ impl<'a, 'db> NarrowingProjector<'a, 'db> {
                         }
                     };
 
-                    actions.push(Action::FinishNonTerminal { id, branch });
+                    actions.push(Action::FinishNonTerminal {
+                        id,
+                        branch,
+                        bypass: node.if_uncertain,
+                    });
                     actions.push(Action::Visit(branch));
                 }
-                Action::FinishNonTerminal { id, branch } => {
-                    let node = self.constraints.get_interior_node(id);
+                Action::FinishNonTerminal { id, branch, bypass } => {
                     let branch = self.projected_node(branch);
-                    let if_uncertain = self.projected_node(node.if_uncertain);
+                    let if_uncertain = self.projected_node(bypass);
                     let projected = self.or(branch, if_uncertain);
                     self.project_cache.insert(id, projected);
                 }
-                Action::FinishPredicate(id) => {
-                    let node = self.constraints.get_interior_node(id);
+                Action::FinishPredicate(id, node) => {
                     let if_true = self.projected_node(node.if_true);
                     let if_uncertain = self.projected_node(node.if_uncertain);
                     let if_false = self.projected_node(node.if_false);

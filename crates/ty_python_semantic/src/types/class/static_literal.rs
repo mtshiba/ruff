@@ -920,6 +920,30 @@ impl<'db> StaticClassLiteral<'db> {
         .map_err(Box::as_ref)
     }
 
+    /// Whether every generic ancestor takes a prefix of this class's type arguments
+    /// or a single fixed `Any`.
+    ///
+    /// Checking each direct base recursively suffices even in a diamond. C3 compares
+    /// class identities and keeps the leftmost path's specialization, so changing the
+    /// arguments cannot change which path supplies an ancestor.
+    #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _| false)]
+    pub(super) fn can_specialize_mro_by_prefix(self, db: &'db dyn Db) -> bool {
+        let Some(context) = self.generic_context(db) else {
+            return false;
+        };
+        self.explicit_bases(db).iter().all(|base| match *base {
+            Type::KnownInstance(
+                KnownInstanceType::SubscriptedGeneric(_)
+                | KnownInstanceType::SubscriptedProtocol(_),
+            ) => true,
+            Type::GenericAlias(base) => {
+                base.has_prefix_or_any_arguments(db, context)
+                    && base.origin(db).can_specialize_mro_by_prefix(db)
+            }
+            _ => false,
+        })
+    }
+
     /// Resolve ancestors in MRO order without specializing a synthetic tuple base with its fields.
     fn try_class_metadata_ancestors(
         self,
@@ -1067,6 +1091,24 @@ impl<'db> StaticClassLiteral<'db> {
 
     /// Return the properties shared by all instances of this class.
     pub(super) fn instance_flags(self, db: &'db dyn Db) -> ClassInstanceFlags {
+        let header = self.header(db);
+        let mut flags = self.classification_flags(db, header);
+        if header.known.is_some() || !header.has_explicit_bases {
+            flags.set(
+                ClassInstanceFlags::HAS_CUSTOM_GETATTRIBUTE,
+                self.has_own_custom_getattribute(db),
+            );
+        }
+        flags
+    }
+
+    /// Look up `TypedDict` and explicit `Any` ancestry together. For a known class or a
+    /// class without bases, neither property requires resolving its own `__getattribute__`.
+    pub(in crate::types) fn classification_flags(
+        self,
+        db: &'db dyn Db,
+        header: StaticClassHeader<'db>,
+    ) -> ClassInstanceFlags {
         #[salsa::tracked(
             returns(copy),
             cycle_initial=|_, _, _, _| ClassInstanceFlags::empty(),
@@ -1100,23 +1142,11 @@ impl<'db> StaticClassLiteral<'db> {
             flags
         }
 
-        let mut flags = if let Some(known) = self.known(db) {
-            if known.is_typed_dict_subclass() {
-                ClassInstanceFlags::TYPED_DICT
-            } else {
-                ClassInstanceFlags::empty()
-            }
-        } else if self.has_explicit_bases(db) {
-            return instance_flags_inner(db, self);
-        } else {
-            ClassInstanceFlags::empty()
-        };
-
-        flags.set(
-            ClassInstanceFlags::HAS_CUSTOM_GETATTRIBUTE,
-            self.has_own_custom_getattribute(db),
-        );
-        flags
+        match header.known {
+            Some(known) if known.is_typed_dict_subclass() => ClassInstanceFlags::TYPED_DICT,
+            None if header.has_explicit_bases => instance_flags_inner(db, self),
+            _ => ClassInstanceFlags::empty(),
+        }
     }
 
     /// Return the module defining the `TypedDict` base of this class.
@@ -1129,14 +1159,8 @@ impl<'db> StaticClassLiteral<'db> {
     /// Return `true` if this class constitutes a typed dict specification (inherits from
     /// `typing.TypedDict` or `typing_extensions.TypedDict`, either directly or indirectly).
     pub fn is_typed_dict(self, db: &'db dyn Db) -> bool {
-        if let Some(known) = self.known(db) {
-            return known.is_typed_dict_subclass();
-        }
-
-        self.has_explicit_bases(db)
-            && self
-                .instance_flags(db)
-                .contains(ClassInstanceFlags::TYPED_DICT)
+        self.classification_flags(db, self.header(db))
+            .contains(ClassInstanceFlags::TYPED_DICT)
     }
 
     /// Return `true` if this class is, or inherits from, a `NamedTuple` (inherits from
