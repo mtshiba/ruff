@@ -34,10 +34,10 @@ pub use scope::FileScopeId;
 use scope::{NodeWithScopeKey, NodeWithScopeRef, Scope, ScopeId, ScopeKind, ScopeLaziness};
 use symbol::ScopedSymbolId;
 pub use use_def::{
-    ApplicableConstraints, BindingWithConstraints, BindingWithConstraintsIterator,
-    BindingsSnapshotId, DeclarationWithConstraint, DeclarationsIterator, ImportedFinalCandidate,
-    ImportedFinalCandidatesIterator, LiveBinding, LoopHeaderId, NarrowingEvaluator,
-    PredicateNarrowingTargets, ScopedDefinitionId, UseDefMap,
+    ApplicableConstraints, BindingKind, BindingWithConstraints, BindingWithConstraintsIterator,
+    BindingsSnapshotId, DeclarationSources, DeclarationWithConstraint, DeclarationsIterator,
+    ImportedFinalCandidate, ImportedFinalCandidatesIterator, LiveBinding, LoopHeaderId,
+    NarrowingEvaluator, PredicateNarrowingTargets, ScopedDefinitionId, UseDefMap,
 };
 use use_def::{EnclosingSnapshotKey, ScopedEnclosingSnapshotId};
 
@@ -1444,15 +1444,16 @@ mod tests {
                     DefinitionKind::AnnotatedAssignment(_)
                 );
             }
+            let sources = use_def.declaration_sources_at_binding(assignment).unwrap();
             assert_eq!(
-                use_def
-                    .declarations_at_binding(assignment)
+                sources
+                    .declarations()
                     .map(|declaration| declaration.declaration)
                     .collect::<Vec<_>>(),
                 [declaration.map_or(DefinitionState::Undefined, DefinitionState::Defined)]
             );
 
-            let mut candidates = use_def.imported_final_candidates_at_binding(assignment);
+            let mut candidates = sources.imported_final_candidates();
             assert_matches!(
                 candidates
                     .next()
@@ -1481,6 +1482,7 @@ mod tests {
             .first_public_binding(global_table.symbol_id("x").expect("symbol exists"))
             .unwrap();
         assert_matches!(binding.kind(&db), DefinitionKind::Assignment(_));
+        assert!(use_def.declaration_sources_at_binding(binding).is_none());
     }
 
     #[test]
@@ -1659,6 +1661,7 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
                         PreviousDefinitions::AreShadowed,
                         FutureDefinitions::ShadowThisOne,
                         ImportedQualifierAction::Preserve,
+                        BindingKind::Default,
                     );
                 }
             }

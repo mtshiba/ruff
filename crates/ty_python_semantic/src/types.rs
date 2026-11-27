@@ -6878,9 +6878,10 @@ impl<'db> Type<'db> {
                     ty.map_or_default(Place::bound).into()
                 }
 
-                // attrs defines the methods `validator` and `default` on field instances.
+                // attrs defines the methods `validator`, `default`, and `converter` on field instances.
                 Type::KnownInstance(KnownInstanceType::Field(field))
-                    if matches!(name_str, "validator" | "default") && field.kind(db).is_attrs() =>
+                    if matches!(name_str, "validator" | "default" | "converter")
+                        && field.kind(db).is_attrs() =>
                 {
                     Place::bound(dedicated::attrs::generic_identity_function(db, env)).into()
                 }
@@ -11339,6 +11340,8 @@ impl<'db> Type<'db> {
         }
 
         match self {
+            // The complement contains non-callable objects, which no callable can cover.
+            Type::Callable(_) if matches!(target, Type::Callable(_)) => false,
             Type::Intersection(intersection) => {
                 intersection.negation_is_subtype_of(db, env, target)
             }
