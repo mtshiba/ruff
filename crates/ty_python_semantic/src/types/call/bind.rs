@@ -682,7 +682,7 @@ pub(crate) struct Bindings<'db> {
 
     /// The elements of this binding. For a union, each element is a union variant.
     /// Each element may contain multiple `CallableBinding`s if it came from an intersection.
-    elements: SmallVec<[BindingsElement<'db>; 1]>,
+    elements: Vec<BindingsElement<'db>>,
 
     /// The lexical scope used to detect recursive generic calls.
     call_site_scope: Option<ScopeId<'db>>,
@@ -880,7 +880,7 @@ impl<'db> Bindings<'db> {
             }
         }
         assert!(!inner_items_acc.is_empty());
-        let elements = smallvec![BindingsElement {
+        let elements = vec![BindingsElement {
             callable_type,
             items: inner_items_acc,
         }];
@@ -3463,7 +3463,7 @@ impl<'db> From<CallableBinding<'db>> for Bindings<'db> {
     fn from(from: CallableBinding<'db>) -> Bindings<'db> {
         Bindings {
             callable_type: from.callable_type,
-            elements: smallvec_inline![BindingsElement {
+            elements: vec![BindingsElement {
                 callable_type: from.callable_type,
                 items: smallvec_inline![CallableItem::Regular(from)],
             }],
@@ -3771,46 +3771,29 @@ impl<'db> CallableBinding<'db> {
         signature_type: Type<'db>,
         overloads: impl IntoIterator<Item = Signature<'db>>,
     ) -> Self {
-        Self::from_indexed_overloads(
-            signature_type,
-            overloads.into_iter().enumerate().map(|(index, signature)| {
-                (
-                    signature.source_overload_index().unwrap_or(index),
-                    signature,
-                )
-            }),
-        )
+        let overloads = overloads.into_iter();
+        let mut binding = Self::with_capacity(signature_type, overloads.size_hint().0);
+        for signature in overloads {
+            binding.push_overload(signature);
+        }
+        binding
     }
 
-    /// Constructs a callable binding from overloads while preserving each overload's position in
-    /// the defining function's overload list.
-    ///
-    /// The preserved indexes are used for diagnostics so filtered or reordered bindings can still
-    /// point back to the correct overload declaration.
-    fn from_indexed_overloads(
-        signature_type: Type<'db>,
-        overloads: impl IntoIterator<Item = (usize, Signature<'db>)>,
-    ) -> Self {
-        let overloads = overloads
-            .into_iter()
-            .map(|(source_overload_index, signature)| {
-                Binding::single(signature_type, signature)
-                    .with_source_overload_index(source_overload_index)
-            })
-            .collect();
-        Self {
-            callable_type: signature_type,
-            signature_type,
-            is_implicitly_invoked: false,
-            dunder_call_is_possibly_unbound: false,
-            bound_type: None,
-            overload_call_result: None,
-            matching_overload_before_type_checking: None,
-            overloads,
-        }
+    /// Preserve the original declaration index when signatures were filtered or reordered.
+    pub(crate) fn push_overload(&mut self, signature: Signature<'db>) {
+        let index = signature
+            .source_overload_index()
+            .unwrap_or(self.overloads.len());
+        self.overloads.push(
+            Binding::single(self.signature_type, signature).with_source_overload_index(index),
+        );
     }
 
     pub(crate) fn not_callable(signature_type: Type<'db>) -> Self {
+        Self::with_capacity(signature_type, 0)
+    }
+
+    pub(crate) fn with_capacity(signature_type: Type<'db>, capacity: usize) -> Self {
         Self {
             callable_type: signature_type,
             signature_type,
@@ -3819,7 +3802,7 @@ impl<'db> CallableBinding<'db> {
             bound_type: None,
             overload_call_result: None,
             matching_overload_before_type_checking: None,
-            overloads: smallvec![],
+            overloads: SmallVec::with_capacity(capacity),
         }
     }
 
